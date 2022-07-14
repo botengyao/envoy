@@ -35,9 +35,9 @@ aio-api-nist==0.0.2 \
     --hash=sha256:27ff7d899760cc666bdbab2123c206c173a45090411d2a766263ffd78123ce0c \
     --hash=sha256:d188116eca1b468448ada0d3172cf054432da19da91c45bd0b5bea2f5712a351
     # via envoy-dependency-check
-aio-core==0.8.6 \
-    --hash=sha256:13b0761e4b741c8c07d2ecf8b45dd379e2110011eed7d9f38c061a6884f933f7 \
-    --hash=sha256:ed00bf3ad79bc1fab544902907accd58a4599794810149b280be2bb3a05f9378
+aio-core==0.9.1 \
+    --hash=sha256:9b1b48f1808804d48260515f17d943864e3a4368a733314dda4685e8fd888945 \
+    --hash=sha256:c679a571057fc3c26f3b499dbbb492ac95876401030336e22cc7040f2ccab832
     # via
     #   aio-api-github
     #   aio-api-nist
@@ -78,10 +78,6 @@ aiodocker==0.21.0 \
     #   envoy-distribution-distrotest
     #   envoy-distribution-verify
     #   envoy-docker-utils
-aiofiles==0.7.0 \
-    --hash=sha256:a1c4fc9b2ff81568c83e21392a82f344ea9d23da906e4f6a52662764545e19d4 \
-    --hash=sha256:c67a6823b5f23fcab0a2595a289cec7d8c863ffcb4322fb8cd6b90400aedfdbc
-    # via aio-core
 aiohttp==3.8.1 \
     --hash=sha256:01d7bdb774a9acc838e6b8f1d114f45303841b89b95984cbb7d80ea41172a9e3 \
     --hash=sha256:03a6d5349c9ee8f79ab3ff3694d6ce1cfc3ced1c9d36200cb8f08ba06bd3b782 \
@@ -158,7 +154,6 @@ aiohttp==3.8.1 \
     # via
     #   aio-api-github
     #   aio-api-nist
-    #   aio-core
     #   aiodocker
     #   envoy-base-utils
     #   envoy-dependency-check
@@ -308,9 +303,9 @@ envoy-base-utils==0.3.6 \
     #   envoy-docs-sphinx-runner
     #   envoy-github-release
     #   envoy-gpg-sign
-envoy-code-check==0.2.1 \
-    --hash=sha256:01b7adf04814e928a6c01facc781e0b4ed4e949dc549ab19fd6fc5a627e56f36 \
-    --hash=sha256:a9bf92238fe9f4c09c4b61e84175bea0129a8da7f61be5a412cbb92dd5ca2e9f
+envoy-code-check==0.2.2 \
+    --hash=sha256:25b4fcee184e4b40ad68b26cbfd0614bbe0a5f980aefc95b5e3f9c6803e68bbb \
+    --hash=sha256:3ad2dd3e01ff57bfcc21475c1268e79d065959911bc9fe8bf1d3ea3cb3f5adf1
     # via -r requirements.in
 envoy-dependency-check==0.1.1 \
     --hash=sha256:a33c16559315561f6eadd3176eebb3a7c5a232b9dafe9b420864a24950cdbad7 \
