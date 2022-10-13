@@ -1,4 +1,4 @@
-FROM python:3.10.7-slim@sha256:c212a18a48efd4de1d6455f197538563d9cc312775761f14c50866c9a7eabd0e
+FROM python:3.11.0rc2-slim@sha256:a7b7703e1479bce7e911341cac76c3cad4d1b7efa794f03fc2df17155152fef0
 
 WORKDIR /client
 
