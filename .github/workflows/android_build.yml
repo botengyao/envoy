@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v1
         with:
           submodules: true
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v3
         with:
           java-version: '8'
           java-package: jdk
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v1
         with:
           submodules: true
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v3
         with:
           java-version: '8'
           java-package: jdk
@@ -76,7 +76,7 @@ jobs:
       - uses: actions/checkout@v1
         with:
           submodules: true
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v3
         with:
           java-version: '8'
           java-package: jdk
@@ -110,7 +110,7 @@ jobs:
       - uses: actions/checkout@v1
         with:
           submodules: true
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v3
         with:
           java-version: '8'
           java-package: jdk
@@ -144,7 +144,7 @@ jobs:
       - uses: actions/checkout@v1
         with:
           submodules: true
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v3
         with:
           java-version: '8'
           java-package: jdk
