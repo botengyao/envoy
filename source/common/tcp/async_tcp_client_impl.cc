@@ -45,8 +45,9 @@ void AsyncTcpClientImpl::setAsyncTcpClientCallbacks(AsyncTcpClientCallbacks& cal
 }
 
 void AsyncTcpClientImpl::write(Buffer::Instance& data, bool end_stream) {
-  ASSERT(connection_ != nullptr);
-  connection_->write(data, end_stream);
+  if (connection_) {
+    connection_->write(data, end_stream);
+  }
 }
 
 void AsyncTcpClientImpl::onData(Buffer::Instance& data, bool end_stream) {
@@ -59,11 +60,11 @@ void AsyncTcpClientImpl::onEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::RemoteClose ||
       event == Network::ConnectionEvent::LocalClose) {
     disconnected_ = true;
-    dispatcher_.deferredDelete(std::move(connection_));
     if (callbacks_) {
       callbacks_->onEvent(event);
       callbacks_ = nullptr;
     }
+    dispatcher_.deferredDelete(std::move(connection_));
   } else {
     disconnected_ = false;
     if (callbacks_) {
