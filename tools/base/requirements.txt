@@ -700,9 +700,7 @@ google-apitools==0.5.32 \
 google-auth[aiohttp]==2.27.0 \
     --hash=sha256:8e4bad367015430ff253fe49d500fdc3396c1a434db5740828c728e45bcce245 \
     --hash=sha256:e863a56ccc2d8efa83df7a80272601e43487fa9a728a376205c86c26aaefa821
-    # via
-    #   google-auth
-    #   gsutil
+    # via gsutil
 google-reauth==0.1.1 \
     --hash=sha256:cb39074488d74c8853074dde47368bbf8f739d4a4338b89aab696c895b6d8368 \
     --hash=sha256:f9f6852a55c2c5453d581cd01f3d1278e86147c03d008409800390a834235892
@@ -1047,9 +1045,9 @@ pyflakes==3.2.0 \
     --hash=sha256:1c61603ff154621fb2a9172037d84dca3500def8c8b630657d1701f026f8af3f \
     --hash=sha256:84b5be138a2dfbb40689ca07e2152deb896a65c3a3e24c251c5c62489568074a
     # via flake8
-pygithub==2.2.0 \
-    --hash=sha256:41042ea53e4c372219db708c38d2ca1fd4fadab75475bac27d89d339596cfad1 \
-    --hash=sha256:e39be7c4dc39418bdd6e3ecab5931c636170b8b21b4d26f9ecf7e6102a3b51c3
+pygithub==2.3.0 \
+    --hash=sha256:0148d7347a1cdeed99af905077010aef81a4dad988b0ba51d4108bf66b443f7e \
+    --hash=sha256:65b499728be3ce7b0cd2cd760da3b32f0f4d7bc55e5e0677617f90f6564e793e
     # via -r requirements.in
 pygments==2.17.2 \
     --hash=sha256:b27c2826c47d0f3219f29554824c30c5e8945175d888647acd804ddd04af846c \
@@ -1063,7 +1061,6 @@ pyjwt[crypto]==2.8.0 \
     # via
     #   gidgethub
     #   pygithub
-    #   pyjwt
 pylsqpack==0.3.18 \
     --hash=sha256:005ddce84bdcbf5c3cf99f764504208e1aa0a91a8331bf47108f2708f2a315e6 \
     --hash=sha256:06e1bbe47514b83cd03158e5558ef8cc44f578169c1820098be9f3cc4137f16a \
