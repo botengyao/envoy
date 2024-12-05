@@ -234,9 +234,9 @@ alabaster==0.7.16 \
     --hash=sha256:75a8b99c28a5dad50dd7f8ccdd447a121ddb3892da9e53d1ca5cca3106d58d65 \
     --hash=sha256:b46733c07dce03ae4e150330b975c75737fa60f0a7c591b6c8bf4928a28e2c92
     # via sphinx
-argcomplete==3.5.0 \
-    --hash=sha256:4349400469dccfb7950bb60334a680c58d88699bff6159df61251878dc6bf74b \
-    --hash=sha256:d4bcf3ff544f51e16e54228a7ac7f486ed70ebf2ecfe49a63a91171c76bf029b
+argcomplete==3.5.1 \
+    --hash=sha256:1a1d148bdaa3e3b93454900163403df41448a248af01b6e849edc5ac08e6c363 \
+    --hash=sha256:eb1ee355aa2557bd3d0145de7b06b2a45b0ce461e1e7813f5d066039ab4177b4
     # via gsutil
 attrs==24.2.0 \
     --hash=sha256:5cfb1b9148b5b086569baec03f20d7b6bf3bcacc9a42bebf87ffaaca362f6346 \
@@ -762,8 +762,8 @@ google-reauth==0.1.1 \
     # via
     #   gcs-oauth2-boto-plugin
     #   gsutil
-gsutil==5.30 \
-    --hash=sha256:ef29d47764d2a3c2436ce50c4e1827626725ba8dbfd3127b42a18641710e7d38
+gsutil==5.32 \
+    --hash=sha256:22a02d235fa850a265e772b765acf906e8e0381adde7b923f7ccafb0a855ec77
     # via -r requirements.in
 httplib2==0.20.4 \
     --hash=sha256:58a98e45b4b1a48273073f905d2961666ecf0fbac4250ea5b47aef259eb5c585 \
