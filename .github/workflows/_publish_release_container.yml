@@ -180,7 +180,7 @@ jobs:
             - tools-v${{ inputs.version-major }}.${{ inputs.version-minor }}-latest
 
     - name: Collect and push OCI artifacts
-      uses: envoyproxy/toolshed/gh-actions/oci/collector@555132e7108208a8a610af6e03c38c97c204119d
+      uses: envoyproxy/toolshed/gh-actions/oci/collector@f70658cd0445b7d763107eaebde543be927c4f7a
       with:
         artifacts-pattern: oci.*
         manifest-config: ${{ steps.dev-config.outputs.value || steps.release-config.outputs.value }}
