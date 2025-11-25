@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package envoy.extensions.filters.http.mcp.v3;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/wrappers.proto";
 
 import "xds/annotations/v3/status.proto";
@@ -21,6 +22,8 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#extension: envoy.filters.http.mcp]
 
 // This filter will inspect and get attributes from MCP traffic.
+// When proxy mode is enabled, it can aggregate multiple MCP backends
+// and handle session management, tool routing, and response merging.
 message Mcp {
   // Traffic handling mode for non-MCP traffic.
   enum TrafficMode {
@@ -51,10 +54,143 @@ message Mcp {
   //
   // Setting it to 0 would disable the limit. It is not recommended to do so in production.
   google.protobuf.UInt32Value max_request_body_size = 3 [(validate.rules).uint32 = {lte: 10485760}];
+
+  // MCP proxy configuration for multi-backend aggregation.
+  // When set and enabled, the filter operates in proxy mode, handling session management,
+  // tool aggregation, and request routing to multiple MCP backends.
+  McpProxyConfig proxy_config = 4;
 }
 
-// McpOverride for MCP filter
+// Configuration for MCP proxy mode with multi-backend support.
+message McpProxyConfig {
+  // Enable MCP proxy mode. When true, the filter handles:
+  // - Session management with encrypted composite session IDs
+  // - Tool/prompt/resource aggregation from multiple backends
+  // - Request routing based on tool prefix
+  // - Response merging with name prefixing
+  bool enabled = 1;
+
+  // Session encryption configuration.
+  // Required when proxy mode is enabled.
+  SessionCryptoConfig session_crypto = 2;
+
+  // MCP backend configurations.
+  // At least one backend is required when proxy mode is enabled.
+  repeated McpBackendConfig backends = 3 [(validate.rules).repeated = {min_items: 1}];
+
+  // Separator used for tool/resource name prefixing.
+  // Format: "{backend_name}{separator}{original_name}"
+  // Defaults to "__" (double underscore).
+  string prefix_separator = 4;
+
+  // Timeout for backend requests.
+  // Defaults to 30 seconds.
+  google.protobuf.Duration backend_timeout = 5;
+
+  // Timeout for initialization fanout to all backends.
+  // Defaults to 60 seconds.
+  google.protobuf.Duration initialization_timeout = 6;
+
+  // Route name for this MCP proxy configuration.
+  // Used in session ID encoding for multi-route deployments.
+  string route_name = 7;
+}
+
+// Configuration for session ID encryption using AES-GCM.
+message SessionCryptoConfig {
+  // Primary seed for key derivation using PBKDF2.
+  // This seed is used to derive the AES-256 encryption key.
+  // Required. Must be at least 16 characters.
+  string encryption_seed = 1 [(validate.rules).string = {min_len: 16}];
+
+  // Fallback seed for key rotation support.
+  // When set, decryption will first try the primary seed,
+  // then fall back to this seed if decryption fails.
+  // This enables zero-downtime key rotation.
+  string fallback_seed = 2;
+
+  // Number of PBKDF2 iterations for key derivation.
+  // Higher values increase security but also CPU usage.
+  // Defaults to 100000. Minimum is 10000.
+  uint32 pbkdf2_iterations = 3 [(validate.rules).uint32 = {gte: 10000}];
+}
+
+// Configuration for an MCP backend server.
+message McpBackendConfig {
+  // Unique name for this backend.
+  // This name is used as the prefix for tools/resources from this backend.
+  // Must be unique within the proxy configuration.
+  // Required. Max 64 characters.
+  string name = 1 [(validate.rules).string = {min_len: 1, max_len: 64}];
+
+  // Envoy cluster name for this backend.
+  // The cluster must be configured separately in Envoy's cluster manager.
+  // Required.
+  string cluster = 2 [(validate.rules).string = {min_len: 1}];
+
+  // HTTP endpoint path for the MCP server.
+  // Defaults to "/mcp".
+  string path = 3;
+
+  // Optional tool selector to filter which tools are exposed from this backend.
+  ToolSelector tool_selector = 4;
+
+  // Backend authentication configuration.
+  BackendAuth auth = 5;
+
+  // Connection timeout for this backend.
+  // Overrides the global backend_timeout if set.
+  google.protobuf.Duration timeout = 6;
+}
+
+// Tool selector for filtering tools exposed by a backend.
+message ToolSelector {
+  // Exact tool names to include.
+  // If empty and include_regex is also empty, all tools are included.
+  repeated string include = 1;
+
+  // RE2-compatible regex patterns for tool names to include.
+  repeated string include_regex = 2;
+
+  // Exact tool names to exclude.
+  // Exclusions are applied after inclusions.
+  repeated string exclude = 3;
+
+  // RE2-compatible regex patterns for tool names to exclude.
+  repeated string exclude_regex = 4;
+}
+
+// Backend authentication configuration.
+message BackendAuth {
+  oneof auth_type {
+    // API key authentication.
+    ApiKeyAuth api_key = 1;
+
+    // Bearer token authentication.
+    BearerTokenAuth bearer = 2;
+  }
+}
+
+// API key authentication for backend.
+message ApiKeyAuth {
+  // Header name to use for the API key.
+  // Defaults to "x-api-key".
+  string header_name = 1;
+
+  // The API key value.
+  // For production, consider using SDS (Secret Discovery Service).
+  string key = 2 [(validate.rules).string = {min_len: 1}];
+}
+
+// Bearer token authentication for backend.
+message BearerTokenAuth {
+  // The bearer token value.
+  // Will be sent as "Authorization: Bearer {token}".
+  string token = 1 [(validate.rules).string = {min_len: 1}];
+}
+
+// McpOverride for MCP filter per-route configuration.
 message McpOverride {
-  // Optional per-route traffic mode override
+  // Optional per-route traffic mode override.
   Mcp.TrafficMode traffic_mode = 1 [(validate.rules).enum = {defined_only: true}];
 }

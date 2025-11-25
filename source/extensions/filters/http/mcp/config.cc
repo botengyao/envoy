@@ -11,12 +11,13 @@ namespace Mcp {
 
 Http::FilterFactoryCb McpFilterConfigFactory::createFilterFactoryFromProtoTyped(
     const envoy::extensions::filters::http::mcp::v3::Mcp& proto_config, const std::string&,
-    Server::Configuration::FactoryContext&) {
+    Server::Configuration::FactoryContext& context) {
 
   auto config = std::make_shared<McpFilterConfig>(proto_config);
+  auto& cluster_manager = context.serverFactoryContext().clusterManager();
 
-  return [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
-    callbacks.addStreamFilter(std::make_shared<McpFilter>(config));
+  return [config, &cluster_manager](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+    callbacks.addStreamFilter(std::make_shared<McpFilter>(config, cluster_manager));
   };
 }
 
