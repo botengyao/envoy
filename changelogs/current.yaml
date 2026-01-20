@@ -24,6 +24,9 @@ bug_fixes:
     ``envoy.reloadable_features.codec_client_enable_idle_timer_only_when_connected`` to ``false``.
 removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
+- area: ext_proc
+  change: |
+    Removed runtime guard ``envoy.reloadable_features.ext_proc_fail_close_spurious_resp`` and legacy code paths.
 
 new_features:
 
