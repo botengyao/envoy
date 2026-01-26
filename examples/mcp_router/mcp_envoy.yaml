@@ -1,0 +1,98 @@
+static_resources:
+  listeners:
+    - name: mcp_listener
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10001
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: mcp_gateway
+                      domains: ["gateway.com"]
+                      routes:
+                        - match:
+                            path: "/mcp"
+                          route:
+                            cluster: deepwiki_one_cluster
+                http_filters:
+                  - name: envoy.filters.http.mcp
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.mcp.v3.Mcp
+                      traffic_mode: REJECT_NO_MCP
+                      clear_route_cache: true
+                  # MCP Router via Rust Dynamic Module
+                  - name: envoy.filters.http.dynamic_modules
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+                      dynamic_module_config:
+                        # Envoy will look for libmcp_router.so
+                        name: mcp_router
+                      filter_name: mcp_router
+                      terminal_filter: true
+                      # JSON config passed to the Rust filter
+                      filter_config:
+                        "@type": type.googleapis.com/google.protobuf.StringValue
+                        value: |
+                          {
+                            "servers": [
+                              {
+                                "name": "deepwiki_one",
+                                "cluster": "deepwiki_one_cluster",
+                                "path": "/mcp",
+                                "host_rewrite": "mcp.deepwiki.com"
+                              },
+                              {
+                                "name": "deepwiki_two",
+                                "cluster": "deepwiki_two_cluster",
+                                "path": "/mcp",
+                                "host_rewrite": "mcp.deepwiki.com"
+                              }
+                            ],
+                            "multiplexing": true
+                          }
+
+  clusters:
+    - name: deepwiki_one_cluster
+      connect_timeout: 30s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: mcp.deepwiki.com
+      load_assignment:
+        cluster_name: deepwiki_one_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: mcp.deepwiki.com
+                      port_value: 443
+
+    - name: deepwiki_two_cluster
+      connect_timeout: 30s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: mcp.deepwiki.com
+      load_assignment:
+        cluster_name: deepwiki_two_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: mcp.deepwiki.com
+                      port_value: 443
