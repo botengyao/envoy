@@ -10,7 +10,7 @@
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
-#include "envoy/extensions/load_balancing_policies/peak_ewma/v3alpha/peak_ewma.pb.h"
+#include "envoy/extensions/load_balancing_policies/peak_ewma/v3/peak_ewma.pb.h"
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/thread_local/thread_local_object.h"
 #include "envoy/upstream/load_balancer.h"
@@ -29,7 +29,7 @@ namespace LoadBalancingPolicies {
 namespace PeakEwma {
 
 // Forward declarations and type aliases.
-using Config = envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma;
+using Config = envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma;
 
 constexpr int64_t kDefaultDecayTimeSeconds = 10;
 constexpr double kDefaultRttMilliseconds = 10.0; // Default RTT for new hosts (10ms).
@@ -81,7 +81,7 @@ public:
       Upstream::ClusterLbStats& stats, Runtime::Loader& runtime, Random::RandomGenerator& random,
       uint32_t healthy_panic_threshold, const Upstream::ClusterInfo& cluster_info,
       TimeSource& time_source,
-      const envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma& config,
+      const envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma& config,
       Event::Dispatcher& main_dispatcher);
 
   ~PeakEwmaLoadBalancer();
@@ -114,7 +114,7 @@ private:
 
   // Core infrastructure.
   const Upstream::PrioritySet& priority_set_;
-  const envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma config_proto_;
+  const envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma config_proto_;
   Random::RandomGenerator& random_;
   TimeSource& time_source_;
   Stats::Scope& stats_scope_;

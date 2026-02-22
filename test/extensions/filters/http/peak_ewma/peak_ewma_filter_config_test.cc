@@ -25,7 +25,7 @@ TEST(PeakEwmaFilterConfigTest, CreateFilterFactory) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
   // Create an empty config proto
-  envoy::extensions::filters::http::peak_ewma::v3alpha::PeakEwmaConfig proto_config;
+  envoy::extensions::filters::http::peak_ewma::v3::PeakEwmaConfig proto_config;
 
   // Create the filter factory
   auto filter_factory =
@@ -47,7 +47,7 @@ TEST(PeakEwmaFilterConfigTest, CreateEmptyConfigProto) {
 
   // Verify it's the right type
   const auto* typed_proto =
-      dynamic_cast<const envoy::extensions::filters::http::peak_ewma::v3alpha::PeakEwmaConfig*>(
+      dynamic_cast<const envoy::extensions::filters::http::peak_ewma::v3::PeakEwmaConfig*>(
           proto.get());
   EXPECT_NE(typed_proto, nullptr);
 }
@@ -61,7 +61,7 @@ TEST(PeakEwmaFilterConfigTest, ConfigTypeUrl) {
   PeakEwmaFilterConfigFactory factory;
   auto config_types = factory.configTypes();
   EXPECT_EQ(config_types.size(), 1);
-  EXPECT_NE(config_types.find("envoy.extensions.filters.http.peak_ewma.v3alpha.PeakEwmaConfig"),
+  EXPECT_NE(config_types.find("envoy.extensions.filters.http.peak_ewma.v3.PeakEwmaConfig"),
             config_types.end());
 }
 
@@ -70,7 +70,7 @@ TEST(PeakEwmaFilterConfigTest, CreateRouteSpecificFilterConfig) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
   // Test that route-specific config is not supported (should return nullptr)
-  envoy::extensions::filters::http::peak_ewma::v3alpha::PeakEwmaConfig proto_config;
+  envoy::extensions::filters::http::peak_ewma::v3::PeakEwmaConfig proto_config;
   auto route_config = factory.createRouteSpecificFilterConfig(
       proto_config, context, ProtobufMessage::getNullValidationVisitor());
 

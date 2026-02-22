@@ -1,7 +1,7 @@
 #pragma once
 
-#include "envoy/extensions/filters/http/peak_ewma/v3alpha/peak_ewma.pb.h"
-#include "envoy/extensions/filters/http/peak_ewma/v3alpha/peak_ewma.pb.validate.h"
+#include "envoy/extensions/filters/http/peak_ewma/v3/peak_ewma.pb.h"
+#include "envoy/extensions/filters/http/peak_ewma/v3/peak_ewma.pb.validate.h"
 
 #include "source/extensions/filters/http/common/factory_base.h"
 
@@ -12,13 +12,13 @@ namespace PeakEwma {
 
 class PeakEwmaFilterConfigFactory
     : public Extensions::HttpFilters::Common::FactoryBase<
-          envoy::extensions::filters::http::peak_ewma::v3alpha::PeakEwmaConfig> {
+          envoy::extensions::filters::http::peak_ewma::v3::PeakEwmaConfig> {
 public:
   PeakEwmaFilterConfigFactory() : FactoryBase("envoy.filters.http.peak_ewma") {}
 
 private:
   Http::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::http::peak_ewma::v3alpha::PeakEwmaConfig& proto_config,
+      const envoy::extensions::filters::http::peak_ewma::v3::PeakEwmaConfig& proto_config,
       const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
 };
 

@@ -30,7 +30,7 @@ public:
     config_helper_.prependFilter(R"EOF(
 name: envoy.filters.http.peak_ewma
 typed_config:
-  "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3alpha.PeakEwmaConfig
+  "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3.PeakEwmaConfig
 )EOF");
 
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
@@ -69,7 +69,7 @@ typed_config:
       - typed_extension_config:
           name: envoy.load_balancing_policies.peak_ewma
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma
+            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma
             decay_time: 0.100s
       )EOF";
 

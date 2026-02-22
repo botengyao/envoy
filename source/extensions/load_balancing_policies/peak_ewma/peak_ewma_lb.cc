@@ -53,7 +53,7 @@ PeakEwmaLoadBalancer::PeakEwmaLoadBalancer(
     Upstream::ClusterLbStats& /*stats*/, Runtime::Loader& runtime, Random::RandomGenerator& random,
     uint32_t /* healthy_panic_threshold */, const Upstream::ClusterInfo& cluster_info,
     TimeSource& time_source,
-    const envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma& config,
+    const envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma& config,
     Event::Dispatcher& main_dispatcher)
     : LoadBalancerBase(priority_set, cluster_info.lbStats(), runtime, random,
                        PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(

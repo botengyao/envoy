@@ -48,7 +48,7 @@ public:
     ON_CALL(time_source_, monotonicTime())
         .WillByDefault(Return(MonotonicTime(std::chrono::milliseconds(1234567890))));
 
-    envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma config;
+    envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma config;
     config.mutable_decay_time()->set_seconds(10);
 
     lb_ = std::make_unique<PeakEwmaLoadBalancer>(priority_set_, nullptr, stats_, runtime_, random_,

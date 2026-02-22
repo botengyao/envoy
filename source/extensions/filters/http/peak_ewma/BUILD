@@ -34,6 +34,6 @@ envoy_cc_extension(
         ":peak_ewma_http_filter_lib",
         "//envoy/registry",
         "//source/extensions/filters/http/common:factory_base_lib",
-        "@envoy_api//envoy/extensions/filters/http/peak_ewma/v3alpha:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/http/peak_ewma/v3:pkg_cc_proto",
     ],
 )

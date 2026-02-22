@@ -1,8 +1,8 @@
 #pragma once
 
 #include "envoy/event/dispatcher.h"
-#include "envoy/extensions/load_balancing_policies/peak_ewma/v3alpha/peak_ewma.pb.h"
-#include "envoy/extensions/load_balancing_policies/peak_ewma/v3alpha/peak_ewma.pb.validate.h"
+#include "envoy/extensions/load_balancing_policies/peak_ewma/v3/peak_ewma.pb.h"
+#include "envoy/extensions/load_balancing_policies/peak_ewma/v3/peak_ewma.pb.validate.h"
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/upstream/load_balancer.h"
 
@@ -15,7 +15,7 @@ namespace Extensions {
 namespace LoadBalancingPolicies {
 namespace PeakEwma {
 
-using PeakEwmaLbProto = envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma;
+using PeakEwmaLbProto = envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma;
 
 class TypedPeakEwmaLbConfig : public Upstream::LoadBalancerConfig {
 public:

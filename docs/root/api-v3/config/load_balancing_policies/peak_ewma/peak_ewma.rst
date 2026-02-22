@@ -4,7 +4,7 @@
 Peak EWMA Load Balancer
 ========================
 
-* This load balancer should be configured with the type URL ``type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma``.
+* This load balancer should be configured with the type URL ``type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma``.
 
 .. note::
 
@@ -94,14 +94,14 @@ For comprehensive host health management, configure Peak EWMA alongside:
       - typed_extension_config:
           name: envoy.load_balancing_policies.peak_ewma
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma
+            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma
             decay_time: 10s
 
   # HTTP filter configuration - required for RTT measurement
   http_filters:
   - name: envoy.filters.http.peak_ewma
     typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3alpha.PeakEwmaConfig
+      "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3.PeakEwmaConfig
 
 Configuration Parameters
 ------------------------
@@ -142,13 +142,13 @@ Example configuration
       - typed_extension_config:
           name: envoy.load_balancing_policies.peak_ewma
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma
+            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma
 
   # HTTP filter configuration - required for RTT measurement
   http_filters:
   - name: envoy.filters.http.peak_ewma
     typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3alpha.PeakEwmaConfig
+      "@type": type.googleapis.com/envoy.extensions.filters.http.peak_ewma.v3.PeakEwmaConfig
 
 **Complete configuration** showing all available parameters:
 
@@ -160,7 +160,7 @@ Example configuration
       - typed_extension_config:
           name: envoy.load_balancing_policies.peak_ewma
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma
+            "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma
             decay_time: 10s
             aggregation_interval: 100ms
             max_samples_per_host: 1000
@@ -197,4 +197,4 @@ API Reference
 -------------
 
 The Peak EWMA load balancing policy is configured using the
-``envoy.extensions.load_balancing_policies.peak_ewma.v3alpha.PeakEwma`` proto message.
+``envoy.extensions.load_balancing_policies.peak_ewma.v3.PeakEwma`` proto message.

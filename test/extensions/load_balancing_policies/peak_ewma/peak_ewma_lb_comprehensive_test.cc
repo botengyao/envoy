@@ -80,7 +80,7 @@ protected:
 
   std::vector<Upstream::HostSharedPtr> hosts_;
   std::unique_ptr<PeakEwmaLoadBalancer> lb_;
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma config_;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma config_;
 };
 
 TEST_F(PeakEwmaLoadBalancerComprehensiveTest, LoadBalancerCreation) {

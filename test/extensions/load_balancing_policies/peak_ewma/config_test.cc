@@ -1,4 +1,4 @@
-#include "envoy/extensions/load_balancing_policies/peak_ewma/v3alpha/peak_ewma.pb.h"
+#include "envoy/extensions/load_balancing_policies/peak_ewma/v3/peak_ewma.pb.h"
 #include "envoy/registry/registry.h"
 #include "envoy/upstream/load_balancer.h"
 
@@ -84,7 +84,7 @@ TEST_F(PeakEwmaConfigTest, CreateEmptyConfigProto) {
 
   // Verify it's the right type
   const auto* typed_proto =
-      dynamic_cast<const envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma*>(
+      dynamic_cast<const envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma*>(
           proto.get());
   EXPECT_NE(typed_proto, nullptr);
 }
@@ -94,7 +94,7 @@ TEST_F(PeakEwmaConfigTest, LoadConfigWithDefaults) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
   // Create a minimal config proto
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma proto_config;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma proto_config;
 
   auto result = factory.loadConfig(context, proto_config);
   EXPECT_TRUE(result.ok());
@@ -110,7 +110,7 @@ TEST_F(PeakEwmaConfigTest, LoadConfigWithCustomValues) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
   // Create config with custom values
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma proto_config;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma proto_config;
   proto_config.mutable_decay_time()->set_seconds(5);         // 5 second decay time
   proto_config.mutable_penalty_value()->set_value(750000.0); // Custom penalty value
 
@@ -129,7 +129,7 @@ TEST_F(PeakEwmaConfigTest, CreateThreadAwareLoadBalancer) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
   // Create config
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma proto_config;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma proto_config;
 
   auto config_result = factory.loadConfig(context, proto_config);
   EXPECT_TRUE(config_result.ok());
@@ -173,7 +173,7 @@ TEST_F(PeakEwmaConfigTest, CreateWithNullConfig) {
 
 TEST_F(PeakEwmaConfigTest, ConfigValidation) {
   // Test that extreme values are handled
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma proto_config;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma proto_config;
 
   // Very small decay time
   proto_config.mutable_decay_time()->set_nanos(1000000); // 1ms
@@ -192,7 +192,7 @@ TEST_F(PeakEwmaConfigTest, MultipleLoadBalancerInstances) {
   Factory factory;
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
-  envoy::extensions::load_balancing_policies::peak_ewma::v3alpha::PeakEwma proto_config;
+  envoy::extensions::load_balancing_policies::peak_ewma::v3::PeakEwma proto_config;
 
   auto config_result = factory.loadConfig(context, proto_config);
   EXPECT_TRUE(config_result.ok());
