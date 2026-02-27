@@ -375,6 +375,12 @@ public:
     return expected_transport_failure_reason_contains_;
   }
 
+  TestUtilOptions& setExpectedClientStats(const std::string& stat) {
+    expected_client_stats_ = stat;
+    return *this;
+  }
+  const std::string& expectedClientStats() const { return expected_client_stats_; }
+
   TestUtilOptions& setNotExpectedClientStats(const std::string& stat) {
     not_expected_client_stats_ = stat;
     return *this;
@@ -428,6 +434,7 @@ private:
   std::string expected_ocsp_response_;
   bool ocsp_stapling_enabled_{false};
   std::string expected_transport_failure_reason_contains_;
+  std::string expected_client_stats_;
   std::string not_expected_client_stats_;
   int expected_verify_error_code_{-1};
   std::string expected_sni_;
@@ -773,6 +780,10 @@ void testUtil(const TestUtilOptions& options) {
     EXPECT_EQ(1UL, server_stats_store.counter(options.expectedServerStats()).value());
   }
 
+  if (!options.expectedClientStats().empty()) {
+    EXPECT_EQ(1UL, client_stats_store.counter(options.expectedClientStats()).value());
+  }
+
   if (!options.notExpectedClientStats().empty()) {
     EXPECT_EQ(0, client_stats_store.counter(options.notExpectedClientStats()).value());
   }
@@ -848,6 +859,13 @@ public:
     return *this;
   }
 
+  TestUtilOptionsV2& setNotExpectedClientStats(const std::string& not_expected_client_stats) {
+    not_expected_client_stats_ = not_expected_client_stats;
+    return *this;
+  }
+
+  const std::string& notExpectedClientStats() const { return not_expected_client_stats_; }
+
   TestUtilOptionsV2& setClientSession(const std::string& client_session) {
     client_session_ = client_session;
     return *this;
@@ -916,6 +934,7 @@ private:
   const envoy::config::listener::v3::Listener& listener_;
   const envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext& client_ctx_proto_;
   std::string expected_client_stats_;
+  std::string not_expected_client_stats_;
 
   std::string client_session_;
   std::string expected_cipher_suite_;
@@ -1130,6 +1149,11 @@ void testUtilV2(const TestUtilOptionsV2& options) {
 
   if (!options.expectedClientStats().empty()) {
     EXPECT_EQ(1UL, client_stats_store.counter(options.expectedClientStats()).value());
+  }
+
+  if (!options.notExpectedClientStats().empty()) {
+    EXPECT_EQ(0UL, client_stats_store.counter(options.notExpectedClientStats()).value())
+        << options.notExpectedClientStats() << " should not be incremented";
   }
 
   if (options.expectSuccess()) {
@@ -1710,6 +1734,49 @@ TEST_P(SslSocketTest, NoCert) {
   testUtil(test_options.setExpectedServerStats("ssl.no_certificate")
                .setExpectNoCert()
                .setExpectNoCertChain());
+}
+
+TEST_P(SslSocketTest, NoClientCertificateStatsOnUpstream) {
+  const std::string client_ctx_yaml = R"EOF(
+    common_tls_context:
+  )EOF";
+
+  const std::string server_ctx_yaml = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+)EOF";
+
+  TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, version_);
+  testUtil(test_options.setExpectedClientStats("ssl.no_certificate")
+               .setExpectNoCert()
+               .setExpectNoCertChain());
+}
+
+TEST_P(SslSocketTest, ClientCertificateNoStatsOnUpstream) {
+  const std::string client_ctx_yaml = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/san_uri_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/san_uri_key.pem"
+)EOF";
+
+  const std::string server_ctx_yaml = R"EOF(
+  common_tls_context:
+    tls_certificates:
+      certificate_chain:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+      private_key:
+        filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+)EOF";
+
+  TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, version_);
+  testUtil(test_options.setNotExpectedClientStats("ssl.no_certificate"));
 }
 
 TEST_P(SslSocketTest, NoLocalCert) {

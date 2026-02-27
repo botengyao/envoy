@@ -557,8 +557,16 @@ void ContextImpl::logHandshake(SSL* ssl) const {
     incCounter(ssl_sigalgs_, sigalg, unknown_ssl_algorithm_);
   }
 
-  bssl::UniquePtr<X509> cert(SSL_get_peer_certificate(ssl));
-  if (!cert.get()) {
+  // The `ssl.no_certificate` metric is used on both downstream and upstream TLS contexts.
+  // For downstream handshakes Envoy is a server and should inspect the peer's (client)
+  // certificate. For upstream handshakes Envoy is a client and should inspect Envoy's local
+  // client certificate, which may be absent for one-way TLS.
+  if (SSL_is_server(ssl)) {
+    bssl::UniquePtr<X509> cert(SSL_get_peer_certificate(ssl));
+    if (!cert) {
+      stats_.no_certificate_.inc();
+    }
+  } else if (SSL_get_certificate(ssl) == nullptr) {
     stats_.no_certificate_.inc();
   }
 

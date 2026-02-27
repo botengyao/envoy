@@ -184,6 +184,11 @@ bug_fixes:
   change: |
     Fixed MCP router to support session-less backends that do not return ``mcp-session-id``
     headers. Previously this caused a spurious 500 error.
+- area: tls
+  change: |
+    Fixed ``ssl.no_certificate`` stat not being incremented for upstream (client) TLS connections.
+    The stat now correctly checks Envoy's own client certificate via ``SSL_get_certificate`` when
+    acting as client, and the peer certificate via ``SSL_get_peer_certificate`` when acting as server.
 
 removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
