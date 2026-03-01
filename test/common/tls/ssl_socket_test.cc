@@ -438,7 +438,6 @@ private:
   std::string not_expected_client_stats_;
   int expected_verify_error_code_{-1};
   std::string expected_sni_;
-  std::string expected_client_stats_;
 };
 
 Network::ListenerPtr createListener(Network::SocketSharedPtr&& socket,

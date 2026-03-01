@@ -557,16 +557,12 @@ void ContextImpl::logHandshake(SSL* ssl) const {
     incCounter(ssl_sigalgs_, sigalg, unknown_ssl_algorithm_);
   }
 
-  // Check whether a certificate was present for this handshake direction.
-  // Server (downstream): peer cert absent means the client connected without mTLS.
-  // Client (upstream):   own cert absent means Envoy connected with one-way TLS.
-  const bool missing_certificate =
-      SSL_is_server(ssl) ? bssl::UniquePtr<X509>(SSL_get_peer_certificate(ssl)).get() == nullptr
-                         : SSL_get_certificate(ssl) == nullptr;
-  if (missing_certificate) {
+  bssl::UniquePtr<X509> cert(SSL_get_peer_certificate(ssl));
+  if (!cert.get()) {
     stats_.no_certificate_.inc();
   }
 
+  // Client (upstream): own cert absent means Envoy connected with one-way TLS.
   if (!SSL_is_server(ssl) && SSL_get_certificate(ssl) == nullptr) {
     stats_.no_certificate_for_upstream_.inc();
   }
