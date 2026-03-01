@@ -859,12 +859,6 @@ public:
     return *this;
   }
 
-  TestUtilOptionsV2& setNotExpectedClientStats(const std::string& not_expected_client_stats) {
-    not_expected_client_stats_ = not_expected_client_stats;
-    return *this;
-  }
-
-  const std::string& notExpectedClientStats() const { return not_expected_client_stats_; }
 
   TestUtilOptionsV2& setClientSession(const std::string& client_session) {
     client_session_ = client_session;
@@ -934,7 +928,6 @@ private:
   const envoy::config::listener::v3::Listener& listener_;
   const envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext& client_ctx_proto_;
   std::string expected_client_stats_;
-  std::string not_expected_client_stats_;
 
   std::string client_session_;
   std::string expected_cipher_suite_;
@@ -1149,11 +1142,6 @@ void testUtilV2(const TestUtilOptionsV2& options) {
 
   if (!options.expectedClientStats().empty()) {
     EXPECT_EQ(1UL, client_stats_store.counter(options.expectedClientStats()).value());
-  }
-
-  if (!options.notExpectedClientStats().empty()) {
-    EXPECT_EQ(0UL, client_stats_store.counter(options.notExpectedClientStats()).value())
-        << options.notExpectedClientStats() << " should not be incremented";
   }
 
   if (options.expectSuccess()) {
