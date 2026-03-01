@@ -13,6 +13,7 @@ namespace Tls {
   COUNTER(handshake)                                                                               \
   COUNTER(session_reused)                                                                          \
   COUNTER(no_certificate)                                                                          \
+  COUNTER(no_certificate_for_upstream)                                                             \
   COUNTER(fail_verify_no_cert)                                                                     \
   COUNTER(fail_verify_error)                                                                       \
   COUNTER(fail_verify_san)                                                                         \

@@ -567,6 +567,10 @@ void ContextImpl::logHandshake(SSL* ssl) const {
     stats_.no_certificate_.inc();
   }
 
+  if (!SSL_is_server(ssl) && SSL_get_certificate(ssl) == nullptr) {
+    stats_.no_certificate_for_upstream_.inc();
+  }
+
   // Increment the `was_key_usage_invalid_` stats to indicate the given cert would have triggered an
   // error but is allowed because the enforcement that rsa key usage and tls usage need to be
   // matched has been disabled.

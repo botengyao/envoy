@@ -438,6 +438,7 @@ private:
   std::string not_expected_client_stats_;
   int expected_verify_error_code_{-1};
   std::string expected_sni_;
+  std::string expected_client_stats_;
 };
 
 Network::ListenerPtr createListener(Network::SocketSharedPtr&& socket,
@@ -1751,20 +1752,18 @@ TEST_P(SslSocketTest, NoClientCertificateStatsOnUpstream) {
 )EOF";
 
   TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, version_);
-  testUtil(test_options.setExpectedClientStats("ssl.no_certificate")
-               .setExpectNoCert()
-               .setExpectNoCertChain());
+  testUtil(test_options.setExpectedClientStats("ssl.no_certificate_for_upstream"));
 }
 
 TEST_P(SslSocketTest, ClientCertificateNoStatsOnUpstream) {
   const std::string client_ctx_yaml = R"EOF(
-  common_tls_context:
-    tls_certificates:
-      certificate_chain:
-        filename: "{{ test_rundir }}/test/common/tls/test_data/san_uri_cert.pem"
-      private_key:
-        filename: "{{ test_rundir }}/test/common/tls/test_data/san_uri_key.pem"
-)EOF";
+    common_tls_context:
+      tls_certificates:
+        certificate_chain:
+          filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_cert.pem"
+        private_key:
+          filename: "{{ test_rundir }}/test/common/tls/test_data/unittest_key.pem"
+  )EOF";
 
   const std::string server_ctx_yaml = R"EOF(
   common_tls_context:
@@ -1776,7 +1775,7 @@ TEST_P(SslSocketTest, ClientCertificateNoStatsOnUpstream) {
 )EOF";
 
   TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, version_);
-  testUtil(test_options.setNotExpectedClientStats("ssl.no_certificate"));
+  testUtil(test_options.setNotExpectedClientStats("ssl.no_certificate_for_upstream"));
 }
 
 TEST_P(SslSocketTest, NoLocalCert) {
