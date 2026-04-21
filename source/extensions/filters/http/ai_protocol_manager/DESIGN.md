@@ -8,10 +8,15 @@ semantics and config proto are intentionally deferred.
 `ai_protocol_manager` is a **decoder-only, terminal** HTTP filter that:
 
 1. Consumes the full HTTP request (headers, body, trailers).
-2. Parses the body as JSON-RPC into a protocol-agnostic internal
-   representation (`AiRequest`) that unifies the common fields of:
-   - **Inference** APIs (OpenAI-style `chat.completions`, `responses`, …)
-   - **Agent** protocols (A2A, MCP).
+2. Parses the body into a protocol-agnostic internal representation
+   (`AiRequest`) that unifies the common fields of:
+   - **Inference** APIs — plain JSON bodies (OpenAI-style
+     `chat.completions`, `responses`, Gemini `generateContent`, …).
+   - **Agent** protocols — JSON-RPC 2.0 bodies (MCP; A2A when
+     transported over JSON-RPC).
+   The decoder dispatches on the classified protocol: plain JSON is
+   parsed directly; JSON-RPC honors the `{jsonrpc,id,method,params}`
+   envelope.
 3. Dispatches the `AiRequest` through one of two **sub filter chains**
    exposed to operators:
    - **Inference filter chain** (`inference_chain`) — for model
@@ -19,9 +24,10 @@ semantics and config proto are intentionally deferred.
    - **Agent filter chain** (`agent_chain`) — for agent protocol
      messages.
 4. At the end of each sub-chain, a **terminal dispatch filter** re-encodes
-   the `AiRequest` back into JSON-RPC and forwards it to one or more HTTP
-   backends via `Http::AsyncClient`, then pumps the response(s) back to
-   the downstream caller.
+   the `AiRequest` (in the backend's expected schema — OpenAI, Gemini,
+   MCP, etc.) and forwards it to one or more HTTP backends via
+   `Http::AsyncClient`, then pumps the response(s) back to the downstream
+   caller.
 
 The filter replaces what would otherwise be two parallel stacks (one per
 protocol family) and lets AI-aware logic — routing, budgeting, PII
@@ -50,8 +56,9 @@ against a neutral request type.
  │            │                                                       │
  │            ▼                                                       │
  │   ┌──────────────────┐        ┌──────────────────────────────┐     │
- │   │ JsonRpcDecoder   │───────▶│ AiRequest (internal repr.)   │     │
- │   │  (streaming)     │        │  + PayloadRefs → PayloadStore│     │
+ │   │ AiRequestDecoder │───────▶│ AiRequest (internal repr.)   │     │
+ │   │  (JSON | JSON-RPC│        │  + PayloadRefs → PayloadStore│     │
+ │   │   , streaming)   │        │                              │     │
  │   └──────────────────┘        └──────────────┬───────────────┘     │
  │                                              │                     │
  │                              classify(protocol) picks ONE chain    │
@@ -68,7 +75,8 @@ against a neutral request type.
  │                      ┌──────────────────┐       ┌──────────────────┐
  │                      │ InferenceDispatch│       │  AgentDispatch   │
  │                      │   (terminal,     │       │    (terminal,    │
- │                      │  JsonRpcEncoder) │       │  JsonRpcEncoder) │
+ │                      │ AiRequestEncoder │       │ AiRequestEncoder │
+ │                      │  — OpenAI/Gemini)│       │  — MCP JSON-RPC) │
  │                      └────────┬─────────┘       └────────┬─────────┘
  │                               └──────────────┬───────────┘         │
  │                                              ▼                     │
@@ -79,7 +87,7 @@ against a neutral request type.
                               downstream response
 ```
 
-`AiRequest` is the **shared** neutral model: `JsonRpcDecoder` emits one,
+`AiRequest` is the **shared** neutral model: `AiRequestDecoder` emits one,
 `classify()` selects which sub-chain runs, and that same `AiRequest`
 (possibly mutated by chain filters) is handed to the sub-chain's
 terminal `*Dispatch` filter for re-encoding. The two sub-chains differ
@@ -103,12 +111,12 @@ ai_protocol_manager/
 ├── filter.h / filter.cc                 # AiProtocolManagerFilter
 ├── filter_config.h / filter_config.cc   # AiProtocolManagerConfig, stats
 │
-│   # Protocol-neutral request model + JSON-RPC codec
+│   # Protocol-neutral request model + body codec
 ├── codec/
 │   ├── ai_request.h / ai_request.cc         # AiRequest, AiResponse, enums
 │   ├── ai_payload.h / ai_payload.cc         # PayloadRef, PayloadStore iface
-│   ├── json_rpc_decoder.h / .cc             # streaming decoder → AiRequest
-│   ├── json_rpc_encoder.h / .cc             # AiRequest → JSON-RPC buffer
+│   ├── ai_request_decoder.h / .cc           # body → AiRequest (JSON | JSON-RPC)
+│   ├── ai_request_encoder.h / .cc           # AiRequest → outbound body
 │   ├── inference_mapping.h / .cc            # OpenAI-style ↔ AiRequest
 │   ├── agent_mapping.h / .cc                # A2A + MCP ↔ AiRequest
 │   └── protocol_classifier.h / .cc          # headers+method → ProtocolKind
@@ -348,35 +356,45 @@ Initial implementations:
 The decoder owns a `PayloadStore*` and, when a field crosses a
 configured byte threshold during streaming, emits an `External` ref
 instead of an `Inline`/`Buffered` one. The encoder resolves refs back
-into the outbound JSON-RPC buffer.
+into the outbound body buffer.
 
-### 4.3 `JsonRpcDecoder` / `JsonRpcEncoder`
+### 4.3 `AiRequestDecoder` / `AiRequestEncoder`
 
-`codec/json_rpc_decoder.h` exposes a streaming interface modeled on the
+AI requests are not always JSON-RPC: inference APIs (OpenAI
+chat/completions, Gemini generateContent, embeddings) are **plain JSON**,
+while agent APIs (MCP, A2A-over-JSON-RPC) carry a JSON-RPC 2.0 envelope.
+The decoder handles both shapes, dispatched by `ProtocolKind`.
+
+`codec/ai_request_decoder.h` exposes a streaming interface modeled on the
 existing `McpJsonParser` (see
 `source/extensions/filters/http/mcp/mcp_json_parser.h`). Key properties:
 
 ```cpp
-class JsonRpcDecoder : public Logger::Loggable<Logger::Id::filter> {
+class AiRequestDecoder : public Logger::Loggable<Logger::Id::filter> {
 public:
-  JsonRpcDecoder(const DecoderConfig&, PayloadStore&);
+  AiRequestDecoder(const DecoderConfig&, PayloadStore&, ProtocolKind);
   absl::Status onData(absl::string_view chunk);  // incremental
   absl::Status onEndStream();
   absl::StatusOr<AiRequest> take();              // owns result
 };
 ```
 
-- Field-level callbacks into a protocol mapper
-  (`InferenceMapping` or `AgentMapping`) which know how to translate
-  OpenAI/A2A/MCP shapes into `AiRequest` fields.
+- For plain JSON (Inference), the decoder feeds bytes straight into the
+  `InferenceMapping` and leaves `AiRequest::jsonrpc_id` / `::method`
+  empty.
+- For JSON-RPC (Agent), the decoder strips the `{jsonrpc,id,method,
+  params}` envelope into envelope fields on `AiRequest` and hands
+  `params` to `AgentMapping`.
 - Streaming sink so large string fields (`messages[*].content`,
   `tool_call.function.arguments`, `attachments[*].data`) can be
   redirected to `PayloadStore` without ever being concatenated in
   memory.
 
-`JsonRpcEncoder` is the dual: it writes an `AiRequest` back to a
-`Buffer::Instance`, resolving `PayloadRef`s lazily (supports async
-`fetch()` when a backend demands an inlined body).
+`AiRequestEncoder` is the dual interface: concrete encoders emit plain
+JSON (OpenAI-shaped, Gemini-shaped, AWS-Bedrock-shaped, …) or JSON-RPC
+(MCP) depending on the target backend. The dispatch layer picks the
+right encoder per request. Encoders resolve `PayloadRef`s lazily
+(supports async `fetch()` when a backend demands an inlined body).
 
 ### 4.4 Protocol classification
 
@@ -580,7 +598,7 @@ each kind in that union:
   only the interested filters in order.
 - If no filter is interested, the runtime **skips the kind entirely** —
   the items remain as `PayloadRef`s in the payload variant and are
-  re-encoded by `JsonRpcEncoder` without ever being materialized into
+  re-encoded by `AiRequestEncoder` without ever being materialized into
   filter memory.
 
 This is the core I/O-hiding guarantee: a chain full of metadata-only
@@ -642,7 +660,7 @@ abstraction the way `router` sits outside `http_filters`.
 
 Responsibilities:
 
-1. Invoke `JsonRpcEncoder` to serialize the (possibly rewritten)
+1. Invoke `AiRequestEncoder` to serialize the (possibly rewritten)
    `AiRequest`.
 2. Resolve per-backend routing: one or N backends (fanout), which
    cluster / path / auth header set.
@@ -669,17 +687,17 @@ decodeHeaders
   → StopIteration, wait for body
 
 decodeData (streaming)
-  → JsonRpcDecoder::onData
+  → AiRequestDecoder::onData
   → large fields flushed to PayloadStore as External refs
 
 decodeTrailers / end_stream
-  → JsonRpcDecoder::onEndStream → AiRequest
+  → AiRequestDecoder::onEndStream → AiRequest
   → SubChain::run(AiRequest)
        ├ AiFilter #1 onRequest → Continue
        ├ AiFilter #2 onRequest → StopIteration … continueRequest()
        └ …
   → DispatchFilter
-       ├ JsonRpcEncoder → Buffer
+       ├ AiRequestEncoder → Buffer
        ├ Http::AsyncClient → upstream(s)
        ├ aggregate responses → AiResponse
        └ SubChain::runResponse(AiResponse)  // v0: no-op
@@ -722,8 +740,8 @@ Plus per-sub-chain histograms for decode/encode/dispatch latency.
 ```
 test/extensions/filters/http/ai_protocol_manager/
 ├── codec/
-│   ├── json_rpc_decoder_test.cc
-│   ├── json_rpc_encoder_test.cc
+│   ├── ai_request_decoder_test.cc
+│   ├── ai_request_encoder_test.cc
 │   ├── inference_mapping_test.cc
 │   ├── agent_mapping_test.cc
 │   └── payload_store_test.cc

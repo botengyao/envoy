@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ai_protocol_manager.v3;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.ai_protocol_manager.v3";
+option java_outer_classname = "AiProtocolManagerProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ai_protocol_manager/v3;ai_protocol_managerv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI Protocol Manager]
+// AI Protocol Manager filter :ref:`configuration overview
+// <config_http_filters_ai_protocol_manager>`.
+// [#extension: envoy.filters.http.ai_protocol_manager]
+//
+// Terminal, decoder-only HTTP filter that parses inference and agent protocol
+// bodies into a neutral AiRequest model, runs them through a sub-chain of
+// AiFilters, and dispatches to upstream backends. See DESIGN.md for the full
+// model. This proto is intentionally minimal for V0; fields will grow as the
+// implementation phases land.
+
+// Sub-chain filter config — matches Envoy's standard {name, typed_config} idiom.
+message AiFilterConfig {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  // Filter name used to look up the registered factory.
+  string name = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Filter-specific typed configuration.
+  google.protobuf.Any typed_config = 2;
+}
+
+// Configuration for the Inference sub-chain.
+message InferenceChain {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  repeated AiFilterConfig filters = 1;
+
+  // Dispatch config is intentionally left as a typed Any for V0 so that
+  // request/response schema selection (OpenAI, Gemini, Claude-on-Vertex, ...)
+  // can be specialized by dispatch implementations without proto churn.
+  google.protobuf.Any dispatch = 2;
+}
+
+// Configuration for the Agent sub-chain.
+message AgentChain {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  repeated AiFilterConfig filters = 1;
+  google.protobuf.Any dispatch = 2;
+}
+
+// Codec-layer configuration.
+message CodecConfig {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  // If set, JSON fields larger than this byte threshold are offloaded to the
+  // PayloadStore as External refs rather than materialized inline. Zero means
+  // no offload — everything stays Inline/Buffered.
+  google.protobuf.UInt32Value max_inline_bytes = 1;
+}
+
+// Classifier configuration.
+message ClassifierConfig {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  // Path prefixes that route requests to the Inference sub-chain
+  // (e.g. "/v1/chat/completions", "/v1/completions", "/v1/embeddings").
+  repeated string inference_path_prefixes = 1;
+
+  // Path prefixes that route requests to the Agent sub-chain
+  // (e.g. "/a2a", "/mcp").
+  repeated string agent_path_prefixes = 2;
+}
+
+// Root configuration for the AI Protocol Manager filter.
+// [#next-free-field: 5]
+message AiProtocolManager {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  InferenceChain inference_chain = 1;
+  AgentChain agent_chain = 2;
+  CodecConfig codec = 3;
+  ClassifierConfig classifier = 4;
+}
+
+// Per-route override. Intentionally empty for V0; added as specialization
+// surface for future per-route sub-chain adjustments (see DESIGN.md §11.5).
+message AiProtocolManagerOverride {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+}
