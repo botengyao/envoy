@@ -40,43 +40,52 @@ against a neutral request type.
 ## 2. High-level architecture
 
 ```
-                          downstream HTTP request
-                                   │
-                                   ▼
- ┌──────────────────────────────────────────────────────────────────┐
- │                  AiProtocolManagerFilter (terminal)              │
- │                                                                  │
- │   decodeHeaders / decodeData / decodeTrailers                    │
- │            │                                                     │
- │            ▼                                                     │
- │   ┌──────────────────┐     ┌─────────────────────────────────┐   │
- │   │ JsonRpcDecoder   │────▶│ AiRequest  (internal repr.)     │   │
- │   │ (streaming)      │     │  + PayloadRefs → PayloadStore   │   │
- │   └──────────────────┘     └─────────────────────────────────┘   │
- │            │                            │                        │
- │            │   classify(protocol)       │                        │
- │            ▼                            ▼                        │
- │     ┌──────────────┐             ┌──────────────┐                │
- │     │  Inference   │             │    Agent     │                │
- │     │  SubChain    │             │   SubChain   │                │
- │     │  (ordered    │             │  (ordered    │                │
- │     │  AiFilters)  │             │   AiFilters) │                │
- │     └──────┬───────┘             └──────┬───────┘                │
- │            │                            │                        │
- │            ▼                            ▼                        │
- │     ┌──────────────┐             ┌──────────────┐                │
- │     │ Inference    │             │   Agent      │                │
- │     │ Dispatch     │             │  Dispatch    │                │
- │     │ (terminal)   │             │  (terminal)  │                │
- │     └──────┬───────┘             └──────┬───────┘                │
- │            │    JsonRpcEncoder          │                        │
- │            ▼                            ▼                        │
- │         Http::AsyncClient  ──▶  one or more upstream clusters    │
- └──────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-                             downstream response
+                            downstream HTTP request
+                                     │
+                                     ▼
+ ┌────────────────────────────────────────────────────────────────────┐
+ │                  AiProtocolManagerFilter (terminal)                │
+ │                                                                    │
+ │   decodeHeaders / decodeData / decodeTrailers                      │
+ │            │                                                       │
+ │            ▼                                                       │
+ │   ┌──────────────────┐        ┌──────────────────────────────┐     │
+ │   │ JsonRpcDecoder   │───────▶│ AiRequest (internal repr.)   │     │
+ │   │  (streaming)     │        │  + PayloadRefs → PayloadStore│     │
+ │   └──────────────────┘        └──────────────┬───────────────┘     │
+ │                                              │                     │
+ │                              classify(protocol) picks ONE chain    │
+ │                               ┌──────────────┴──────────────┐      │
+ │                               ▼                             ▼      │
+ │                      ┌──────────────────┐       ┌──────────────────┐
+ │                      │ InferenceChain   │       │   AgentChain     │
+ │                      │ (ordered         │       │  (ordered        │
+ │                      │  AiFilters over  │       │   AiFilters over │
+ │                      │  AiRequest)      │       │   AiRequest)     │
+ │                      └────────┬─────────┘       └────────┬─────────┘
+ │                               │ AiRequest                │ AiRequest│
+ │                               ▼                          ▼          │
+ │                      ┌──────────────────┐       ┌──────────────────┐
+ │                      │ InferenceDispatch│       │  AgentDispatch   │
+ │                      │   (terminal,     │       │    (terminal,    │
+ │                      │  JsonRpcEncoder) │       │  JsonRpcEncoder) │
+ │                      └────────┬─────────┘       └────────┬─────────┘
+ │                               └──────────────┬───────────┘         │
+ │                                              ▼                     │
+ │                              Http::AsyncClient → upstream(s)       │
+ └────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+                              downstream response
 ```
+
+`AiRequest` is the **shared** neutral model: `JsonRpcDecoder` emits one,
+`classify()` selects which sub-chain runs, and that same `AiRequest`
+(possibly mutated by chain filters) is handed to the sub-chain's
+terminal `*Dispatch` filter for re-encoding. The two sub-chains differ
+only in which `AiFilter` factories they draw from and which `*Dispatch`
+implementation sits at their tail — not in the type that flows through
+them.
 
 ## 3. Directory & file layout
 
