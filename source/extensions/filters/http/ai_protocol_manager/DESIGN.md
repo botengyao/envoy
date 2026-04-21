@@ -140,61 +140,180 @@ Envoy::Extensions::HttpFilters::AiProtocolManager
 
 ## 4. Core types
 
-### 4.1 `AiRequest` — the neutral model
+### 4.1 `AiRequest` — shared envelope + variant payload
 
-`codec/ai_request.h`. Small, cheap to move, holds refs (not values) for
-large content.
+`codec/ai_request.h`. The request is a shared envelope holding fields
+that are genuinely protocol-neutral, plus a `std::variant` payload
+carrying the protocol-specific body. Cross-cutting sub-chain filters
+(PII scrub, rate limit, budget, logging) take `AiRequest&` and never
+see the variant; specialized filters and the terminal `*Dispatch`
+filters pull out the variant they expect.
+
+#### Envelope
 
 ```cpp
+// codec/ai_request.h
+
 enum class ProtocolKind { Unknown, Inference, AgentA2a, AgentMcp };
 
-enum class InvocationKind {
-  // Inference
-  ChatCompletion, Completion, Responses, Embeddings,
-  // Agent protocols
-  ToolsCall, ToolsList, MessageSend, TaskSubmit, /* … */
-};
-
-struct ModelTarget {
-  std::string name;              // e.g. "gpt-4o-mini" or agent id
-  std::string provider_hint;     // optional routing hint
-};
-
-struct AiRequestHeaders {
-  InvocationKind        invocation;
-  ProtocolKind          protocol;
-  std::string           json_rpc_id;   // empty ⇒ notification
-  std::string           method;        // raw JSON-RPC "method"
-  ModelTarget           target;
-  bool                  streaming{false};
-  // Free-form, protocol-specific small scalars kept inline.
-  absl::flat_hash_map<std::string, std::string> attributes;
-};
-
-struct AiRequestBody {
-  // Prompts, messages, tool call arguments, tool results, images, etc.
-  // Each is either an inline value or a reference into PayloadStore.
-  std::vector<PayloadRef> messages;     // chat turns / A2A parts / MCP content
-  std::vector<PayloadRef> tools;        // tool / function definitions
-  std::vector<PayloadRef> attachments;  // images, files, blobs
-  // Raw JSON-RPC "params" subtree the mapper didn't claim — kept so
-  // passthrough filters can still reason about it.
-  PayloadRef              params_residual;
-};
+// Per-filter scratch shared across sub-chain filters (not cross-request,
+// not serialized back out).
+using AiScratch = absl::flat_hash_map<std::string, std::any>;
 
 class AiRequest {
 public:
-  AiRequestHeaders& headers();
-  AiRequestBody&    body();
-  // Filter-state-like scratch space for sub-chain filters.
-  StreamInfo::FilterStateSharedPtr scratch();
-  // …
+  // --- JSON-RPC identity ---
+  std::string jsonrpc_id;       // empty ⇒ notification
+  std::string method;           // raw "method" token
+
+  // --- Protocol discriminator + variant payload ---
+  ProtocolKind protocol{ProtocolKind::Unknown};
+  std::variant<std::monostate, InferencePayload, AgentPayload> payload;
+
+  // --- Protocol-neutral small scalars that arrived with the request
+  //     (tenant, user id, request-id, routing hints). Cross-cutting
+  //     filters read from here.
+  absl::flat_hash_map<std::string, std::string> attributes;
+
+  // --- Streaming intent (OpenAI stream:true, A2A/MCP SSE subscribe). ---
+  bool streaming{false};
+
+  // --- Payload offload: not owned; outer filter owns the store. ---
+  PayloadStore* payload_store{nullptr};
+
+  // --- Filter-to-filter scratch within this request. ---
+  AiScratch scratch;
+
+  // --- Typed accessors. Return nullptr on wrong variant. ---
+  InferencePayload*       as_inference();
+  const InferencePayload* as_inference() const;
+  AgentPayload*           as_agent();
+  const AgentPayload*     as_agent() const;
 };
 ```
 
-`AiResponse` is the mirror type used on the reply path; v0 keeps it
-minimal (status, raw body, headers) and grows as response-side logic
-lands.
+#### Inference variant — `codec/inference_payload.h`
+
+```cpp
+enum class InferenceInvocation {
+  Unknown,
+  ChatCompletion,   // POST /v1/chat/completions
+  Completion,       // POST /v1/completions
+  Responses,        // POST /v1/responses
+  Embeddings,       // POST /v1/embeddings
+  // (Audio, Moderations, Images — added as needed.)
+};
+
+struct ModelTarget {
+  std::string name;            // "gpt-4o-mini", "claude-sonnet-4-6", …
+  std::string provider_hint;   // optional: "openai", "anthropic", "vertex"
+};
+
+struct SamplingParams {
+  absl::optional<double>   temperature;
+  absl::optional<double>   top_p;
+  absl::optional<int32_t>  max_tokens;
+  absl::optional<int32_t>  n;
+  std::vector<std::string> stop;
+  absl::optional<int64_t>  seed;
+  // Rarer knobs (presence_penalty, frequency_penalty, logprobs, …)
+  // live in InferencePayload::extra_params rather than bloating this.
+};
+
+struct InferencePayload {
+  InferenceInvocation invocation{InferenceInvocation::Unknown};
+  ModelTarget         target;
+
+  // Potentially large — always PayloadRef so the decoder can offload.
+  std::vector<PayloadRef> messages;      // chat turns
+  std::vector<PayloadRef> tools;         // tool / function definitions
+  std::vector<PayloadRef> attachments;   // images, audio, files
+
+  // tool_choice, response_format, service_tier, user, plus any params
+  // the mapper didn't claim.
+  absl::flat_hash_map<std::string, std::string> extra_params;
+
+  SamplingParams sampling;
+
+  // Everything the mapper didn't pull apart — keeps pass-through honest.
+  PayloadRef residual_params;
+};
+```
+
+#### Agent variant — `codec/agent_payload.h`
+
+```cpp
+enum class AgentDialect { Unknown, A2a, Mcp };
+
+enum class AgentInvocation {
+  Unknown,
+  // MCP
+  Initialize, Ping,
+  ToolsList, ToolsCall,
+  ResourcesList, ResourcesRead, ResourcesSubscribe, ResourcesUnsubscribe,
+  PromptsList, PromptsGet,
+  SamplingCreateMessage, CompletionComplete, LoggingSetLevel,
+  // A2A
+  MessageSend, MessageStream,
+  TaskSubmit, TaskGet, TaskCancel,
+  // Notifications folded in here (NotificationInitialized, …) when we
+  // need to route them.
+};
+
+struct AgentTarget {
+  std::string agent_id;     // logical agent / skill id for routing
+  std::string session_id;   // MCP session / A2A context id (may be empty)
+  std::string task_id;      // A2A task id (empty outside task ops)
+};
+
+struct AgentPayload {
+  AgentDialect     dialect{AgentDialect::Unknown};
+  AgentInvocation  invocation{AgentInvocation::Unknown};
+  AgentTarget      target;
+
+  // Selector fields — small, protocol-specific, filled based on
+  // invocation. Only the ones relevant to `invocation` are populated.
+  std::string tool_name;       // ToolsCall
+  std::string resource_uri;    // Resources*
+  std::string prompt_name;     // PromptsGet
+  std::string completion_ref;  // CompletionComplete ("ref/prompt" | "ref/resource")
+
+  // Potentially large — offloadable.
+  std::vector<PayloadRef> parts;        // A2A Parts | MCP content[]
+  PayloadRef              arguments;    // ToolsCall.arguments, PromptsGet.arguments
+  PayloadRef              capabilities; // Initialize
+
+  PayloadRef residual_params;
+};
+```
+
+#### Design notes
+
+1. **Variant inside `AiRequest`, not base class**: avoids heap
+   allocation per request, keeps cross-cutting filters taking
+   `AiRequest&` without virtual dispatch, and lets `std::visit` work
+   for exhaustive handling in dispatch filters.
+2. **`ModelTarget` vs `AgentTarget` don't unify**: an inference target
+   names a *model*; an agent target names an *agent / session / task*.
+   Hoisting a shared "target" into the envelope would paper over that.
+3. **One invocation enum per variant**: keeps the inference mapper
+   from ever considering MCP values and vice versa, and lets each
+   sub-chain's `AiFilter` factories validate config against only its
+   variant.
+4. **Three field tiers, on purpose**:
+   - `attributes` — protocol-neutral scalars that arrived with the
+     request and cross-cutting filters care about (tenant, user id).
+   - `InferencePayload::extra_params` / variant residuals —
+     protocol-specific JSON fields the mapper didn't model.
+   - `scratch` — runtime-only, filter-to-filter data, never
+     serialized back out.
+5. **`AiResponse`**: unified for v0 (status + headers + body). Apply
+   the same envelope+variant pattern if response-side logic grows
+   protocol-specific (OpenAI chunk framing vs A2A event types).
+6. **Open**: should `AgentPayload` split into `A2aPayload` /
+   `McpPayload`? Kept unified because fields overlap heavily and
+   `dialect` is already a discriminator; revisit if MCP/A2A diverge
+   more than expected.
 
 ### 4.2 `PayloadRef` + `PayloadStore` — offload boundary
 
