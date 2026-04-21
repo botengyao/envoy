@@ -23,7 +23,6 @@ enum class InferenceInvocation {
   Completion,      // POST /v1/completions
   Responses,       // POST /v1/responses
   Embeddings,      // POST /v1/embeddings
-  // Audio, Moderations, Images — added as needed.
 };
 
 struct ModelTarget {
@@ -38,29 +37,45 @@ struct SamplingParams {
   absl::optional<int32_t> n;
   std::vector<std::string> stop;
   absl::optional<int64_t> seed;
-  // Rarer knobs (presence_penalty, frequency_penalty, logprobs, ...) live in
-  // InferencePayload::extra_params to keep this struct narrow.
+  absl::optional<double> frequency_penalty;
+  absl::optional<double> presence_penalty;
 };
 
+// A single chat turn in parsed form. V0 covers text-only content; multimodal
+// parts (image_url / input_audio) and thinking / refusal blocks are added in
+// later phases of §2.1. Role is normalized: "system", "user", "assistant",
+// "tool", "developer".
+struct ChatMessage {
+  std::string role;
+  std::string text;
+};
+
+// OPENAI_VERTEX_SPEC.md §2.1 rule: system + developer messages merge into a
+// single systemInstruction when encoded for Gemini. We keep them split out
+// here because the OpenAI encoder needs them interleaved with user/assistant
+// turns if it's ever used as the OPENAI_PASSTHROUGH encoder from a parsed
+// payload (rather than residual bytes).
 struct InferencePayload {
   InferenceInvocation invocation{InferenceInvocation::Unknown};
   ModelTarget target;
 
-  // Potentially large — always PayloadRef so the decoder can offload.
-  std::vector<PayloadRef> messages;     // chat turns
-  std::vector<PayloadRef> tools;        // tool / function definitions
-  std::vector<PayloadRef> attachments;  // images, audio, files
+  // Parsed chat turns (user / assistant / tool). system / developer turns go
+  // into `system_instructions` so the encoder can emit Gemini
+  // systemInstruction cleanly.
+  std::vector<ChatMessage> chat;
+  std::vector<std::string> system_instructions;
 
-  // tool_choice, response_format, service_tier, user, plus any params the
-  // mapper didn't claim. String-valued because the decoder stores raw JSON
-  // fragments here; callers re-parse when needed.
-  absl::flat_hash_map<std::string, std::string> extra_params;
+  // Phase 3b: tools, tool_choice, response_format. Phase 3c: multimodal
+  // attachments. Phase 3d: thinking / reasoning_effort. For 3a these are
+  // carried forward only as residual bytes.
 
   SamplingParams sampling;
 
   bool streaming{false};
 
-  // Everything the mapper did not pull apart — keeps pass-through honest.
+  // Raw body bytes, kept so the OPENAI_PASSTHROUGH encoder can round-trip
+  // without re-synthesizing from parsed fields. Phase 3b+ will emit from
+  // parsed fields directly.
   PayloadRef residual_params;
 };
 

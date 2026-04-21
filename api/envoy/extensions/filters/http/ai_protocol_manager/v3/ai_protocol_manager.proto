@@ -52,20 +52,42 @@ message AiFilterConfig {
 message InferenceDispatch {
   option (xds.annotations.v3.message_status).work_in_progress = true;
 
+  // Target schema that the dispatch re-encodes the AiRequest into before
+  // sending upstream. The default preserves the inbound (OpenAI) shape.
+  enum TargetSchema {
+    // Emit the same OpenAI-shaped JSON the client sent. Path and host come
+    // from the downstream request (unless overridden below).
+    OPENAI_PASSTHROUGH = 0;
+    // Emit Gemini generateContent (or streamGenerateContent when
+    // stream=true) JSON per OPENAI_VERTEX_SPEC.md §2. Path is computed
+    // internally from gcp_project / gcp_location / model.
+    GEMINI_VERTEX = 1;
+  }
+  TargetSchema target_schema = 5;
+
   // Envoy cluster that receives the re-encoded outbound request. Required.
   string upstream_cluster = 1 [(validate.rules).string = {min_len: 1}];
 
-  // Optional path override. When empty the downstream request's :path is
-  // forwarded unchanged. Later phases (Vertex target) will compute the path
-  // internally from the Gemini URL template and ignore this field.
+  // Optional path override. Used for OPENAI_PASSTHROUGH. Ignored for
+  // GEMINI_VERTEX (the Vertex path is computed from gcp_project /
+  // gcp_location / model).
   string upstream_path_override = 2;
 
-  // Optional host (:authority) for the outbound request. Most clusters
-  // rewrite this anyway; only set when the upstream cares.
+  // Optional host (:authority) for the outbound request. Ignored unless the
+  // upstream cluster cares.
   string upstream_host = 3;
 
   // Per-request timeout. Defaults to 30s when unset.
   google.protobuf.Duration timeout = 4;
+
+  // GCP Vertex fields — required when target_schema = GEMINI_VERTEX.
+  string gcp_project = 6;
+  string gcp_location = 7;
+
+  // Optional model override. When set, wins over the model the client
+  // sent. Used to lock requests to a specific Vertex model regardless of
+  // what the OpenAI request specified.
+  string model_name_override = 8;
 }
 
 // Configuration for the Inference sub-chain.

@@ -94,6 +94,12 @@ private:
   std::string request_host_;   // downstream :authority
   std::string request_method_;
   std::string content_type_;
+  std::string authorization_;  // Authorization header, passed through to upstream
+
+  // Parsed during finalizeRequest, consumed by sendUpstream — needed for
+  // GeminiVertex URL construction.
+  std::string parsed_model_;
+  bool parsed_streaming_{false};
 
   // AsyncClient state. active_request_ is held so we can cancel on destroy.
   Http::AsyncClient::Request* active_request_{nullptr};

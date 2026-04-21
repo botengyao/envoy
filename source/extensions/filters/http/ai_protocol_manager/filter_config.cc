@@ -42,6 +42,20 @@ AiProtocolManagerConfig::AiProtocolManagerConfig(
       inference_dispatch_.timeout =
           std::chrono::milliseconds(DurationUtil::durationToMilliseconds(d.timeout()));
     }
+    using ProtoDispatch =
+        envoy::extensions::filters::http::ai_protocol_manager::v3::InferenceDispatch;
+    switch (d.target_schema()) {
+    case ProtoDispatch::GEMINI_VERTEX:
+      inference_dispatch_.target_schema = InferenceDispatchConfig::TargetSchema::GeminiVertex;
+      break;
+    case ProtoDispatch::OPENAI_PASSTHROUGH:
+    default:
+      inference_dispatch_.target_schema = InferenceDispatchConfig::TargetSchema::OpenAiPassThrough;
+      break;
+    }
+    inference_dispatch_.gcp_project = d.gcp_project();
+    inference_dispatch_.gcp_location = d.gcp_location();
+    inference_dispatch_.model_name_override = d.model_name_override();
   }
 }
 

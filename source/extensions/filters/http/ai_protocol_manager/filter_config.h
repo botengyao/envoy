@@ -38,10 +38,21 @@ struct AiProtocolManagerStats {
 
 // Resolved inference dispatch configuration.
 struct InferenceDispatchConfig {
+  enum class TargetSchema {
+    OpenAiPassThrough,  // re-emit OpenAI-shape (default)
+    GeminiVertex,       // re-emit Gemini generateContent shape
+  };
+
+  TargetSchema target_schema{TargetSchema::OpenAiPassThrough};
   std::string upstream_cluster;
-  std::string upstream_path_override;  // empty ⇒ forward the downstream path
+  std::string upstream_path_override;  // empty ⇒ forward the downstream path (OpenAI pass-through)
   std::string upstream_host;           // empty ⇒ use the downstream host
   std::chrono::milliseconds timeout{30000};
+
+  // GCP Vertex fields. Required when target_schema == GeminiVertex.
+  std::string gcp_project;
+  std::string gcp_location;
+  std::string model_name_override;
 };
 
 class AiProtocolManagerConfig {

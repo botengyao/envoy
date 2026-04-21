@@ -8,11 +8,10 @@ licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
 
-# Consolidated codec library. The decoder, mappers, and encoder are tightly
+# Consolidated codec library. The decoder, mappers, and encoders are tightly
 # coupled (decoder invokes the right mapper based on ProtocolKind; encoders
 # are symmetric with mappers), so a single library avoids the inter-header
-# cycles that would otherwise form. Can be split later if individual pieces
-# grow enough to justify it.
+# cycles that would otherwise form.
 envoy_cc_library(
     name = "codec_lib",
     srcs = [
@@ -21,6 +20,7 @@ envoy_cc_library(
         "ai_request.cc",
         "ai_request_decoder.cc",
         "ai_request_encoder.cc",
+        "gemini_encoder.cc",
         "inference_mapping.cc",
         "protocol_classifier.cc",
     ],
@@ -31,6 +31,7 @@ envoy_cc_library(
         "ai_request.h",
         "ai_request_decoder.h",
         "ai_request_encoder.h",
+        "gemini_encoder.h",
         "inference_mapping.h",
         "inference_payload.h",
         "protocol_classifier.h",
@@ -40,6 +41,8 @@ envoy_cc_library(
         "//envoy/http:header_map_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:logger_lib",
+        "//source/common/json:json_loader_lib",
+        "//source/common/protobuf:utility_lib",
         "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",

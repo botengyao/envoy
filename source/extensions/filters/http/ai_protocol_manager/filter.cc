@@ -8,8 +8,11 @@
 #include "source/common/http/headers.h"
 #include "source/common/http/message_impl.h"
 #include "source/common/http/utility.h"
+#include "source/extensions/filters/http/ai_protocol_manager/codec/gemini_encoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/inference_mapping.h"
 #include "source/extensions/filters/http/ai_protocol_manager/codec/protocol_classifier.h"
+
+#include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -67,6 +70,10 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   content_type_ = std::string(headers.getContentTypeValue());
   if (content_type_.empty()) {
     content_type_ = Http::Headers::get().ContentTypeValues.Json;
+  }
+  const auto auth_header = headers.get(Http::CustomHeaders::get().Authorization);
+  if (!auth_header.empty()) {
+    authorization_ = std::string(auth_header[0]->value().getStringView());
   }
 
   if (config_->inferenceDispatchConfigured()) {
@@ -139,12 +146,32 @@ void AiProtocolManagerFilter::finalizeRequest() {
   }
   Codec::AiRequest& req = *req_or;
 
+  // Capture the model + streaming flag from the parsed payload so
+  // sendUpstream can build the Vertex URL without re-parsing.
+  if (const auto* payload = req.asInference(); payload != nullptr) {
+    parsed_model_ = payload->target.name;
+    parsed_streaming_ = payload->streaming;
+  }
+
   Chain::UnreachableCallbacks null_cb;
   (void)chain_->runMetadata(req, null_cb);
 
-  Codec::OpenAiEncoder encoder;
+  // Target schema selects the encoder. OPENAI_PASSTHROUGH re-emits the
+  // residual OpenAI body; GEMINI_VERTEX synthesizes a Gemini generateContent
+  // body from the parsed payload per OPENAI_VERTEX_SPEC.md §2.
+  const auto& dispatch = config_->inferenceDispatch();
+  std::unique_ptr<Codec::AiRequestEncoder> encoder;
+  switch (dispatch.target_schema) {
+  case InferenceDispatchConfig::TargetSchema::GeminiVertex:
+    encoder = std::make_unique<Codec::GeminiEncoder>();
+    break;
+  case InferenceDispatchConfig::TargetSchema::OpenAiPassThrough:
+    encoder = std::make_unique<Codec::OpenAiEncoder>();
+    break;
+  }
+
   Buffer::OwnedImpl encoded;
-  auto enc_st = encoder.encode(req, encoded);
+  auto enc_st = encoder->encode(req, encoded);
   if (!enc_st.ok()) {
     config_->stats().rq_encode_error_.inc();
     if (mode_ == Mode::Dispatch) {
@@ -177,17 +204,50 @@ bool AiProtocolManagerFilter::sendUpstream(const Buffer::Instance& encoded_body)
     return false;
   }
 
-  const std::string& path =
-      dispatch.upstream_path_override.empty() ? request_path_ : dispatch.upstream_path_override;
-  const std::string& host = dispatch.upstream_host.empty() ? request_host_ : dispatch.upstream_host;
-  const std::string& method = request_method_.empty() ? "POST" : request_method_;
+  std::string path;
+  std::string host = dispatch.upstream_host.empty() ? request_host_ : dispatch.upstream_host;
+  std::string method = "POST";
+  std::string content_type = "application/json";
+
+  if (dispatch.target_schema == InferenceDispatchConfig::TargetSchema::GeminiVertex) {
+    // OPENAI_VERTEX_SPEC.md §2 — Vertex URL template:
+    //   /v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{method}
+    //   (+?alt=sse when streaming)
+    // model_name_override wins; else the model the client sent.
+    const std::string model =
+        dispatch.model_name_override.empty() ? parsed_model_ : dispatch.model_name_override;
+    if (model.empty() || dispatch.gcp_project.empty() || dispatch.gcp_location.empty()) {
+      ENVOY_LOG(warn, "ai_protocol_manager: Vertex dispatch missing model/project/location");
+      return false;
+    }
+    const char* gen_method = parsed_streaming_ ? "streamGenerateContent" : "generateContent";
+    path = absl::StrCat("/v1/projects/", dispatch.gcp_project, "/locations/",
+                        dispatch.gcp_location, "/publishers/google/models/", model, ":",
+                        gen_method);
+    if (parsed_streaming_) {
+      absl::StrAppend(&path, "?alt=sse");
+    }
+  } else {
+    path = dispatch.upstream_path_override.empty() ? request_path_ : dispatch.upstream_path_override;
+    method = request_method_.empty() ? "POST" : request_method_;
+    content_type = content_type_;
+  }
 
   auto headers = Http::createHeaderMap<Http::RequestHeaderMapImpl>({
       {Http::Headers::get().Method, method},
       {Http::Headers::get().Path, path},
       {Http::Headers::get().Host, host},
-      {Http::Headers::get().ContentType, content_type_},
+      {Http::Headers::get().ContentType, content_type},
   });
+
+  // Authorization pass-through. For GCP Vertex the client is responsible for
+  // providing an OAuth2 bearer today; proper GCP service-account signing
+  // belongs in a companion filter (the existing gcp_authn filter or a
+  // dedicated one) and is out of scope for Phase 3a.
+  if (!authorization_.empty()) {
+    headers->addReferenceKey(Http::CustomHeaders::get().Authorization, authorization_);
+  }
+
   auto message = std::make_unique<Http::RequestMessageImpl>(std::move(headers));
   // Copy the encoded body (we do not own `encoded_body`).
   message->body().add(encoded_body);
