@@ -391,6 +391,59 @@ Decides Inference vs Agent (and which agent dialect) from a combination
 of path prefix, `content-type`, an explicit config override, and the
 JSON-RPC `method` token. Output drives which sub-chain runs.
 
+### 4.5 `AiItem` — materialized view of a large payload
+
+`codec/ai_item.h`. `PayloadRef` is the storage-side handle; `AiItem`
+is the runtime-side materialized view that filter authors see during
+per-item callbacks. It exists only for the duration of one
+`onRequestItem` invocation — the runtime fetches the bytes from
+`PayloadStore`, hands the filter a concrete value, and re-stores on
+return if the filter mutated it.
+
+```cpp
+enum class AiItemKind { Message, Tool, Attachment };
+
+struct Message {            // chat turn / A2A part / MCP content
+  std::string role;         // "user", "assistant", "system", "tool"
+  std::string text;         // primary text content (materialized)
+  std::vector<ContentPart> parts;   // multimodal parts (text/image/audio/…)
+  absl::flat_hash_map<std::string, std::string> attributes;
+};
+
+struct Tool {               // tool / function definition
+  std::string name;
+  std::string description;
+  std::string schema_json;  // JSON-schema for arguments
+  absl::flat_hash_map<std::string, std::string> attributes;
+};
+
+struct Attachment {         // image, audio, file, blob
+  std::string mime_type;
+  std::string filename;     // optional
+  std::string bytes;        // materialized; may be very large
+  absl::flat_hash_map<std::string, std::string> attributes;
+};
+
+class AiItem {
+public:
+  AiItemKind kind() const;
+  size_t     index() const;         // position within its kind list
+
+  // Mutation tracking — filter must call markDirty() (or mutate via
+  // the helper setters, TBD) if it changed anything. Clean items
+  // skip the re-store step back into PayloadStore.
+  bool dirty() const;
+  void markDirty();
+
+  // Typed accessors. Exactly one is non-null based on kind().
+  Message*    as_message();
+  Tool*       as_tool();
+  Attachment* as_attachment();
+};
+```
+
+Filters never construct `AiItem` directly; the runtime does.
+
 ## 5. Filter chain surface (`chain/`)
 
 Operators should be able to write an `AiFilter` in a few dozen lines
@@ -398,18 +451,49 @@ without touching HTTP plumbing. That is the whole point of this filter.
 
 ### 5.1 `AiFilter` interface
 
-`chain/ai_filter.h`:
+`chain/ai_filter.h`. The chain runs in **phases**. A filter implements
+only the phases it cares about; defaults are no-op `Continue`. This
+keeps metadata-only filters (rate limit, budget, model routing) free
+of any payload-I/O concerns, and lets the runtime skip materializing
+large payloads when no filter in the chain needs them.
 
 ```cpp
+enum class AiFilterStatus {
+  Continue,        // advance to next filter (same phase)
+  StopIteration,   // pause; resume via cb.continueRequest()
+};
+
+// Bitset: which item kinds this filter wants onRequestItem calls for.
+struct AiItemKindSet {
+  bool messages{false};
+  bool tools{false};
+  bool attachments{false};
+  static AiItemKindSet all();
+  static AiItemKindSet none();
+};
+
 class AiFilter {
 public:
   virtual ~AiFilter() = default;
 
-  // Called once per request, in order. Return Continue to advance,
-  // StopIteration to pause (filter holds the token, resumes via cb).
-  virtual AiFilterStatus onRequest(AiRequest&, AiFilterCallbacks&) = 0;
+  // --- Phase 1: scalars only. Always invoked. ---
+  // Sees envelope + variant payload's scalar fields. Does not trigger
+  // payload materialization. Most cross-cutting filters stop here.
+  virtual AiFilterStatus onRequestMetadata(AiRequest&, AiFilterCallbacks&) {
+    return AiFilterStatus::Continue;
+  }
 
-  // Response path (v0: pass-through; most filters won't override).
+  // --- Phase 2+: per-item, iterated across messages/tools/attachments. ---
+  // Runtime materializes the item from PayloadStore before the call and
+  // re-stores it on return if `item.dirty()`. Only invoked for kinds
+  // this filter declared interest in via itemInterest().
+  virtual AiItemKindSet itemInterest() const { return AiItemKindSet::none(); }
+  virtual AiFilterStatus onRequestItem(AiItem&, AiFilterCallbacks&) {
+    return AiFilterStatus::Continue;
+  }
+
+  // Response path (v0: pass-through; symmetric split added when we
+  // design the response phase).
   virtual AiFilterStatus onResponse(AiResponse&, AiFilterCallbacks&) {
     return AiFilterStatus::Continue;
   }
@@ -417,6 +501,13 @@ public:
   virtual void onDestroy() {}
 };
 ```
+
+Why one generic `onRequestItem` rather than typed
+`onRequestMessage` / `onRequestTool` / `onRequestAttachment`: most
+real filters (PII scrub, redaction, size caps, classification) treat
+all large items uniformly; forcing three copies of the same logic is
+worse than dispatching on `item.kind()` internally. Typed access
+stays available via `item.as_message()` / `as_tool()` / `as_attachment()`.
 
 ### 5.2 `AiFilterCallbacks`
 
@@ -430,12 +521,21 @@ public:
   virtual StreamInfo::StreamInfo& streamInfo() = 0;
   virtual const AiProtocolManagerConfig& config() = 0;
 
-  // Resume after StopIteration.
+  // Resume after StopIteration. Valid at whatever granularity the
+  // pause happened: metadata phase or per-item phase.
   virtual void continueRequest() = 0;
   virtual void continueResponse() = 0;
 
   // Short-circuit the chain and reply directly (e.g. guardrail denial).
+  // Valid in any phase.
   virtual void sendLocalReply(AiResponse&&) = 0;
+
+  // --- Per-item callbacks (valid only inside onRequestItem). ---
+  // Drop the current item; it will not be forwarded.
+  virtual void dropCurrentItem() = 0;
+  // Queue an item to be inserted after the current one in the same
+  // phase-major position (runs through subsequent filters normally).
+  virtual void insertAfter(AiItem&&) = 0;
 
   // Emit stats / access-log entries in the AI-manager namespace.
   virtual void recordEvent(AiEvent) = 0;
@@ -450,9 +550,54 @@ filter needs them, it should instead promote the concern into the
 ### 5.3 `AiFilterChain`
 
 `chain/ai_filter_chain.h` holds an ordered `std::vector<AiFilterPtr>`
-and runs the sync state machine (Continue / StopIteration / Error).
-Single implementation used by both sub-chains; the distinction is
-purely configuration.
+and runs the phased state machine. Single implementation used by both
+sub-chains; the distinction is purely configuration.
+
+**Phase-major ordering across filters.** Each phase completes across
+the entire chain before the next begins:
+
+```
+onRequestMetadata        : f1 → f2 → … → fN
+onRequestItem(msg 0)     : f1 → f2 → … → fN
+onRequestItem(msg 1)     : f1 → f2 → … → fN
+…
+onRequestItem(tool 0)    : f1 → f2 → … → fN
+…
+onRequestItem(attach 0)  : f1 → f2 → … → fN
+```
+
+This mirrors the HTTP filter mental model (`decodeHeaders` for all
+filters, then `decodeData` chunks for all filters) and lets the runtime
+stream through large item lists holding only one materialized `AiItem`
+in memory at a time.
+
+**Phase-skip optimization.** At chain-build time the runtime unions
+`itemInterest()` across all filters into a single `AiItemKindSet`. For
+each kind in that union:
+
+- If at least one filter is interested, the runtime iterates that kind,
+  materializing each `AiItem` (via `PayloadStore::fetch`) and running
+  only the interested filters in order.
+- If no filter is interested, the runtime **skips the kind entirely** —
+  the items remain as `PayloadRef`s in the payload variant and are
+  re-encoded by `JsonRpcEncoder` without ever being materialized into
+  filter memory.
+
+This is the core I/O-hiding guarantee: a chain full of metadata-only
+filters never touches `PayloadStore::fetch`, even when the underlying
+payloads live in external storage.
+
+**Mutation & re-store.** After `onRequestItem` returns, the runtime
+checks `item.dirty()`. Dirty items are written back to `PayloadStore`
+and the owning `PayloadRef` is updated; clean items are left alone. A
+filter paused with `StopIteration` keeps the current item pinned until
+`continueRequest()` is called.
+
+**Pause semantics.** `StopIteration` in any phase pauses the whole
+chain at that point. `continueRequest()` resumes from the same filter
+and same item (if mid-item phase). The runtime serializes per-item
+work — only one item is in flight at a time — to keep the mental model
+simple; parallelism across items is a later optimization.
 
 ### 5.4 `InferenceChain` / `AgentChain`
 
