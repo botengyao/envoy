@@ -1,11 +1,13 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
+#include "envoy/upstream/cluster_manager.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/codec/protocol_classifier.h"
 
@@ -26,10 +28,20 @@ namespace AiProtocolManager {
   COUNTER(rq_chain_stop)                                                                           \
   COUNTER(rq_local_reply)                                                                          \
   COUNTER(rq_dispatch_failure)                                                                     \
+  COUNTER(rq_dispatch_ok)                                                                          \
+  COUNTER(rq_cluster_not_found)                                                                    \
   COUNTER(rq_roundtrip_ok)
 
 struct AiProtocolManagerStats {
   AI_PROTOCOL_MANAGER_STATS(GENERATE_COUNTER_STRUCT)
+};
+
+// Resolved inference dispatch configuration.
+struct InferenceDispatchConfig {
+  std::string upstream_cluster;
+  std::string upstream_path_override;  // empty ⇒ forward the downstream path
+  std::string upstream_host;           // empty ⇒ use the downstream host
+  std::chrono::milliseconds timeout{30000};
 };
 
 class AiProtocolManagerConfig {
@@ -37,7 +49,8 @@ public:
   AiProtocolManagerConfig(
       const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager&
           proto_config,
-      const std::string& stats_prefix, Stats::Scope& scope);
+      const std::string& stats_prefix, Stats::Scope& scope,
+      Upstream::ClusterManager& cluster_manager);
 
   const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager&
   protoConfig() const {
@@ -46,12 +59,17 @@ public:
   AiProtocolManagerStats& stats() { return stats_; }
   const Codec::ClassifierPrefixes& classifierPrefixes() const { return classifier_prefixes_; }
   std::size_t maxInlineBytes() const { return max_inline_bytes_; }
+  const InferenceDispatchConfig& inferenceDispatch() const { return inference_dispatch_; }
+  bool inferenceDispatchConfigured() const { return !inference_dispatch_.upstream_cluster.empty(); }
+  Upstream::ClusterManager& clusterManager() { return cluster_manager_; }
 
 private:
   const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config_;
   AiProtocolManagerStats stats_;
   Codec::ClassifierPrefixes classifier_prefixes_;
   std::size_t max_inline_bytes_{0};
+  InferenceDispatchConfig inference_dispatch_;
+  Upstream::ClusterManager& cluster_manager_;
 };
 
 using AiProtocolManagerConfigSharedPtr = std::shared_ptr<AiProtocolManagerConfig>;

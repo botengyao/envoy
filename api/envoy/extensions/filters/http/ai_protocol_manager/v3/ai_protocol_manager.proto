@@ -3,6 +3,7 @@ syntax = "proto3";
 package envoy.extensions.filters.http.ai_protocol_manager.v3;
 
 import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/wrappers.proto";
 
 import "xds/annotations/v3/status.proto";
@@ -39,16 +40,41 @@ message AiFilterConfig {
   google.protobuf.Any typed_config = 2;
 }
 
+// Dispatch configuration for the Inference sub-chain.
+//
+// Addresses the "terminal dispatch" role from DESIGN.md §6: the encoded
+// AiRequest is sent to this upstream cluster, and the upstream response is
+// pumped back to the downstream caller.
+//
+// Target-schema selection (OpenAI pass-through vs Gemini vs Claude-on-Vertex)
+// is a separate concern that will land as additional fields here alongside
+// the GeminiEncoder / Claude-on-Vertex encoders in later phases.
+message InferenceDispatch {
+  option (xds.annotations.v3.message_status).work_in_progress = true;
+
+  // Envoy cluster that receives the re-encoded outbound request. Required.
+  string upstream_cluster = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Optional path override. When empty the downstream request's :path is
+  // forwarded unchanged. Later phases (Vertex target) will compute the path
+  // internally from the Gemini URL template and ignore this field.
+  string upstream_path_override = 2;
+
+  // Optional host (:authority) for the outbound request. Most clusters
+  // rewrite this anyway; only set when the upstream cares.
+  string upstream_host = 3;
+
+  // Per-request timeout. Defaults to 30s when unset.
+  google.protobuf.Duration timeout = 4;
+}
+
 // Configuration for the Inference sub-chain.
 message InferenceChain {
   option (xds.annotations.v3.message_status).work_in_progress = true;
 
   repeated AiFilterConfig filters = 1;
 
-  // Dispatch config is intentionally left as a typed Any for V0 so that
-  // request/response schema selection (OpenAI, Gemini, Claude-on-Vertex, ...)
-  // can be specialized by dispatch implementations without proto churn.
-  google.protobuf.Any dispatch = 2;
+  InferenceDispatch dispatch = 2;
 }
 
 // Configuration for the Agent sub-chain.

@@ -11,8 +11,9 @@ Http::FilterFactoryCb AiProtocolManagerFilterConfigFactory::createFilterFactoryF
     const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager&
         proto_config,
     const std::string& stats_prefix, Server::Configuration::FactoryContext& context) {
-  auto config = std::make_shared<AiProtocolManagerConfig>(proto_config, stats_prefix,
-                                                          context.serverFactoryContext().scope());
+  auto config = std::make_shared<AiProtocolManagerConfig>(
+      proto_config, stats_prefix, context.serverFactoryContext().scope(),
+      context.serverFactoryContext().clusterManager());
   return [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<AiProtocolManagerFilter>(config));
   };
@@ -23,8 +24,8 @@ AiProtocolManagerFilterConfigFactory::createFilterFactoryFromProtoWithServerCont
     const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager&
         proto_config,
     const std::string& stats_prefix, Server::Configuration::ServerFactoryContext& context) {
-  auto config =
-      std::make_shared<AiProtocolManagerConfig>(proto_config, stats_prefix, context.scope());
+  auto config = std::make_shared<AiProtocolManagerConfig>(proto_config, stats_prefix,
+                                                          context.scope(), context.clusterManager());
   return [config](Http::FilterChainFactoryCallbacks& callbacks) -> void {
     callbacks.addStreamFilter(std::make_shared<AiProtocolManagerFilter>(config));
   };
