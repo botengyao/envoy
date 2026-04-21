@@ -17,6 +17,7 @@ envoy_cc_library(
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
         "//source/common/common:logger_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:codec_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],
 )
@@ -32,8 +33,7 @@ envoy_cc_library(
         "//envoy/http:header_map_interface",
         "//source/common/common:logger_lib",
         "//source/extensions/filters/http/ai_protocol_manager/chain:ai_filter_chain_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_request_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/codec:protocol_classifier_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:codec_lib",
         "//source/extensions/filters/http/ai_protocol_manager/dispatch:ai_dispatch_filter_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",

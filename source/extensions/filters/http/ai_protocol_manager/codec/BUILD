@@ -8,84 +8,42 @@ licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
 
+# Consolidated codec library. The decoder, mappers, and encoder are tightly
+# coupled (decoder invokes the right mapper based on ProtocolKind; encoders
+# are symmetric with mappers), so a single library avoids the inter-header
+# cycles that would otherwise form. Can be split later if individual pieces
+# grow enough to justify it.
 envoy_cc_library(
-    name = "ai_payload_lib",
-    srcs = ["ai_payload.cc"],
-    hdrs = ["ai_payload.h"],
-    deps = [
-        "//envoy/buffer:buffer_interface",
-        "@abseil-cpp//absl/strings",
-    ],
-)
-
-envoy_cc_library(
-    name = "ai_request_lib",
-    srcs = ["ai_request.cc"],
-    hdrs = [
-        "agent_payload.h",
-        "ai_request.h",
-        "inference_payload.h",
-    ],
-    deps = [
-        ":ai_payload_lib",
-        "@abseil-cpp//absl/container:flat_hash_map",
-        "@abseil-cpp//absl/strings",
-        "@abseil-cpp//absl/types:optional",
-    ],
-)
-
-envoy_cc_library(
-    name = "protocol_classifier_lib",
-    srcs = ["protocol_classifier.cc"],
-    hdrs = ["protocol_classifier.h"],
-    deps = [
-        ":ai_request_lib",
-        "//envoy/http:header_map_interface",
-        "@abseil-cpp//absl/strings",
-    ],
-)
-
-envoy_cc_library(
-    name = "ai_request_codec_lib",
+    name = "codec_lib",
     srcs = [
+        "agent_mapping.cc",
+        "ai_payload.cc",
+        "ai_request.cc",
         "ai_request_decoder.cc",
         "ai_request_encoder.cc",
+        "inference_mapping.cc",
+        "protocol_classifier.cc",
     ],
     hdrs = [
+        "agent_mapping.h",
+        "agent_payload.h",
+        "ai_payload.h",
+        "ai_request.h",
         "ai_request_decoder.h",
         "ai_request_encoder.h",
+        "inference_mapping.h",
+        "inference_payload.h",
+        "protocol_classifier.h",
     ],
     deps = [
-        ":ai_payload_lib",
-        ":ai_request_lib",
         "//envoy/buffer:buffer_interface",
+        "//envoy/http:header_map_interface",
+        "//source/common/buffer:buffer_lib",
         "//source/common/common:logger_lib",
+        "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
         "@abseil-cpp//absl/strings",
-    ],
-)
-
-envoy_cc_library(
-    name = "inference_mapping_lib",
-    srcs = ["inference_mapping.cc"],
-    hdrs = ["inference_mapping.h"],
-    deps = [
-        ":ai_request_codec_lib",
-        ":ai_request_lib",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/strings",
-    ],
-)
-
-envoy_cc_library(
-    name = "agent_mapping_lib",
-    srcs = ["agent_mapping.cc"],
-    hdrs = ["agent_mapping.h"],
-    deps = [
-        ":ai_request_codec_lib",
-        ":ai_request_lib",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/types:optional",
     ],
 )

@@ -27,8 +27,7 @@ envoy_cc_library(
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/common:logger_lib",
         "//source/extensions/filters/http/ai_protocol_manager/chain:ai_filter_interface",
-        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_request_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/codec:ai_request_codec_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/codec:codec_lib",
         "@abseil-cpp//absl/status",
     ],
 )

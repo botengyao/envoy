@@ -14,7 +14,7 @@ namespace Chain {
 class AiItem; // chain/ai_filter_chain.h
 
 // Forward-declared event type for recordEvent(). Kept opaque here; concrete
-// enum defined alongside the chain implementation. Avoids a cyclic include.
+// struct defined alongside the chain implementation. Avoids a cyclic include.
 struct AiEvent;
 
 // DESIGN.md §5.2 — narrow interface through which an AiFilter interacts with
@@ -42,6 +42,21 @@ public:
 
   // Observability entry point.
   virtual void recordEvent(const AiEvent& event) = 0;
+};
+
+// Pure abort-on-call callbacks impl. Suitable only as a placeholder for an
+// empty chain (where no filter actually calls back). Using it with a
+// non-empty chain is a programming error.
+class UnreachableCallbacks : public AiFilterCallbacks {
+public:
+  Event::Dispatcher& dispatcher() override;
+  StreamInfo::StreamInfo& streamInfo() override;
+  void continueRequest() override;
+  void continueResponse() override;
+  void sendLocalReply(Codec::AiResponse&&) override;
+  void dropCurrentItem() override;
+  void insertAfter(AiItem&&) override;
+  void recordEvent(const AiEvent&) override;
 };
 
 } // namespace Chain
