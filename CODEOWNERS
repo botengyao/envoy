@@ -362,6 +362,8 @@ extensions/upstreams/tcp @ggreenway @mattklein123
 /*/extensions/filters/http/thrift_to_metadata @JuniorHsu @zuercher
 # IP tagging
 /*/extensions/filters/http/ip_tagging @zuercher @JuniorHsu @nezdolik
+# IP-based water-fill load shedding
+/*/extensions/filters/http/ip_load_shed @botengyao @UNOWNED
 # Header to metadata
 /*/extensions/filters/http/header_to_metadata @zuercher @JuniorHsu
 # Json to metadata

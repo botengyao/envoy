@@ -621,6 +621,13 @@ envoy.filters.http.health_check:
   status: stable
   type_urls:
   - envoy.extensions.filters.http.health_check.v3.HealthCheck
+envoy.filters.http.ip_load_shed:
+  categories:
+  - envoy.filters.http
+  security_posture: robust_to_untrusted_downstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.http.ip_load_shed.v3.IpLoadShed
 envoy.filters.http.ip_tagging:
   categories:
   - envoy.filters.http

@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.ip_load_shed.v3;
+
+import "envoy/type/v3/percent.proto";
+
+import "google/protobuf/duration.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.ip_load_shed.v3";
+option java_outer_classname = "IpLoadShedProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ip_load_shed/v3;ip_load_shedv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: IP-based water-fill load shedding]
+// IP-based water-fill load shedding filter.
+// [#extension: envoy.filters.http.ip_load_shed]
+
+// Sheds new streams from the heaviest source IPs (tenants) first when process memory is under
+// pressure. Per-IP in-flight usage is tracked across all worker threads, and a water-fill level
+// is periodically computed on the main thread such that only tenants above the level are shed.
+// Tenants using less than their fair share are never shed until the reject-all threshold.
+// [#next-free-field: 9]
+message IpLoadShed {
+  // Name of an overload action (e.g. ``envoy.overload_actions.shed_tenant_load``) whose
+  // trigger state provides the shed severity in [0, 1]. Configure the action with a
+  // ``scaled`` trigger (e.g. scaling threshold 0.8, saturation threshold 0.9 on
+  // ``envoy.resource_monitors.fixed_heap``) so severity ramps linearly with memory pressure.
+  // When set, the overload manager is the pressure source and ``max_heap_size_bytes``,
+  // ``shed_start_threshold`` and ``reject_all_threshold`` are only used as a fallback if the
+  // action is not configured in the overload manager.
+  string overload_action_name = 1;
+
+  // Self-contained pressure mode: maximum heap size used as the pressure denominator, i.e.
+  // pressure = currently_allocated_bytes / max_heap_size_bytes. Required when
+  // ``overload_action_name`` is not set. This should match the overload manager's
+  // ``fixed_heap`` monitor configuration.
+  uint64 max_heap_size_bytes = 2;
+
+  // Memory pressure at which water-fill shedding starts. Only used in self-contained pressure
+  // mode. Defaults to 80%.
+  type.v3.Percent shed_start_threshold = 3;
+
+  // Memory pressure at or above which all new streams are rejected. Only used in
+  // self-contained pressure mode. Defaults to 90%.
+  type.v3.Percent reject_all_threshold = 4;
+
+  // How often the per-tenant usage is aggregated and the water level is re-evaluated and
+  // republished to the worker threads. Defaults to 100ms.
+  google.protobuf.Duration evaluation_interval = 5;
+
+  // Fixed cost added to a tenant's usage for each active stream, approximating per-stream
+  // connection and codec buffer overhead. Defaults to 65536 (64 KiB).
+  uint64 stream_cost_bytes = 6;
+
+  // HTTP status code used for shed responses. Defaults to 503 (Service Unavailable).
+  uint32 rejection_status_code = 7
+      [(validate.rules).uint32 = {lt: 600 gte: 400 ignore_empty: true}];
+
+  // Upper bound on the number of tracked tenants, so the tracker itself has bounded memory.
+  // Beyond this limit, new tenants are aggregated into per-shard overflow buckets that count
+  // toward total usage but are not individually sheddable below the reject-all threshold.
+  // Defaults to 100000.
+  uint32 max_tracked_tenants = 8;
+}

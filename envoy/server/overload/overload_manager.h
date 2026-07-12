@@ -44,17 +44,23 @@ public:
   // Overload action to terminate idle downstream HTTP connections.
   const std::string CloseIdleHttpConnections = "envoy.overload_actions.close_idle_http_connections";
 
+  // Overload action providing the shed severity for tenant-aware (per source IP) water-fill
+  // load shedding. The action state is consumed by extensions (e.g.
+  // envoy.filters.http.ip_load_shed); the overload manager itself takes no direct action.
+  const std::string ShedTenantLoad = "envoy.overload_actions.shed_tenant_load";
+
   // This should be kept current with the Overload actions available.
   // This is the last member of this class to duplicating the strings with
   // proper lifetime guarantees.
-  const std::array<absl::string_view, 8> WellKnownActions = {StopAcceptingRequests,
+  const std::array<absl::string_view, 9> WellKnownActions = {StopAcceptingRequests,
                                                              DisableHttpKeepAlive,
                                                              StopAcceptingConnections,
                                                              RejectIncomingConnections,
                                                              ShrinkHeap,
                                                              ReduceTimeouts,
                                                              ResetStreams,
-                                                             CloseIdleHttpConnections};
+                                                             CloseIdleHttpConnections,
+                                                             ShedTenantLoad};
 };
 
 using OverloadActionNames = ConstSingleton<OverloadActionNameValues>;
