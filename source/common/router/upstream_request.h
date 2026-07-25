@@ -324,14 +324,10 @@ public:
   }
   // If the filter manager determines a decoder filter has available, tell
   // the router to resume the flow of data from downstream.
-  void onDecoderFilterBelowWriteBufferLowWatermark() override {
-    upstream_request_.onBelowWriteBufferLowWatermark();
-  }
+  void onDecoderFilterBelowWriteBufferLowWatermark() override;
   // If the filter manager determines a decoder filter has too much data, tell
   // the router to stop the flow of data from downstream.
-  void onDecoderFilterAboveWriteBufferHighWatermark() override {
-    upstream_request_.onAboveWriteBufferHighWatermark();
-  }
+  void onDecoderFilterAboveWriteBufferHighWatermark() override;
 
   // These functions are delegated to the downstream HCM/FM
   OptRef<const Tracing::Config> tracingConfig() const override;

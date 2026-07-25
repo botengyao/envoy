@@ -184,6 +184,49 @@ TEST_F(UpstreamRequestTest, AcceptRouterHeaders) {
   filter->callbacks_->resetStream();
 }
 
+// Back-pressure raised toward the request source by a filter in the upstream filter
+// chain must also fan out to that chain's upstream-watermark subscribers (mirroring
+// ConnectionManagerImpl::ActiveStream), so a filter that produces request data of its
+// own (e.g. replays a buffered body) can pause and resume in step with the upstream.
+TEST_F(UpstreamRequestTest, WatermarksFanOutToUpstreamWatermarkSubscribers) {
+  std::shared_ptr<Http::MockStreamDecoderFilter> filter(
+      new NiceMock<Http::MockStreamDecoderFilter>());
+
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.addStreamDecoderFilter(filter);
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      });
+
+  initialize();
+  ASSERT_TRUE(filter->callbacks_ != nullptr);
+
+  Http::MockUpstreamWatermarkCallbacks watermark_callbacks;
+  filter->callbacks_->addUpstreamWatermarkCallbacks(watermark_callbacks);
+
+  // High watermark: pushed back to the router (which slows the downstream source) and
+  // fanned out to the subscriber.
+  EXPECT_CALL(router_filter_interface_.callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
+  EXPECT_CALL(watermark_callbacks, onAboveWriteBufferHighWatermark());
+  filter->callbacks_->onDecoderFilterAboveWriteBufferHighWatermark();
+
+  // A subscriber registering while the high watermark is outstanding is caught up
+  // immediately.
+  Http::MockUpstreamWatermarkCallbacks late_watermark_callbacks;
+  EXPECT_CALL(late_watermark_callbacks, onAboveWriteBufferHighWatermark());
+  filter->callbacks_->addUpstreamWatermarkCallbacks(late_watermark_callbacks);
+
+  // Low watermark: propagated to the router and to both subscribers.
+  EXPECT_CALL(router_filter_interface_.callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
+  EXPECT_CALL(watermark_callbacks, onBelowWriteBufferLowWatermark());
+  EXPECT_CALL(late_watermark_callbacks, onBelowWriteBufferLowWatermark());
+  filter->callbacks_->onDecoderFilterBelowWriteBufferLowWatermark();
+
+  filter->callbacks_->removeUpstreamWatermarkCallbacks(late_watermark_callbacks);
+  filter->callbacks_->removeUpstreamWatermarkCallbacks(watermark_callbacks);
+}
+
 TEST_F(UpstreamRequestTest, ConnectionPoolLatencyTime) {
   initialize();
 

@@ -824,6 +824,22 @@ void UpstreamRequest::enableDataFromDownstreamForFlowControl() {
   }
 }
 
+void UpstreamRequestFilterManagerCallbacks::onDecoderFilterBelowWriteBufferLowWatermark() {
+  upstream_request_.onBelowWriteBufferLowWatermark();
+  // Pushing back toward the router only slows the original request source. Also notify any
+  // filter in this upstream chain that produces request data of its own (e.g. replays a
+  // buffered body) so it can resume, mirroring the connection manager's
+  // onDecoderFilterBelowWriteBufferLowWatermark().
+  upstream_request_.filter_manager_->callUpstreamLowWatermarkCallbacks();
+}
+
+void UpstreamRequestFilterManagerCallbacks::onDecoderFilterAboveWriteBufferHighWatermark() {
+  upstream_request_.onAboveWriteBufferHighWatermark();
+  // See onDecoderFilterBelowWriteBufferLowWatermark(): also fan the back-pressure out to
+  // filters in this upstream chain that produce request data of their own.
+  upstream_request_.filter_manager_->callUpstreamHighWatermarkCallbacks();
+}
+
 Http::RequestHeaderMapOptRef UpstreamRequestFilterManagerCallbacks::requestHeaders() {
   return {*upstream_request_.parent_.downstreamHeaders()};
 }
