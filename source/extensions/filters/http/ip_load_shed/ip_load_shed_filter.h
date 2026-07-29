@@ -1,16 +1,32 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
+#include "envoy/http/codes.h"
+
 #include "source/common/common/logger.h"
+#include "source/extensions/filters/common/ip_load_shed/water_fill_controller.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
-#include "source/extensions/filters/http/ip_load_shed/water_fill_controller.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace IpLoadShed {
+
+using Filters::Common::IpLoadShed::ShedSnapshotConstSharedPtr;
+using Filters::Common::IpLoadShed::WaterFillControllerSharedPtr;
+
+/**
+ * Per-listener filter configuration: the shared controller plus L7-specific knobs.
+ */
+struct FilterConfig {
+  WaterFillControllerSharedPtr controller_;
+  uint64_t stream_cost_bytes_;
+  Http::Code rejection_status_code_;
+};
+using FilterConfigSharedPtr = std::shared_ptr<const FilterConfig>;
 
 /**
  * Per-stream filter. On decodeHeaders it either sheds the stream (tenant above the current
@@ -20,8 +36,7 @@ namespace IpLoadShed {
 class IpLoadShedFilter : public Http::PassThroughFilter,
                          public Logger::Loggable<Logger::Id::filter> {
 public:
-  explicit IpLoadShedFilter(WaterFillControllerSharedPtr controller)
-      : controller_(std::move(controller)) {}
+  explicit IpLoadShedFilter(FilterConfigSharedPtr config) : config_(std::move(config)) {}
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
@@ -37,9 +52,9 @@ public:
 private:
   void account(uint64_t bytes);
 
-  const WaterFillControllerSharedPtr controller_;
-  // Tenant key: the downstream direct remote IP. Empty when the downstream address is not an
-  // IP (e.g. unix domain sockets), in which case the stream is neither shed nor accounted.
+  const FilterConfigSharedPtr config_;
+  // Tenant key per the controller's TenantKeySource config. Empty when the downstream address
+  // is not an IP (e.g. unix domain sockets); such streams are neither shed nor accounted.
   std::string ip_key_;
   int64_t accounted_bytes_{0};
 };

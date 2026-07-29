@@ -6,7 +6,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace HttpFilters {
+namespace Filters {
+namespace Common {
 namespace IpLoadShed {
 
 // Water level meaning "nothing is shed".
@@ -26,6 +27,7 @@ constexpr uint64_t NoWaterLevel = std::numeric_limits<uint64_t>::max();
 uint64_t computeWaterLevel(std::vector<uint64_t>& usages, double severity);
 
 } // namespace IpLoadShed
-} // namespace HttpFilters
+} // namespace Common
+} // namespace Filters
 } // namespace Extensions
 } // namespace Envoy

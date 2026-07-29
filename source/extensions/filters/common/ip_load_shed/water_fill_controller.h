@@ -7,25 +7,27 @@
 #include <string>
 
 #include "envoy/event/timer.h"
-#include "envoy/extensions/filters/http/ip_load_shed/v3/ip_load_shed.pb.h"
-#include "envoy/http/codes.h"
+#include "envoy/extensions/filters/common/ip_load_shed/v3/water_fill.pb.h"
+#include "envoy/network/socket.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/singleton/instance.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/logger.h"
-#include "source/extensions/filters/http/ip_load_shed/water_fill.h"
+#include "source/extensions/filters/common/ip_load_shed/water_fill.h"
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
 namespace Extensions {
-namespace HttpFilters {
+namespace Filters {
+namespace Common {
 namespace IpLoadShed {
 
 /**
@@ -52,7 +54,7 @@ struct ShedSnapshot {
 using ShedSnapshotConstSharedPtr = std::shared_ptr<const ShedSnapshot>;
 
 /**
- * All ip_load_shed stats. @see stats_macros.h
+ * All ip_load_shed stats, shared by the HTTP and network filters. @see stats_macros.h
  */
 #define ALL_IP_LOAD_SHED_STATS(COUNTER, GAUGE)                                                     \
   COUNTER(shed_total)                                                                              \
@@ -67,7 +69,7 @@ struct IpLoadShedStats {
 };
 
 /**
- * Server-wide singleton shared by all ip_load_shed filter instances.
+ * Server-wide singleton shared by all ip_load_shed filter instances (HTTP and network).
  *
  * Threading model:
  *  - Workers account per-tenant usage into 64 striped shards (short critical sections on a
@@ -82,10 +84,19 @@ struct IpLoadShedStats {
 class WaterFillController : public Singleton::Instance,
                             public Logger::Loggable<Logger::Id::filter> {
 public:
-  WaterFillController(
-      Server::Configuration::ServerFactoryContext& context,
-      const envoy::extensions::filters::http::ip_load_shed::v3::IpLoadShed& config);
+  using WaterFillConfig = envoy::extensions::filters::common::ip_load_shed::v3::WaterFillConfig;
+
+  WaterFillController(Server::Configuration::ServerFactoryContext& context,
+                      const WaterFillConfig& config);
   ~WaterFillController() override;
+
+  // Returns an error when the config has no usable pressure source or inverted thresholds.
+  static absl::Status validateConfig(const WaterFillConfig& config);
+
+  // Returns the process-wide controller, creating it from this config on first use. Filter
+  // config factories call this on the main thread during listener configuration.
+  static std::shared_ptr<WaterFillController>
+  getOrCreate(Server::Configuration::ServerFactoryContext& context, const WaterFillConfig& config);
 
   // Worker-thread API ---------------------------------------------------------------------
 
@@ -93,13 +104,15 @@ public:
   // TLS (treated as "do not shed").
   ShedSnapshotConstSharedPtr snapshot();
 
-  // Adjusts a tenant's aggregated usage by delta bytes (positive on stream admission and
-  // buffered data, negative when a stream is destroyed).
+  // Adjusts a tenant's aggregated usage by delta bytes (positive on admission and observed
+  // data, negative when the stream or connection is destroyed).
   void addUsage(absl::string_view ip, int64_t delta);
 
+  // The tenant key for a downstream connection per the configured TenantKeySource; empty
+  // when the address is not an IP (e.g. unix domain sockets).
+  std::string tenantKey(const Network::ConnectionInfoProvider& info) const;
+
   IpLoadShedStats& stats() { return stats_; }
-  uint64_t streamCostBytes() const { return stream_cost_bytes_; }
-  Http::Code rejectionStatusCode() const { return rejection_status_code_; }
 
 private:
   struct ThreadLocalSnapshot : public ThreadLocal::ThreadLocalObject {
@@ -117,14 +130,14 @@ private:
   // Current shed severity in [0, 1]. Main thread only.
   double shedSeverity() const;
 
+  const WaterFillConfig config_;
   const std::string overload_action_name_;
   const uint64_t max_heap_size_bytes_;
   const double shed_start_;
   const double reject_all_;
   const std::chrono::milliseconds evaluation_interval_;
-  const uint64_t stream_cost_bytes_;
-  const Http::Code rejection_status_code_;
   const uint32_t max_tenants_per_shard_;
+  const bool use_remote_address_;
 
   IpLoadShedStats stats_;
   std::array<Shard, NumShards> shards_;
@@ -134,11 +147,16 @@ private:
   // Latest severity delivered by the overload manager action callback (main thread only).
   bool use_overload_action_{false};
   double overload_severity_{0.0};
+  // Liveness sentinel for the overload-action callback, which the overload manager holds for
+  // the process lifetime and which captures a raw `this`. The callback and the destructor
+  // both run on the main thread, so a weak_ptr lock is a race-free liveness check.
+  const std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
 };
 
 using WaterFillControllerSharedPtr = std::shared_ptr<WaterFillController>;
 
 } // namespace IpLoadShed
-} // namespace HttpFilters
+} // namespace Common
+} // namespace Filters
 } // namespace Extensions
 } // namespace Envoy

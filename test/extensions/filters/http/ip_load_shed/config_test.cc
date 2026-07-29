@@ -24,7 +24,7 @@ TEST(IpLoadShedConfigTest, SelfContainedModeCreatesFilter) {
   new NiceMock<Event::MockTimer>(&context.server_factory_context_.dispatcher_);
 
   envoy::extensions::filters::http::ip_load_shed::v3::IpLoadShed proto_config;
-  proto_config.set_max_heap_size_bytes(2ULL * 1024 * 1024 * 1024);
+  proto_config.mutable_water_fill()->set_max_heap_size_bytes(2ULL * 1024 * 1024 * 1024);
 
   IpLoadShedFilterFactory factory;
   auto cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
@@ -38,6 +38,7 @@ TEST(IpLoadShedConfigTest, SelfContainedModeCreatesFilter) {
 TEST(IpLoadShedConfigTest, MissingPressureSourceRejected) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   envoy::extensions::filters::http::ip_load_shed::v3::IpLoadShed proto_config;
+  proto_config.mutable_water_fill();
 
   IpLoadShedFilterFactory factory;
   auto cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);
@@ -47,9 +48,10 @@ TEST(IpLoadShedConfigTest, MissingPressureSourceRejected) {
 TEST(IpLoadShedConfigTest, InvertedThresholdsRejected) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   envoy::extensions::filters::http::ip_load_shed::v3::IpLoadShed proto_config;
-  proto_config.set_max_heap_size_bytes(1024);
-  proto_config.mutable_shed_start_threshold()->set_value(95.0);
-  proto_config.mutable_reject_all_threshold()->set_value(90.0);
+  auto* water_fill = proto_config.mutable_water_fill();
+  water_fill->set_max_heap_size_bytes(1024);
+  water_fill->mutable_shed_start_threshold()->set_value(95.0);
+  water_fill->mutable_reject_all_threshold()->set_value(90.0);
 
   IpLoadShedFilterFactory factory;
   auto cb = factory.createFilterFactoryFromProto(proto_config, "stats", context);

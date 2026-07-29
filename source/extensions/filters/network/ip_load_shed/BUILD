@@ -14,12 +14,10 @@ envoy_cc_library(
     srcs = ["ip_load_shed_filter.cc"],
     hdrs = ["ip_load_shed_filter.h"],
     deps = [
-        "//envoy/http:codes_interface",
-        "//source/common/common:macros",
+        "//envoy/network:connection_interface",
+        "//envoy/network:filter_interface",
         "//source/common/common:minimal_logger_lib",
-        "//source/common/http:header_map_lib",
         "//source/extensions/filters/common/ip_load_shed:water_fill_controller_lib",
-        "//source/extensions/filters/http/common:pass_through_filter_lib",
     ],
 )
 
@@ -31,7 +29,7 @@ envoy_cc_extension(
         ":ip_load_shed_lib",
         "//envoy/registry",
         "//source/extensions/filters/common/ip_load_shed:water_fill_controller_lib",
-        "//source/extensions/filters/http/common:factory_base_lib",
-        "@envoy_api//envoy/extensions/filters/http/ip_load_shed/v3:pkg_cc_proto",
+        "//source/extensions/filters/network/common:factory_base_lib",
+        "@envoy_api//envoy/extensions/filters/network/ip_load_shed/v3:pkg_cc_proto",
     ],
 )

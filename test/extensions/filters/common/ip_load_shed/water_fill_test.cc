@@ -2,13 +2,14 @@
 #include <numeric>
 #include <vector>
 
-#include "source/extensions/filters/http/ip_load_shed/water_fill.h"
+#include "source/extensions/filters/common/ip_load_shed/water_fill.h"
 
 #include "gtest/gtest.h"
 
 namespace Envoy {
 namespace Extensions {
-namespace HttpFilters {
+namespace Filters {
+namespace Common {
 namespace IpLoadShed {
 namespace {
 
@@ -46,7 +47,6 @@ TEST(WaterFillTest, OnlyHeaviestTenantCappedAtLowSeverity) {
   // Shed 5% of 200 -> target 190. Capping only the top tenant at 90 achieves it.
   const uint64_t level = computeWaterLevel(usages, 0.05);
   EXPECT_EQ(level, 90);
-  // Only the 100-usage tenant is above the water line.
   EXPECT_EQ(cappedTotal(usages, level), 190);
 }
 
@@ -58,8 +58,6 @@ TEST(WaterFillTest, WaterLevelSpreadsAcrossHeavyTenants) {
   EXPECT_GE(level, 20);
   EXPECT_LT(level, 30);
   EXPECT_LE(cappedTotal(usages, level), 100);
-  // The lightest tenant is below the water line.
-  EXPECT_LT(uint64_t{20}, level + 10); // sanity: level ~26
 }
 
 TEST(WaterFillTest, EqualTenantsAllCapped) {
@@ -102,6 +100,7 @@ TEST(WaterFillTest, LargeTenantCount) {
 
 } // namespace
 } // namespace IpLoadShed
-} // namespace HttpFilters
+} // namespace Common
+} // namespace Filters
 } // namespace Extensions
 } // namespace Envoy

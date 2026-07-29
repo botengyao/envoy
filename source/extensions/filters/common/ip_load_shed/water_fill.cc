@@ -1,4 +1,4 @@
-#include "source/extensions/filters/http/ip_load_shed/water_fill.h"
+#include "source/extensions/filters/common/ip_load_shed/water_fill.h"
 
 #include <algorithm>
 #include <functional>
@@ -6,7 +6,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace HttpFilters {
+namespace Filters {
+namespace Common {
 namespace IpLoadShed {
 
 uint64_t computeWaterLevel(std::vector<uint64_t>& usages, double severity) {
@@ -41,6 +42,7 @@ uint64_t computeWaterLevel(std::vector<uint64_t>& usages, double severity) {
 }
 
 } // namespace IpLoadShed
-} // namespace HttpFilters
+} // namespace Common
+} // namespace Filters
 } // namespace Extensions
 } // namespace Envoy

@@ -180,7 +180,8 @@ runs a timer on the **main** dispatcher (`evaluation_interval`, default 100 ms):
    publication mechanism the overload manager uses for action state).
 
 Staleness is bounded by one evaluation interval (100 ms) plus the TLS post latency, which is
-the same order as the overload manager's own `refresh_interval` (250 ms default). Memory
+the same order as the overload manager's own `refresh_interval` (1s default; the examples
+here set 0.25s). Memory
 pressure moves on a much slower timescale, and the scaled ramp gives natural hysteresis: as
 shedding drains heavy tenants, pressure falls, severity falls, and the water level rises
 smoothly instead of flapping.
@@ -246,12 +247,13 @@ http_filters:
 - name: envoy.filters.http.ip_load_shed
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.ip_load_shed.v3.IpLoadShed
-    overload_action_name: envoy.overload_actions.shed_tenant_load
-    # Self-contained fallback if the action is not configured:
-    max_heap_size_bytes: 2147483648
-    shed_start_threshold:  { value: 80 }   # type.v3.Percent
-    reject_all_threshold:  { value: 90 }
-    evaluation_interval: 0.1s
+    water_fill:
+      overload_action_name: envoy.overload_actions.shed_tenant_load
+      # Self-contained fallback if the action is not configured:
+      max_heap_size_bytes: 2147483648
+      shed_start_threshold:  { value: 80 }   # type.v3.Percent
+      reject_all_threshold:  { value: 90 }
+      evaluation_interval: 0.1s
     stream_cost_bytes: 65536
 ```
 

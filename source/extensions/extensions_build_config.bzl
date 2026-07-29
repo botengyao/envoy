@@ -265,6 +265,7 @@ EXTENSIONS = {
     "envoy.filters.network.reverse_tunnel":                       "//source/extensions/filters/network/reverse_tunnel:config",
     "envoy.filters.network.reverse_tunnel_drain_aware_http_connection_manager": "//source/extensions/filters/network/reverse_tunnel/drain_aware_hcm:drain_aware_config",
     "envoy.filters.network.http_connection_manager":              "//source/extensions/filters/network/http_connection_manager:config",
+    "envoy.filters.network.ip_load_shed":                         "//source/extensions/filters/network/ip_load_shed:config",
     "envoy.filters.network.local_ratelimit":                      "//source/extensions/filters/network/local_ratelimit:config",
     "envoy.filters.network.mongo_proxy":                          "//source/extensions/filters/network/mongo_proxy:config",
     "envoy.filters.network.tcp_bandwidth_limit":                  "//source/extensions/filters/network/tcp_bandwidth_limit:config",

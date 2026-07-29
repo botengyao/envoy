@@ -12,12 +12,18 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_extension_cc_test(
-    name = "water_fill_test",
-    srcs = ["water_fill_test.cc"],
+    name = "filter_test",
+    srcs = ["filter_test.cc"],
     extension_names = ["envoy.filters.http.ip_load_shed"],
     rbe_pool = "6gig",
     deps = [
-        "//source/extensions/filters/http/ip_load_shed:water_fill_lib",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/network:utility_lib",
+        "//source/extensions/filters/http/ip_load_shed:ip_load_shed_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:utility_lib",
     ],
 )
 
