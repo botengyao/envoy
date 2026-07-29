@@ -1,0 +1,457 @@
+{
+  "mode": "l7",
+  "steps": [
+    {
+      "pressure": 0.7,
+      "heavy": {
+        "ok": 192,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light": {
+        "ok": 960,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 0,
+        "shed_total": 0,
+        "tenants_shed": 0,
+        "tenants_tracked": 8,
+        "total_usage_bytes": 15728640,
+        "water_level_bytes": 0,
+        "downstream_cx_overload_reject": 0,
+        "active": 0,
+        "scale_percent": 0,
+        "failed_updates": 0,
+        "pressure": 70,
+        "skipped_updates": 0
+      }
+    },
+    {
+      "pressure": 0.82,
+      "heavy": {
+        "ok": 192,
+        "shed": 1759,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.902
+      },
+      "light": {
+        "ok": 928,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 200,
+        "shed_total": 1759,
+        "tenants_shed": 8,
+        "tenants_tracked": 8,
+        "total_usage_bytes": 15728640,
+        "water_level_bytes": 1572863,
+        "downstream_cx_overload_reject": 0,
+        "active": 0,
+        "scale_percent": 20,
+        "failed_updates": 0,
+        "pressure": 82,
+        "skipped_updates": 0
+      }
+    },
+    {
+      "pressure": 0.85,
+      "heavy": {
+        "ok": 192,
+        "shed": 2156,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.918
+      },
+      "light": {
+        "ok": 954,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 500,
+        "shed_total": 3915,
+        "tenants_shed": 8,
+        "tenants_tracked": 8,
+        "total_usage_bytes": 15728640,
+        "water_level_bytes": 983040,
+        "downstream_cx_overload_reject": 0,
+        "active": 0,
+        "scale_percent": 50,
+        "failed_updates": 0,
+        "pressure": 85,
+        "skipped_updates": 0
+      }
+    },
+    {
+      "pressure": 0.88,
+      "heavy": {
+        "ok": 192,
+        "shed": 1148,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.857
+      },
+      "light": {
+        "ok": 960,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 800,
+        "shed_total": 5063,
+        "tenants_shed": 8,
+        "tenants_tracked": 8,
+        "total_usage_bytes": 15728640,
+        "water_level_bytes": 393215,
+        "downstream_cx_overload_reject": 0,
+        "active": 0,
+        "scale_percent": 80,
+        "failed_updates": 0,
+        "pressure": 88,
+        "skipped_updates": 0
+      }
+    },
+    {
+      "pressure": 0.92,
+      "heavy": {
+        "ok": 0,
+        "shed": 79798,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 1.0
+      },
+      "light": {
+        "ok": 0,
+        "shed": 928,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 1.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 1000,
+        "shed_total": 89579,
+        "tenants_shed": 0,
+        "tenants_tracked": 0,
+        "total_usage_bytes": 0,
+        "water_level_bytes": 0,
+        "downstream_cx_overload_reject": 0,
+        "active": 1,
+        "scale_percent": 100,
+        "failed_updates": 0,
+        "pressure": 92,
+        "skipped_updates": 0
+      }
+    },
+    {
+      "pressure": 0.7,
+      "heavy": {
+        "ok": 192,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light": {
+        "ok": 960,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "stats": {
+        "count": 0,
+        "downstream_cx_overload_disable_keepalive": 0,
+        "downstream_rq_overload_close": 0,
+        "rq_overload_local_reply": 0,
+        "severity_permille": 0,
+        "shed_total": 90212,
+        "tenants_shed": 0,
+        "tenants_tracked": 8,
+        "total_usage_bytes": 15728640,
+        "water_level_bytes": 0,
+        "downstream_cx_overload_reject": 0,
+        "active": 0,
+        "scale_percent": 0,
+        "failed_updates": 0,
+        "pressure": 70,
+        "skipped_updates": 0
+      }
+    }
+  ],
+  "per_tenant_final": {
+    "10.1.0.1": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.2": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.3": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.4": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.5": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.6": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.7": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.1.0.8": {
+      "ok": 24,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.1": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.2": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.3": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.4": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.5": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.6": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.7": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.8": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.9": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.10": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.11": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.12": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.13": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.14": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.15": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.16": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.17": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.18": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.19": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.20": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.21": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.22": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.23": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.24": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.25": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.26": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.27": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.28": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.29": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.30": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.31": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    },
+    "10.2.0.32": {
+      "ok": 30,
+      "shed": 0,
+      "other": 0,
+      "error": 0
+    }
+  }
+}
