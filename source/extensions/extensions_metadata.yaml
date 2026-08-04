@@ -621,13 +621,6 @@ envoy.filters.http.health_check:
   status: stable
   type_urls:
   - envoy.extensions.filters.http.health_check.v3.HealthCheck
-envoy.filters.http.ip_load_shed:
-  categories:
-  - envoy.filters.http
-  security_posture: robust_to_untrusted_downstream
-  status: alpha
-  type_urls:
-  - envoy.extensions.filters.http.ip_load_shed.v3.IpLoadShed
 envoy.filters.http.ip_tagging:
   categories:
   - envoy.filters.http
@@ -780,6 +773,13 @@ envoy.filters.http.tap:
   status: alpha
   type_urls:
   - envoy.extensions.filters.http.tap.v3.Tap
+envoy.filters.http.tenant_load_shed:
+  categories:
+  - envoy.filters.http
+  security_posture: robust_to_untrusted_downstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.http.tenant_load_shed.v3.TenantLoadShed
 envoy.filters.http.thrift_to_metadata:
   categories:
   - envoy.filters.http
@@ -959,13 +959,6 @@ envoy.filters.network.envoy_mobile_http_connection_manager:
   - envoy.filters.network
   security_posture: robust_to_untrusted_downstream
   status: stable
-envoy.filters.network.ip_load_shed:
-  categories:
-  - envoy.filters.network
-  security_posture: robust_to_untrusted_downstream
-  status: alpha
-  type_urls:
-  - envoy.extensions.filters.network.ip_load_shed.v3.IpLoadShed
 envoy.filters.network.local_ratelimit:
   categories:
   - envoy.filters.network
@@ -1029,6 +1022,13 @@ envoy.filters.network.tcp_proxy:
   status: stable
   type_urls:
   - envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+envoy.filters.network.tenant_load_shed:
+  categories:
+  - envoy.filters.network
+  security_posture: robust_to_untrusted_downstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.network.tenant_load_shed.v3.TenantLoadShed
 envoy.filters.network.thrift_proxy:
   categories:
   - envoy.filters.network
