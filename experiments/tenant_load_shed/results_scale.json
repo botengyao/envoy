@@ -1,0 +1,209 @@
+[
+  {
+    "tenants": 10,
+    "heavy_tenants": 2,
+    "light_tenants": 8,
+    "heavy_concurrency_per_tenant": 20,
+    "light_period_s": 0.1,
+    "baseline": {
+      "heavy": {
+        "ok": 160,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light": {
+        "ok": 1136,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 4.8,
+        "p95": 8.2,
+        "n": 1136
+      },
+      "envoy_cpu_pct_avg": 10.9,
+      "envoy_rss_mb": 118.4,
+      "stats": {
+        "severity_permille": 0,
+        "shed_total": 0,
+        "tenants_shed": 0,
+        "tenants_tracked": 2,
+        "total_usage_bytes": 13107200,
+        "water_level_bytes": 0
+      }
+    },
+    "shed": {
+      "heavy": {
+        "ok": 200,
+        "shed": 2250,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.9184
+      },
+      "light": {
+        "ok": 1504,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 4.8,
+        "p95": 8.8,
+        "n": 1504
+      },
+      "envoy_cpu_pct_avg": 11.7,
+      "envoy_rss_mb": 237.0,
+      "stats": {
+        "severity_permille": 500,
+        "shed_total": 2250,
+        "tenants_shed": 2,
+        "tenants_tracked": 7,
+        "total_usage_bytes": 13434880,
+        "water_level_bytes": 3194880
+      }
+    }
+  },
+  {
+    "tenants": 100,
+    "heavy_tenants": 20,
+    "light_tenants": 80,
+    "heavy_concurrency_per_tenant": 2,
+    "light_period_s": 1.0,
+    "baseline": {
+      "heavy": {
+        "ok": 160,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light": {
+        "ok": 1200,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 9.3,
+        "p95": 18.7,
+        "n": 1200
+      },
+      "envoy_cpu_pct_avg": 0.9,
+      "envoy_rss_mb": 123.3,
+      "stats": {
+        "severity_permille": 0,
+        "shed_total": 0,
+        "tenants_shed": 0,
+        "tenants_tracked": 20,
+        "total_usage_bytes": 13107200,
+        "water_level_bytes": 0
+      }
+    },
+    "shed": {
+      "heavy": {
+        "ok": 200,
+        "shed": 2060,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.9115
+      },
+      "light": {
+        "ok": 1600,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 8.6,
+        "p95": 20.4,
+        "n": 1600
+      },
+      "envoy_cpu_pct_avg": 1.8,
+      "envoy_rss_mb": 253.1,
+      "stats": {
+        "severity_permille": 500,
+        "shed_total": 2060,
+        "tenants_shed": 20,
+        "tenants_tracked": 20,
+        "total_usage_bytes": 13107200,
+        "water_level_bytes": 327680
+      }
+    }
+  },
+  {
+    "tenants": 1000,
+    "heavy_tenants": 200,
+    "light_tenants": 800,
+    "heavy_concurrency_per_tenant": 1,
+    "light_period_s": 10.0,
+    "baseline": {
+      "heavy": {
+        "ok": 800,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light": {
+        "ok": 1600,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 31.2,
+        "p95": 105.9,
+        "n": 1600
+      },
+      "envoy_cpu_pct_avg": 2.5,
+      "envoy_rss_mb": 188.7,
+      "stats": {
+        "severity_permille": 0,
+        "shed_total": 0,
+        "tenants_shed": 0,
+        "tenants_tracked": 200,
+        "total_usage_bytes": 65536000,
+        "water_level_bytes": 0
+      }
+    },
+    "shed": {
+      "heavy": {
+        "ok": 1000,
+        "shed": 9764,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.9071
+      },
+      "light": {
+        "ok": 1600,
+        "shed": 0,
+        "other": 0,
+        "error": 0,
+        "shed_rate": 0.0
+      },
+      "light_latency_ms": {
+        "p50": 16.9,
+        "p95": 57.3,
+        "n": 1600
+      },
+      "envoy_cpu_pct_avg": 19.7,
+      "envoy_rss_mb": 742.4,
+      "stats": {
+        "severity_permille": 500,
+        "shed_total": 9764,
+        "tenants_shed": 200,
+        "tenants_tracked": 200,
+        "total_usage_bytes": 65536000,
+        "water_level_bytes": 163840
+      }
+    }
+  }
+]

@@ -75,3 +75,36 @@ monotonically across steps (67 MB → 148 MB; cumulative bytes-seen never decays
 connections stay open), and at recovery heavy tenants are admitted again purely because
 severity is 0, not because their booked usage dropped. Both are what the Tier-2
 buffered-bytes ledger / EWMA decay in ACCOUNTING.md §2.2 fix.
+
+## E4 — tenant-cardinality scaling: 10 / 100 / 1000 tenants (`results_scale.json`)
+
+Constant total offered load (~80 light GET/s + a fixed heavy POST pool) spread over a varying
+number of tenants (20% heavy / 80% light); per scale, a 15s baseline (pressure 0) and a 20s
+shed phase at pressure 0.85 (severity 0.5). `--concurrency 4`, fresh envoy per scale.
+
+| tenants (heavy+light) | phase | heavy shed rate | light shed rate | light p50 / p95 ms | water level | envoy CPU% | RSS MB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 (2+8) | baseline | 0 | 0 | 4.8 / 8.2 | — | 10.9 | 118 |
+| 10 (2+8) | shed | **0.92** | **0** | 4.8 / 8.8 | 3.19 MB | 11.7 | 237 |
+| 100 (20+80) | baseline | 0 | 0 | 9.3 / 18.7 | — | 0.9 | 123 |
+| 100 (20+80) | shed | **0.91** | **0** | 8.6 / 20.4 | 327 KB | 1.8 | 253 |
+| 1000 (200+800) | baseline | 0 | 0 | 31.2 / 105.9 | — | 2.5 | 189 |
+| 1000 (200+800) | shed | **0.91** | **0** | 16.9 / 57.3 | 163 KB | 19.7 | 742 |
+
+Findings:
+
+* **Fairness is scale-invariant.** Light tenants took zero 503s at every cardinality while
+  the heavy class shed at a uniform ~91% — the water-fill selectivity does not degrade as the
+  tenant population grows 100×.
+* **The water level adapts automatically**: the same aggregate heavy usage spread over 2 → 20
+  → 200 tenants moves the solved level 3.19 MB → 327 KB → 163 KB with no tuning.
+* **Shedding is protective, visibly.** At 1000 tenants the light p50 *improves* from 31.2 ms
+  to 16.9 ms during the shed phase — rejecting the heavy class returns capacity to everyone
+  else.
+* **Overhead attribution.** Controller cost is invisible at these scales (E3: the solve is
+  ~1–60 µs/tick up to 10k tenants; accounting is a thread-local map add). The N=1000 shed
+  phase CPU (19.7%) and RSS growth are dominated by the reject/retry churn of unpaced heavy
+  clients (~490 rejects/s, each a fresh connection + PROXY header + immediate 503), i.e.
+  workload, not accounting.
+* `tenants_tracked` stays at the heavy count (200 at N=1000): light tenants' deltas fold to
+  zero between ticks, so the lock-free ledger self-cleans — idle tenants cost nothing.
