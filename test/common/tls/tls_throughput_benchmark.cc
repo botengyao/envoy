@@ -184,17 +184,20 @@ static void testThroughput(benchmark::State& state) {
 
 static void testParams(benchmark::internal::Benchmark* b) {
   // `write_front_chunk` false writes the buffer the way `SslSocket::doWrite` did before
-  // `envoy.reloadable_features.tls_write_front_chunk`, i.e. always through `linearize`, so the two
-  // strategies can be compared over the same scenarios.
-  for (auto write_front_chunk : {false, true}) {
-    for (auto move_slices : {false, true}) {
-      for (auto align_to_16kb : {false, true}) {
-        // Add a single case of no short slices; don't iterate over the sizes
-        // which duplicates test cases when count is zero.
+  // `envoy.reloadable_features.tls_write_front_chunk`, i.e. always through `linearize`. It is the
+  // innermost parameter so that the two strategies for a scenario run back to back, rather than
+  // being separated by the whole rest of the matrix.
+  for (auto move_slices : {false, true}) {
+    for (auto align_to_16kb : {false, true}) {
+      // Add a single case of no short slices; don't iterate over the sizes
+      // which duplicates test cases when count is zero.
+      for (auto write_front_chunk : {false, true}) {
         b->Args({0, 0, align_to_16kb, move_slices, write_front_chunk});
+      }
 
-        for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
-          for (auto num_short_slices : {1, 2, 3}) {
+      for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
+        for (auto num_short_slices : {1, 2, 3}) {
+          for (auto write_front_chunk : {false, true}) {
             b->Args({short_slice_size, num_short_slices, align_to_16kb, move_slices,
                      write_front_chunk});
           }

@@ -63,6 +63,38 @@ TEST(NextWriteChunkTest, ShortFrontSliceCoalescedUpToMinimum) {
   EXPECT_EQ(std::string(200, 'a') + std::string(MinWriteChunkSize - 200, 'b'), asStringView(chunk));
 }
 
+// Leading fragments that tile the chunk exactly are coalesced whole. The copy ends on a slice
+// boundary, so the buffer stays aligned and the next write goes out in place.
+TEST(NextWriteChunkTest, LeadingFragmentsTilingTheChunkCoalescedWhole) {
+  Buffer::OwnedImpl buffer;
+  appendSlice(buffer, 1, 'a');
+  appendSlice(buffer, MaxWriteChunkSize - 1, 'b');
+  appendSlice(buffer, MaxWriteChunkSize, 'c');
+
+  const Buffer::RawSlice front = buffer.frontSlice();
+  const Buffer::RawSlice chunk = nextWriteChunk(buffer, MaxWriteChunkSize);
+  EXPECT_NE(front.mem_, chunk.mem_);
+  EXPECT_EQ(MaxWriteChunkSize, chunk.len_);
+
+  buffer.drain(chunk.len_);
+  const Buffer::RawSlice next = nextWriteChunk(buffer, MaxWriteChunkSize);
+  EXPECT_EQ(buffer.frontSlice().mem_, next.mem_);
+  EXPECT_EQ(MaxWriteChunkSize, next.len_);
+}
+
+// The scan is bounded, so a buffer of many tiny slices falls back to the fixed cap instead of
+// walking the whole buffer.
+TEST(NextWriteChunkTest, ManyTinySlicesCoalescedUpToMinimum) {
+  Buffer::OwnedImpl buffer;
+  for (int i = 0; i < 64; i++) {
+    appendSlice(buffer, 8, 'a');
+  }
+  appendSlice(buffer, MaxWriteChunkSize, 'b');
+
+  const Buffer::RawSlice chunk = nextWriteChunk(buffer, MaxWriteChunkSize);
+  EXPECT_EQ(MinWriteChunkSize, chunk.len_);
+}
+
 // A contiguous buffer below the minimum is written in place rather than copied.
 TEST(NextWriteChunkTest, ShortContiguousBufferWrittenInPlace) {
   Buffer::OwnedImpl buffer;
@@ -156,6 +188,24 @@ TEST(NextWriteChunkTest, StableAcrossAppendsForWantWriteRetry) {
     EXPECT_EQ(chunk.mem_, retry.mem_) << "front_size " << front_size;
     EXPECT_EQ(chunk.len_, retry.len_) << "front_size " << front_size;
   }
+}
+
+// The same, for the whole-slice coalesce path: a short front slice plus a slice that completes the
+// chunk, so the retry has to reproduce a coalesce of the full chunk rather than the fixed cap.
+TEST(NextWriteChunkTest, StableAcrossAppendsWhenFragmentsTileTheChunk) {
+  Buffer::OwnedImpl buffer;
+  appendSlice(buffer, 1, 'a');
+  appendSlice(buffer, MaxWriteChunkSize - 1, 'b');
+
+  const Buffer::RawSlice chunk = nextWriteChunk(buffer, MaxWriteChunkSize);
+  EXPECT_EQ(MaxWriteChunkSize, chunk.len_);
+
+  appendSlice(buffer, MaxWriteChunkSize, 'c');
+  buffer.add("appended while the write was blocked");
+
+  const Buffer::RawSlice retry = nextWriteChunk(buffer, chunk.len_);
+  EXPECT_EQ(chunk.mem_, retry.mem_);
+  EXPECT_EQ(chunk.len_, retry.len_);
 }
 
 // The same, for a buffer whose front slice is also its back slice, so that the append grows the

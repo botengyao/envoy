@@ -21,6 +21,10 @@ constexpr uint64_t MaxWriteChunkSize = 16384;
 // does not turn into a stream of tiny TLS records.
 constexpr uint64_t MinWriteChunkSize = 4096;
 
+// How many leading slices to consider coalescing whole. Bounds the scan below for a buffer made of
+// many tiny slices, which falls back to coalescing MinWriteChunkSize anyway.
+constexpr uint64_t MaxCoalescedSlices = 16;
+
 /**
  * Select the plaintext for the next SSL_write() call from the front of `buffer`.
  *
@@ -48,7 +52,25 @@ inline Buffer::RawSlice nextWriteChunk(Buffer::Instance& buffer, uint64_t max_by
     return {front.mem_, static_cast<size_t>(std::min<uint64_t>(front.len_, max_bytes))};
   }
 
-  const uint64_t size = std::min(max_bytes, MinWriteChunkSize);
+  // The front slice is too short to write on its own, so something has to be coalesced. Prefer
+  // taking whole slices: ending the copy on a slice boundary leaves the rest of the buffer aligned
+  // with the chunk size, so leading fragments that tile the chunk exactly still go out as one
+  // record, exactly as linearizing the whole chunk would.
+  uint64_t size = 0;
+  for (const Buffer::RawSlice& slice : buffer.getRawSlices(MaxCoalescedSlices)) {
+    if (size + slice.len_ > max_bytes) {
+      break;
+    }
+    size += slice.len_;
+  }
+
+  // The fragments do not tile the chunk, so the slice behind them has to be split. Copy only up to
+  // MinWriteChunkSize rather than the whole chunk: the remainder of that slice then stays big
+  // enough to be written in place next time round, which is what stops the misalignment from
+  // repeating for the rest of the stream.
+  if (size < MinWriteChunkSize) {
+    size = std::min(max_bytes, MinWriteChunkSize);
+  }
   return {buffer.linearize(size), static_cast<size_t>(size)};
 }
 
