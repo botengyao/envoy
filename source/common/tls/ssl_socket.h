@@ -16,6 +16,7 @@
 
 #include "source/common/common/logger.h"
 #include "source/common/network/transport_socket_options_impl.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/tls/context_impl.h"
 #include "source/common/tls/ssl_handshaker.h"
 #include "source/common/tls/utility.h"
@@ -108,6 +109,9 @@ private:
   std::string failure_reason_;
   std::optional<Api::IoError::IoErrorCode> detected_io_error_;
   bool read_disabled_{false};
+  // Read once per socket to keep the runtime lookup off the write path.
+  const bool write_front_chunk_{
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_write_front_chunk")};
 
   SslHandshakerImplSharedPtr info_;
 };

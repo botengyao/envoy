@@ -62,6 +62,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "write_chunk_lib",
+    hdrs = ["write_chunk.h"],
+    deps = [
+        "//envoy/buffer:buffer_interface",
+        "//source/common/common:assert_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "ssl_socket_base",
     srcs = ["ssl_socket.cc"],
     hdrs = ["ssl_socket.h"],
@@ -73,6 +82,7 @@ envoy_cc_library(
         ":io_handle_bio_lib",
         ":ssl_handshaker_lib",
         ":utility_lib",
+        ":write_chunk_lib",
         "//envoy/network:connection_interface",
         "//envoy/network:transport_socket_interface",
         "//envoy/ssl:handshaker_interface",
@@ -87,6 +97,7 @@ envoy_cc_library(
         "//source/common/common:thread_annotations",
         "//source/common/http:headers_lib",
         "//source/common/network:transport_socket_options_lib",
+        "//source/common/runtime:runtime_features_lib",
         "@abseil-cpp//absl/container:node_hash_set",
         "@abseil-cpp//absl/hash",
         "@abseil-cpp//absl/synchronization",

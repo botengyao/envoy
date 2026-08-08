@@ -10,6 +10,7 @@
 #include "source/common/tls/io_handle_bio.h"
 #include "source/common/tls/ssl_handshaker.h"
 #include "source/common/tls/utility.h"
+#include "source/common/tls/write_chunk.h"
 
 #include "absl/strings/str_replace.h"
 #include "openssl/err.h"
@@ -342,7 +343,7 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     bytes_to_write = bytes_to_retry_;
     bytes_to_retry_ = 0;
   } else {
-    bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
+    bytes_to_write = std::min(write_buffer.length(), MaxWriteChunkSize);
   }
 
   uint64_t total_bytes_written = 0;
@@ -352,15 +353,24 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
 
     // SSL_write() requires that if a previous call returns SSL_ERROR_WANT_WRITE, we need to call
     // it again with the same parameters. This is done by tracking last write size, but not write
-    // data, since linearize() will return the same undrained data anyway.
+    // data, since the buffer is only appended to in between: both linearize() and nextWriteChunk()
+    // return the same undrained data anyway.
     ASSERT(bytes_to_write <= write_buffer.length());
-    int rc = SSL_write(rawSsl(), write_buffer.linearize(bytes_to_write), bytes_to_write);
+    void* mem;
+    if (write_front_chunk_) {
+      const Buffer::RawSlice chunk = nextWriteChunk(write_buffer, bytes_to_write);
+      mem = chunk.mem_;
+      bytes_to_write = chunk.len_;
+    } else {
+      mem = write_buffer.linearize(bytes_to_write);
+    }
+    int rc = SSL_write(rawSsl(), mem, bytes_to_write);
     ENVOY_CONN_LOG(trace, "ssl write returns: {}", callbacks_->connection(), rc);
     if (rc > 0) {
       ASSERT(rc == static_cast<int>(bytes_to_write));
       total_bytes_written += rc;
       write_buffer.drain(rc);
-      bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
+      bytes_to_write = std::min(write_buffer.length(), MaxWriteChunkSize);
     } else {
       int err = SSL_get_error(rawSsl(), rc);
       ENVOY_CONN_LOG(trace, "ssl error occurred while write: {}", callbacks_->connection(),

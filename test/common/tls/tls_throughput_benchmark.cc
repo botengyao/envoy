@@ -1,4 +1,5 @@
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/tls/write_chunk.h"
 
 #include "test/test_common/environment.h"
 
@@ -113,6 +114,7 @@ static void testThroughput(benchmark::State& state) {
   unsigned num_short_slices = state.range(1);
   unsigned align_to_16kb = state.range(2);
   unsigned move_slices = state.range(3);
+  unsigned write_front_chunk = state.range(4);
 
   uint64_t bytes_written = 0;
   for (auto _ : state) {
@@ -152,8 +154,14 @@ static void testThroughput(benchmark::State& state) {
     while (write_buf.length() > 0) {
       const Buffer::RawSlice initial = write_buf.frontSlice();
       void* mem;
-      size_t len = std::min<uint64_t>(write_buf.length(), 16384);
-      mem = write_buf.linearize(len);
+      size_t len = std::min<uint64_t>(write_buf.length(), MaxWriteChunkSize);
+      if (write_front_chunk) {
+        const Buffer::RawSlice chunk = nextWriteChunk(write_buf, len);
+        mem = chunk.mem_;
+        len = chunk.len_;
+      } else {
+        mem = write_buf.linearize(len);
+      }
       if (write_buf.frontSlice() != initial) {
         ++num_times_linearize_did_something;
       }
@@ -175,15 +183,21 @@ static void testThroughput(benchmark::State& state) {
 }
 
 static void testParams(benchmark::internal::Benchmark* b) {
-  for (auto move_slices : {false, true}) {
-    for (auto align_to_16kb : {false, true}) {
-      // Add a single case of no short slices; don't iterate over the sizes
-      // which duplicates test cases when count is zero.
-      b->Args({0, 0, align_to_16kb, move_slices});
+  // `write_front_chunk` false writes the buffer the way `SslSocket::doWrite` did before
+  // `envoy.reloadable_features.tls_write_front_chunk`, i.e. always through `linearize`, so the two
+  // strategies can be compared over the same scenarios.
+  for (auto write_front_chunk : {false, true}) {
+    for (auto move_slices : {false, true}) {
+      for (auto align_to_16kb : {false, true}) {
+        // Add a single case of no short slices; don't iterate over the sizes
+        // which duplicates test cases when count is zero.
+        b->Args({0, 0, align_to_16kb, move_slices, write_front_chunk});
 
-      for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
-        for (auto num_short_slices : {1, 2, 3}) {
-          b->Args({short_slice_size, num_short_slices, align_to_16kb, move_slices});
+        for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
+          for (auto num_short_slices : {1, 2, 3}) {
+            b->Args({short_slice_size, num_short_slices, align_to_16kb, move_slices,
+                     write_front_chunk});
+          }
         }
       }
     }
