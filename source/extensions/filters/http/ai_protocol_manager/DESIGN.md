@@ -198,18 +198,38 @@ two ext_proc instances:
       untyped: [envoy.aigw.request, envoy.aigw.token_usage]
 ```
 
-Caveats:
+Message-frequency model and optimizations. `metadata_context` is rebuilt for
+every ProcessingRequest with no dedup or delta semantics, so a namespace that
+exists is re-serialized on every body-chunk message:
 
-- STREAMED means one gRPC message per SSE frame (body bytes included). If the
-  server needs only the final number, access logs (gRPC ALS / OTel) reading the
-  same namespace at stream end are the cheaper channel; ext_proc earns its place
-  when the server must also act.
+| Fact | Channel | Frequency |
+|---|---|---|
+| `envoy.aigw.request` (model, provider) | policy ext_proc, `request_headers` message | 1x per request |
+| `envoy.aigw.token_usage` (final) | reporting ext_proc, last `response_body` message — or ALS/OTel access log for accounting-only | 1x per stream |
+| running usage (PROGRESSIVE) | sync ext_proc STREAMED | per chunk, opt-in only |
+
+- FINALIZE write mode kills usage repetition for free: the namespace does not
+  exist until the final frame, so `addDynamicMetadata` finds nothing to copy on
+  intermediate chunks and the usage appears in exactly one message (the last).
+- The reporting instance forwards **only** `envoy.aigw.token_usage` — this is why
+  the usage struct deliberately duplicates `provider` and `model`: the final event
+  is self-contained, intermediate messages carry an empty `metadata_context`, and
+  the request facts already reached the server once via the policy instance
+  (correlate on `x-request-id` if a join is needed).
+- Metadata was never the dominant cost — mirrored body bytes are: STREAMED ships
+  every SSE chunk's content to the server. `observability_mode` supports only
+  `STREAMED`/`GRPC`/`NONE` body modes (no "one buffered message at end" combo, and
+  `NONE` has no end-of-stream carrier). For accounting-only consumers the right
+  channel is therefore the access log (ALS/OTel reading the same namespace):
+  one export per stream, zero body mirroring, and it captures the phase-3
+  `complete: false` disconnect partials that die with an ext_proc stream.
 - PROGRESSIVE + non-observability STREAMED is the mid-stream enforcement combo
   (server watches running `output_tokens` per chunk and can stop the stream), at
-  the cost of per-chunk latency — a deliberate trade, not a default.
-- On client disconnect mid-SSE the ext_proc stream dies with the client; the
-  phase-3 `complete: false` partial flush + access log is the loss-proof billing
-  path.
+  the cost of per-chunk latency — there, per-chunk repetition is the feature.
+- Possible upstream ext_proc enhancement: a `metadata_options` forwarding
+  refinement (`ON_CHANGE` / `LAST_MESSAGE_ONLY`) so unchanged namespaces are not
+  re-attached per message — backwards-compatible and benefits every
+  metadata-producing filter.
 
 ## 5. Filter architecture
 
