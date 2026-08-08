@@ -145,20 +145,71 @@ Contract rules:
   stream may die with the client). Consumers that must never lose usage should use
   both.
 
-### ext_proc integration (config only, no code coupling)
+### ext_proc reporting mechanics (config only, no code coupling)
+
+The mechanic everything rides on: ext_proc attaches `metadata_context` to **every**
+ProcessingRequest — headers, each body chunk, and trailers — snapshotted from the
+downstream StreamInfo **when that message is built** (`buildHeaderRequest` /
+`setupBodyChunk` / trailers each call `addDynamicMetadata`). It is not a one-time
+handshake.
+
+Request path sequencing: because `ai_protocol_manager` pins request headers until
+the body is offloaded and classified, `envoy.aigw.request` (model, provider) is
+already in dynamic metadata when ext_proc's `decodeHeaders` fires — **the server
+receives body-derived facts in the `request_headers` message** and can
+authorize/deny/inject on it alone. `request_body_mode: NONE` is therefore the
+gateway default. (If body chunks are requested, they arrive with the replayed 64KiB
+framing, not the client's original chunk boundaries.)
+
+Response path (SSE): upstream filters run before downstream filters on every encode
+frame, so usage written by the upstream instance on the final data frame is inside
+the `metadata_context` of ext_proc's final `response_body` message
+(`end_of_stream=true`). **The final response_body message is the usage event.**
+Consequence: with `response_body_mode: NONE` the server's last message is
+`response_headers`, which predates the usage — the reporting role **requires**
+`response_body_mode: STREAMED`. Since non-observability STREAMED holds each chunk
+for a server ack (adds RTT to the token stream), reporting runs with
+`observability_mode: true` (fire-and-forget).
+
+`observability_mode` is filter-level, so decision-making and reporting split into
+two ext_proc instances:
 
 ```yaml
-ext_proc:
+# 1. Policy (sync, request side only)
+- name: envoy.filters.http.ext_proc          # "aigw-policy"
+  processing_mode:
+    request_header_mode: SEND                 # metadata_context carries envoy.aigw.request
+    request_body_mode: NONE
+    response_header_mode: SKIP
+    response_body_mode: NONE
   metadata_options:
     forwarding_namespaces:
-      untyped: ["envoy.aigw.request", "envoy.aigw.token_usage"]
+      untyped: [envoy.aigw.request]
+
+# 2. Reporting (async, response side only)
+- name: envoy.filters.http.ext_proc          # "aigw-usage-report"
+  observability_mode: true                    # never blocks the token stream
+  processing_mode:
+    request_header_mode: SKIP
+    response_header_mode: SEND                # optional: status / TTFT marker
+    response_body_mode: STREAMED              # final chunk = the usage event
+  metadata_options:
+    forwarding_namespaces:
+      untyped: [envoy.aigw.request, envoy.aigw.token_usage]
 ```
 
-Request phase: the server sees model/provider for authz, quota pre-checks,
-credential injection, or model-based routing via header mutation. Response phase:
-the final `response_body` / `response_trailers` ProcessingRequest carries the
-completed `token_usage` for budget debiting. For pure reporting, run ext_proc in
-`observability_mode` (fire-and-forget, off the latency path).
+Caveats:
+
+- STREAMED means one gRPC message per SSE frame (body bytes included). If the
+  server needs only the final number, access logs (gRPC ALS / OTel) reading the
+  same namespace at stream end are the cheaper channel; ext_proc earns its place
+  when the server must also act.
+- PROGRESSIVE + non-observability STREAMED is the mid-stream enforcement combo
+  (server watches running `output_tokens` per chunk and can stop the stream), at
+  the cost of per-chunk latency — a deliberate trade, not a default.
+- On client disconnect mid-SSE the ext_proc stream dies with the client; the
+  phase-3 `complete: false` partial flush + access log is the loss-proof billing
+  path.
 
 ## 5. Filter architecture
 
