@@ -97,8 +97,8 @@ defaults.
 ```yaml
 provider: "openai" | "anthropic" | "gemini"
 api:      "chat_completions" | "responses" | "messages" | "generate_content"
-model:    "gpt-5" | "claude-opus-5" | ...     # from the request body
-streaming: true                               # stream:true / alt=sse / :streamGenerateContent
+model:    "gpt-5" | "claude-opus-5" | ...     # body `model` (OpenAI/Anthropic); URL path (Gemini)
+streaming: true                               # body stream:true (OpenAI/Anthropic); URL :streamGenerateContent (Gemini)
 ```
 
 `envoy.aigw.token_usage` — written by the instance that owns response handling
@@ -277,27 +277,71 @@ First hit wins; the result is cached in `envoy.aigw.request` and reused:
    `response.` => OpenAI. Undetermined events are skipped; once detected, the
    provider is pinned for the stream.
 
-## 6. Token-usage mapping and merge semantics
+## 6. Wire-format extraction spec (verified against official docs, 2026-08-08)
 
-Normalized struct (all fields optional): `input_tokens`, `output_tokens`,
-`total_tokens`, `cached_input_tokens`, `cache_creation_input_tokens`,
-`reasoning_tokens`, `model`, `provider`.
+Sources: OpenAI OpenAPI spec (github.com/openai/openai-openapi), Anthropic API
+reference (platform.claude.com), Google discovery documents (generativelanguage +
+aiplatform). Normalized struct (all fields optional): `input_tokens`,
+`output_tokens`, `total_tokens`, `cached_input_tokens`,
+`cache_creation_input_tokens`, `reasoning_tokens`, `model`, `provider`.
 
-| | OpenAI (Chat Completions / Responses) | Anthropic (Messages) | Gemini (generateContent) |
+### Model id
+
+| | Request | Streaming selector | Response-reported model |
 |---|---|---|---|
-| Non-streaming JSON | `usage.prompt_tokens` / `completion_tokens` / `total_tokens`; Responses: `usage.input_tokens` / `output_tokens` / `total_tokens` | `usage.input_tokens`, `usage.output_tokens` (no total — computed) | `usageMetadata.promptTokenCount` / `candidatesTokenCount` / `totalTokenCount` |
-| Streaming (SSE) | chunks carry `usage: null`; final pre-`[DONE]` chunk has `usage` only when the client sent `stream_options.include_usage` (absent => `token_usage_missing`). Responses API: `event: response.completed` → `response.usage` | `event: message_start` → `message.usage.input_tokens` + cache fields; `event: message_delta` → cumulative `usage.output_tokens` (last wins); `message_stop` = parsing complete | each chunk may carry cumulative `usageMetadata`; last wins; no terminator (finalize at end_stream) |
-| Cache / extras | `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` (Responses: `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`) | `cache_read_input_tokens` → cached_input; `cache_creation_input_tokens` | `cachedContentTokenCount` → cached_input; `thoughtsTokenCount` → reasoning |
-| Model | root `model` | `message.model` / root `model` | `modelVersion` |
+| OpenAI Chat Completions | body root `model` (required) | body `stream: true`; usage needs `stream_options.include_usage` | root `model`, and on every chunk |
+| OpenAI Responses | body root `model` (optional — stored prompts / `previous_response_id`) | body `stream: true` | `response.model` in every lifecycle event |
+| Anthropic Messages | body root `model` (required) | body `stream: true` | root `model`; streaming: only `message_start.message.model` |
+| Gemini | **URL path**: `/v1beta/models/{model}:generateContent` (split last segment on `:`); Vertex: `/v1/projects/.../models/{m}:...` | **URL verb** `:streamGenerateContent`; `?alt=sse` selects SSE framing | `modelVersion` (optional per chunk) |
 
-**One merge rule for all providers:** every event/body yields a partial usage; the
-accumulator merges field-wise with later-non-null-wins. Correct simultaneously for
-OpenAI (single terminal usage), Anthropic (input from `message_start`, cumulative
-output from the last `message_delta`), and Gemini (cumulative snapshots). At
-finalize: `total_tokens = provider total, else input + output`.
+Gemini corollaries: Vertex tuned-model endpoints
+(`/v1/.../endpoints/{id}:generateContent`) carry no model in the path — fall back
+to response `modelVersion`. `?key=` API keys ride the query string — scrub before
+logging paths.
 
-`data: [DONE]` is recognized as the OpenAI terminator (marks parsing complete), not
-a parse error.
+### Token usage
+
+| | OpenAI Chat Completions | OpenAI Responses | Anthropic Messages | Gemini generateContent |
+|---|---|---|---|---|
+| input | `usage.prompt_tokens` | `usage.input_tokens` | `usage.input_tokens` | `usageMetadata.promptTokenCount` |
+| output | `usage.completion_tokens` | `usage.output_tokens` | `usage.output_tokens` | `usageMetadata.candidatesTokenCount` |
+| total | `usage.total_tokens` | `usage.total_tokens` | — (compute input+output) | `usageMetadata.totalTokenCount` |
+| cache read | `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` | `usage.cache_read_input_tokens` | `usageMetadata.cachedContentTokenCount` (**subset of promptTokenCount — never add**) |
+| cache write | `usage.prompt_tokens_details.cache_write_tokens` | `usage.input_tokens_details.cache_write_tokens` | `usage.cache_creation_input_tokens` (+ TTL split in `usage.cache_creation.*`) | — (billed via cachedContents API) |
+| reasoning | `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` | `usage.output_tokens_details.thinking_tokens` | `usageMetadata.thoughtsTokenCount` |
+
+Every `usage` object and every details sub-object is optional in practice, even
+where schemas mark them required.
+
+### Streaming semantics (per dialect — do not share heuristics)
+
+| | Framing | Usage-bearing event(s) | Semantics | Terminator |
+|---|---|---|---|---|
+| Chat Completions | data-only SSE | one chunk with `choices: []` right before `[DONE]` — **only if** client sent `stream_options.include_usage`; all other chunks `usage: null` | final-only | `data: [DONE]` |
+| Responses | named-event SSE | terminal lifecycle event: `response.completed` **or** `response.failed` / `response.incomplete` — read usage from all three | final-only, unconditional | terminal lifecycle event; no `[DONE]` per official examples |
+| Anthropic | named-event SSE | `message_start` → `message.usage` (input + cache, initial output≈1-3); `message_delta` → **cumulative** usage (simple: only `output_tokens`; newer: also input + cache) | cumulative; last `message_delta` wins; tolerate absent `usage` | `event: message_stop` |
+| Gemini `?alt=sse` | data-only SSE | any chunk may carry `usageMetadata`; presence per chunk not guaranteed | cumulative snapshots; last-seen wins | none — `finishReason: "STOP"` + stream close |
+| Gemini default | streamed JSON **array** (`[{...},{...}]`) | same as above, per array element | last element wins (JSON handler root-array path) | array close |
+
+**One merge rule covers all five shapes:** every event/body/element yields a
+partial usage; the accumulator merges field-wise with later-non-null-wins. At
+finalize: `total_tokens = provider total, else input + output`. Terminators only
+mark parsing complete; `data: [DONE]` is not a parse error.
+
+### Detection and misclassification guards
+
+- generativelanguage also hosts an **OpenAI-compat endpoint**
+  (`/v1beta/openai/chat/completions`) — OpenAI extraction rules despite the Google
+  host; and the newer **Interactions API** (`/v1beta/interactions`: model in body,
+  named events, explicit `[DONE]`) is a different surface — detection keys on
+  path, not host alone. Interactions support is future work.
+- Absent usage is a normal outcome (`token_usage_missing`): Chat Completions
+  streams without `include_usage`, client cancels before the usage chunk, optional
+  `usage` in non-streaming schemas. A transcoding-phase option is to inject
+  `stream_options.include_usage: true` on the request path to guarantee usage.
+- Ignore unknown fields and unknown SSE event types everywhere (OpenAI
+  `obfuscation` padding fields, Anthropic `ping`/in-stream `error` events, future
+  event types).
 
 ## 7. Config sketch
 
