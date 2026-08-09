@@ -5,7 +5,7 @@
 # (api.openai.com, api.anthropic.com, generativelanguage.googleapis.com, ...);
 # the DFP cluster resolves DNS on demand and dials 443 with TLS (auto SNI +
 # SAN validation). The ai_protocol_manager runs in the cluster's upstream
-# filter chain and publishes extracted usage to envoy.aigw.token_usage on the
+# filter chain and publishes extracted usage to envoy.ai.token_usage on the
 # downstream stream, which the file access log prints per request.
 admin:
   address:
@@ -33,7 +33,7 @@ static_resources:
                   path: "%REQ(:PATH)%"
                   status: "%RESPONSE_CODE%"
                   duration_ms: "%DURATION%"
-                  token_usage: "%DYNAMIC_METADATA(envoy.aigw.token_usage)%"
+                  token_usage: "%DYNAMIC_METADATA(envoy.ai.token_usage)%"
           route_config:
             name: all
             virtual_hosts:
@@ -118,7 +118,7 @@ static_resources:
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
             # Empty message: token usage extraction with AUTO_DETECT dialect
-            # detection, default caps, default namespace envoy.aigw.token_usage.
+            # detection, default caps, default namespace envoy.ai.token_usage.
             response_handling: {}
         - name: envoy.filters.http.upstream_codec
           typed_config:
