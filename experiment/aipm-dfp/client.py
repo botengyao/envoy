@@ -68,12 +68,12 @@ def anthropic(key):
     print("[anthropic] messages (JSON)")
     call("api.anthropic.com", "/v1/messages",
          {"x-api-key": key, "anthropic-version": "2023-06-01"},
-         {"model": "claude-3-5-haiku-latest", "max_tokens": 24,
+         {"model": "claude-haiku-4-5", "max_tokens": 24,
           "messages": [{"role": "user", "content": "Say hi in five words."}]})
     print("[anthropic] messages (streaming SSE)")
     call("api.anthropic.com", "/v1/messages",
          {"x-api-key": key, "anthropic-version": "2023-06-01"},
-         {"model": "claude-3-5-haiku-latest", "max_tokens": 24, "stream": True,
+         {"model": "claude-haiku-4-5", "max_tokens": 24, "stream": True,
           "messages": [{"role": "user", "content": "Say hi in five words."}]},
          stream=True)
 
@@ -81,12 +81,12 @@ def anthropic(key):
 def gemini(key):
     print("[gemini] generateContent (JSON)")
     call("generativelanguage.googleapis.com",
-         "/v1beta/models/gemini-2.0-flash:generateContent",
+         "/v1beta/models/gemini-2.5-flash:generateContent",
          {"x-goog-api-key": key},
          {"contents": [{"parts": [{"text": "Say hi in five words."}]}]})
     print("[gemini] streamGenerateContent (SSE)")
     call("generativelanguage.googleapis.com",
-         "/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse",
+         "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
          {"x-goog-api-key": key},
          {"contents": [{"parts": [{"text": "Say hi in five words."}]}]},
          stream=True)
