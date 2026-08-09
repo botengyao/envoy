@@ -81,12 +81,12 @@ def anthropic(key):
 def gemini(key):
     print("[gemini] generateContent (JSON)")
     call("generativelanguage.googleapis.com",
-         "/v1beta/models/gemini-2.5-flash:generateContent",
+         "/v1beta/models/gemini-flash-latest:generateContent",
          {"x-goog-api-key": key},
          {"contents": [{"parts": [{"text": "Say hi in five words."}]}]})
     print("[gemini] streamGenerateContent (SSE)")
     call("generativelanguage.googleapis.com",
-         "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+         "/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse",
          {"x-goog-api-key": key},
          {"contents": [{"parts": [{"text": "Say hi in five words."}]}]},
          stream=True)
