@@ -1083,6 +1083,86 @@ TEST_P(TcpProxyTest, NoHost) {
   EXPECT_EQ(access_log_data_, "UH");
 }
 
+// The upstream connection attempt is shed and the downstream connection closed when the load shed
+// point fires.
+TEST_P(TcpProxyTest, NewUpstreamConnectionLoadShed) {
+  Server::MockLoadShedPoint new_upstream_connection_point;
+  EXPECT_CALL(factory_context_.server_factory_context_.overload_manager_,
+              getLoadShedPoint(Server::LoadShedPointName::get().TcpProxyNewUpstreamConnection))
+      .WillOnce(Return(&new_upstream_connection_point));
+  EXPECT_CALL(new_upstream_connection_point, shouldShedLoad()).WillOnce(Return(true));
+
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
+  setup(0, accessLogConfig("%RESPONSE_FLAGS%"));
+  EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onNewConnection());
+
+  EXPECT_EQ(1U, config_->stats().downstream_cx_overload_shed_.value());
+  filter_.reset();
+  EXPECT_EQ(access_log_data_, "OM");
+}
+
+// A configured load shed point that is not firing leaves the upstream connection untouched.
+TEST_P(TcpProxyTest, NewUpstreamConnectionLoadShedNotTriggered) {
+  Server::MockLoadShedPoint new_upstream_connection_point;
+  EXPECT_CALL(factory_context_.server_factory_context_.overload_manager_,
+              getLoadShedPoint(Server::LoadShedPointName::get().TcpProxyNewUpstreamConnection))
+      .WillOnce(Return(&new_upstream_connection_point));
+  EXPECT_CALL(new_upstream_connection_point, shouldShedLoad()).WillOnce(Return(false));
+
+  setup(1);
+  raiseEventUpstreamConnected(0);
+  EXPECT_EQ(0U, config_->stats().downstream_cx_overload_shed_.value());
+
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::FlushWrite));
+  upstream_callbacks_->onEvent(Network::ConnectionEvent::RemoteClose);
+}
+
+// Listeners that bypass the overload manager never resolve the load shed point.
+TEST_P(TcpProxyTest, NewUpstreamConnectionLoadShedBypassed) {
+  EXPECT_CALL(factory_context_, shouldBypassOverloadManager()).WillRepeatedly(Return(true));
+  EXPECT_CALL(factory_context_.server_factory_context_.overload_manager_, getLoadShedPoint(_))
+      .Times(0);
+
+  setup(1);
+  raiseEventUpstreamConnected(0);
+  EXPECT_EQ(0U, config_->stats().downstream_cx_overload_shed_.value());
+
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::FlushWrite));
+  upstream_callbacks_->onEvent(Network::ConnectionEvent::RemoteClose);
+}
+
+// Each connect attempt is checked against the load shed point, so a retry can be shed even when
+// the initial attempt was not.
+TEST_P(TcpProxyTest, NewUpstreamConnectionLoadShedOnConnectRetry) {
+  Server::MockLoadShedPoint new_upstream_connection_point;
+  EXPECT_CALL(factory_context_.server_factory_context_.overload_manager_,
+              getLoadShedPoint(Server::LoadShedPointName::get().TcpProxyNewUpstreamConnection))
+      .WillOnce(Return(&new_upstream_connection_point));
+  EXPECT_CALL(new_upstream_connection_point, shouldShedLoad())
+      .WillOnce(Return(false))
+      .WillOnce(Return(true));
+
+  envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy config =
+      accessLogConfig("%RESPONSE_FLAGS%");
+  config.mutable_idle_timeout()->set_seconds(0); // Disable idle timeout.
+  config.mutable_max_connect_attempts()->set_value(2);
+
+  Event::MockTimer* retry_timer = new Event::MockTimer(&filter_callbacks_.connection_.dispatcher_);
+  setup(1, config);
+
+  EXPECT_CALL(*retry_timer, enableTimer(std::chrono::milliseconds(0), _));
+  raiseEventUpstreamConnectFailed(0, ConnectionPool::PoolFailureReason::RemoteConnectionFailure);
+
+  // The retry attempt is shed rather than dialing the upstream again.
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
+  retry_timer->invokeCallback();
+
+  EXPECT_EQ(1U, config_->stats().downstream_cx_overload_shed_.value());
+  EXPECT_CALL(*retry_timer, disableTimer());
+  filter_.reset();
+  EXPECT_EQ(access_log_data_, "UF,OM");
+}
+
 // Tests StreamDecoderFilterCallbacks interface implementation
 TEST_P(TcpProxyTest, StreamDecoderFilterCallbacks) {
   envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy config =

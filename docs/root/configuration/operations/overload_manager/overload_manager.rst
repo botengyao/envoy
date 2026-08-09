@@ -269,6 +269,17 @@ The following core load shed points are supported:
       (causes downstream connections to ungracefully close) that should only be
       used with a very high threshold (if at all).
 
+  * - envoy.load_shed_points.tcp_proxy_new_upstream_connection
+    - Envoy will stop establishing new upstream connections in the
+      :ref:`TCP proxy <config_network_filters_tcp_proxy>` filter when it is under
+      pressure (typically memory pressure). The downstream connection is closed
+      without any connect retries, and the ``downstream_cx_overload_shed`` counter
+      is incremented. This is checked after the cluster circuit breakers, on every
+      connection attempt. Unlike
+      ``envoy.load_shed_points.connection_pool_new_connection``, which is shared by
+      all connection pools and only applies when the pool needs to open a new
+      upstream connection, this point is scoped to TCP proxy traffic.
+
 .. _config_overload_manager_reducing_timeouts:
 
 Reducing timeouts

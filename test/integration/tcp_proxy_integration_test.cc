@@ -6,6 +6,7 @@
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/filter/network/tcp_proxy/v2/tcp_proxy.pb.h"
+#include "envoy/config/overload/v3/overload.pb.h"
 #include "envoy/extensions/access_loggers/file/v3/file.pb.h"
 #include "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.pb.h"
 
@@ -17,6 +18,7 @@
 #include "source/common/tls/context_manager_impl.h"
 #include "source/extensions/filters/network/common/factory_base.h"
 
+#include "test/integration/base_overload_integration_test.h"
 #include "test/integration/fake_access_log.h"
 #include "test/integration/ssl_utility.h"
 #include "test/integration/tcp_proxy_integration.h"
@@ -3251,6 +3253,55 @@ typed_config:
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.upstream_cx_total")->value());
   EXPECT_EQ(1, test_server_->counter("tcp.tcpproxy_stats.route_delayed_total")->value());
   EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_total")->value());
+}
+
+class TcpProxyOverloadIntegrationTest : public BaseOverloadIntegrationTest,
+                                        public TcpProxyIntegrationTest {
+protected:
+  void
+  initializeOverloadManager(const envoy::config::overload::v3::LoadShedPoint& load_shed_point) {
+    setupOverloadManagerConfig(load_shed_point);
+    config_helper_.addConfigModifier([this](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      *bootstrap.mutable_overload_manager() = this->overload_manager_config_;
+    });
+    initialize();
+    updateResource(0);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(TcpProxyIntegrationTestParams, TcpProxyOverloadIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+TEST_P(TcpProxyOverloadIntegrationTest, NewUpstreamConnectionLoadShed) {
+  initializeOverloadManager(TestUtility::parseYaml<envoy::config::overload::v3::LoadShedPoint>(
+      R"EOF(
+      name: "envoy.load_shed_points.tcp_proxy_new_upstream_connection"
+      triggers:
+        - name: "envoy.resource_monitors.testonly.fake_resource_monitor"
+          threshold:
+            value: 0.90
+    )EOF"));
+
+  // Below the threshold the connection is proxied as usual.
+  IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("tcp_proxy"));
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+  tcp_client->close();
+  ASSERT_TRUE(fake_upstream_connection->waitForHalfClose());
+  ASSERT_TRUE(fake_upstream_connection->close());
+  ASSERT_TRUE(fake_upstream_connection->waitForDisconnect());
+
+  updateResource(0.95);
+  test_server_->waitForGauge(
+      "overload.envoy.load_shed_points.tcp_proxy_new_upstream_connection.scale_percent", Eq(100));
+
+  // The downstream connection is now closed without any upstream connection being established.
+  IntegrationTcpClientPtr shed_client = makeTcpConnection(lookupPort("tcp_proxy"));
+  shed_client->waitForHalfClose();
+  shed_client->close();
+  test_server_->waitForCounter("tcp.tcpproxy_stats.downstream_cx_overload_shed", Eq(1));
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.upstream_cx_total")->value());
 }
 
 } // namespace Envoy

@@ -55,6 +55,12 @@ public:
   // which will eventually drain the HTTP/3 connection.
   const std::string H3ServerGoAwayOnDispatch =
       "envoy.load_shed_points.http3_server_go_away_on_dispatch";
+
+  // Envoy will stop establishing new upstream connections in the TCP proxy
+  // filter when it is under pressure (typically memory pressure). The
+  // downstream connection is closed without any connect retries.
+  const std::string TcpProxyNewUpstreamConnection =
+      "envoy.load_shed_points.tcp_proxy_new_upstream_connection";
 };
 
 using LoadShedPointName = ConstSingleton<LoadShedPointNameValues>;

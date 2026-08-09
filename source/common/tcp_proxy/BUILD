@@ -57,6 +57,8 @@ envoy_cc_library(
         "//envoy/registry",
         "//envoy/router:router_interface",
         "//envoy/server:filter_config_interface",
+        "//envoy/server/overload:load_shed_point_interface",
+        "//envoy/server/overload:overload_manager_interface",
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
         "//envoy/stats:timespan_interface",

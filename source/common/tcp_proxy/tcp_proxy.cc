@@ -12,6 +12,7 @@
 #include "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.pb.validate.h"
 #include "envoy/extensions/request_id/uuid/v3/uuid.pb.h"
 #include "envoy/registry/registry.h"
+#include "envoy/server/overload/overload_manager.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stream_info/bool_accessor.h"
 #include "envoy/upstream/cluster_manager.h"
@@ -212,6 +213,15 @@ Config::SharedConfig::SharedConfig(
     proxy_protocol_tlvs_ =
         parseTLVs(config.proxy_protocol_tlvs(), context, dynamic_tlv_formatters_);
   }
+
+  Server::OverloadManager& overload_manager =
+      context.shouldBypassOverloadManager() ? context.serverFactoryContext().nullOverloadManager()
+                                            : context.serverFactoryContext().overloadManager();
+  new_upstream_connection_load_shed_ = overload_manager.getLoadShedPoint(
+      Server::LoadShedPointName::get().TcpProxyNewUpstreamConnection);
+  ENVOY_LOG_ONCE_MISC_IF(trace, new_upstream_connection_load_shed_ == nullptr,
+                         "LoadShedPoint envoy.load_shed_points.tcp_proxy_new_upstream_connection "
+                         "is not found. Is it configured?");
 }
 
 Config::Config(const envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy& config,
@@ -697,6 +707,17 @@ Network::FilterStatus Filter::establishUpstreamConnection() {
     getStreamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamOverflow);
     cluster->trafficStats()->upstream_cx_overflow_.inc();
     onInitFailure(UpstreamFailureReason::ResourceLimitExceeded);
+    return Network::FilterStatus::StopIteration;
+  }
+
+  // Shed the connection attempt if Envoy is overloaded. This is checked on every attempt, so
+  // connect retries are shed as well.
+  if (config_->shouldShedNewUpstreamConnection()) {
+    ENVOY_CONN_LOG(debug, "shedding upstream connection attempt due to overload",
+                   read_callbacks_->connection());
+    getStreamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::OverloadManager);
+    config_->stats().downstream_cx_overload_shed_.inc();
+    onInitFailure(UpstreamFailureReason::OverloadShed);
     return Network::FilterStatus::StopIteration;
   }
 

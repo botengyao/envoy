@@ -17,6 +17,7 @@
 #include "envoy/network/filter.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/server/filter_config.h"
+#include "envoy/server/overload/load_shed_point.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/stats/timespan.h"
@@ -61,6 +62,7 @@ constexpr absl::string_view ReceiveBeforeConnectKey = "envoy.tcp_proxy.receive_b
 #define ALL_TCP_PROXY_STATS(COUNTER, GAUGE)                                                        \
   COUNTER(downstream_cx_drain_close)                                                               \
   COUNTER(downstream_cx_no_route)                                                                  \
+  COUNTER(downstream_cx_overload_shed)                                                             \
   COUNTER(downstream_cx_rx_bytes_total)                                                            \
   COUNTER(downstream_cx_total)                                                                     \
   COUNTER(downstream_cx_tx_bytes_total)                                                            \
@@ -271,6 +273,12 @@ public:
       return proxy_protocol_tlv_merge_policy_;
     }
 
+    // Whether the upstream connection attempt should be shed because Envoy is overloaded.
+    bool shouldShedNewUpstreamConnection() const {
+      return new_upstream_connection_load_shed_ != nullptr &&
+             new_upstream_connection_load_shed_->shouldShedLoad();
+    }
+
     // Evaluate dynamic TLV formatters and combine with static TLVs.
     Network::ProxyProtocolTLVVector
     evaluateDynamicTLVs(const StreamInfo::StreamInfo& stream_info) const;
@@ -308,6 +316,8 @@ public:
     envoy::extensions::filters::network::tcp_proxy::v3::ProxyProtocolTlvMergePolicy
         proxy_protocol_tlv_merge_policy_{
             envoy::extensions::filters::network::tcp_proxy::v3::ADD_IF_ABSENT};
+    // Owned by the overload manager, which outlives the filter configuration.
+    Server::LoadShedPoint* new_upstream_connection_load_shed_{nullptr};
   };
 
   using SharedConfigSharedPtr = std::shared_ptr<SharedConfig>;
@@ -365,6 +375,9 @@ public:
   // This function must not be called if on demand is disabled.
   const OnDemandStats& onDemandStats() const { return shared_config_->onDemandConfig()->stats(); }
   Random::RandomGenerator& randomGenerator() { return random_generator_; }
+  bool shouldShedNewUpstreamConnection() const {
+    return shared_config_->shouldShedNewUpstreamConnection();
+  }
   bool flushAccessLogOnConnected() const { return shared_config_->flushAccessLogOnConnected(); }
   bool flushAccessLogOnStart() const { return shared_config_->flushAccessLogOnStart(); }
   Regex::Engine& regexEngine() const { return regex_engine_; }
@@ -677,6 +690,8 @@ protected:
     NoHealthyUpstream,
     ResourceLimitExceeded,
     NoRoute,
+    // Keep new values at the end; the numeric value is embedded in the connection close reason.
+    OverloadShed,
   };
 
   // Callbacks for different error and success states during connection establishment
