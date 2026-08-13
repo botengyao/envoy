@@ -83,7 +83,9 @@ static_resources:
         - name: envoy.filters.http.ai_protocol_manager
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-            response_handling: {}
+            response_handling:
+              token_usage:
+                include_unconfigured_routes: true
         - name: envoy.filters.http.upstream_codec
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
@@ -117,9 +119,13 @@ static_resources:
         - name: envoy.filters.http.ai_protocol_manager
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-            # Empty message: token usage extraction with AUTO_DETECT dialect
-            # detection, default caps, default namespace envoy.ai.token_usage.
-            response_handling: {}
+            # Token-usage extraction with auto-detection, default caps, and the
+            # default namespace envoy.ai.token_usage. DFP routes carry no
+            # per-route config, so response inspection must opt in to
+            # unconfigured routes.
+            response_handling:
+              token_usage:
+                include_unconfigured_routes: true
         - name: envoy.filters.http.upstream_codec
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
