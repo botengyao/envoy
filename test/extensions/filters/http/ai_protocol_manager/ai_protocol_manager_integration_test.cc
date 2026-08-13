@@ -24,12 +24,19 @@ namespace {
 // downstream HTTP filter chain and once in the upstream (cluster) filter chain.
 class AiProtocolManagerIntegrationTest : public HttpProtocolIntegrationTest {
 protected:
-  void prependFilter(bool downstream = true) {
-    config_helper_.prependFilter(R"EOF(
+  // The filter only offloads a payload it has reason to inspect. These scenarios
+  // are about the round-trip, not parsing, and their bodies are not JSON -- so
+  // they parse unconfigured routes best-effort, which engages on every route
+  // and tolerates that.
+  void prependFilter(bool downstream = true, bool parse_unconfigured_routes = true) {
+    config_helper_.prependFilter(fmt::format(R"EOF(
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling:
+    parse_unconfigured_routes: {}
 )EOF",
+                                             parse_unconfigured_routes),
                                  downstream);
   }
 
@@ -50,6 +57,7 @@ typed_config:
   void runHeaderAndBodyAndTrailers();
   void runHeaderAndTrailersNoBody();
   void runLocalReplyDuringReplay(bool downstream);
+  void runPassThroughWhenNotInspecting();
 };
 
 INSTANTIATE_TEST_SUITE_P(Protocols, AiProtocolManagerIntegrationTest,
@@ -274,6 +282,40 @@ typed_config:
   EXPECT_EQ("200", ok_response->headers().getStatusValue());
 }
 
+// With nothing configured to inspect the payload the filter does not offload at
+// all; the round-trip must still be transparent.
+void AiProtocolManagerIntegrationTest::runPassThroughWhenNotInspecting() {
+  initialize();
+
+  for (const uint64_t body_size : {0u, 16u, 1024u, 64u * 1024u}) {
+    codec_client_ = makeHttpConnection(lookupPort("http"));
+    const std::string body(body_size, 'c');
+    auto response = codec_client_->makeRequestWithBody(requestHeaders(), body);
+
+    waitForNextUpstreamRequest();
+    EXPECT_TRUE(upstream_request_->complete());
+    EXPECT_EQ(body_size, upstream_request_->bodyLength());
+    EXPECT_EQ(body, upstream_request_->body().toString());
+
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    ASSERT_TRUE(response->waitForEndStream());
+    ASSERT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+
+    cleanupUpstreamAndDownstream();
+  }
+}
+
+TEST_P(AiProtocolManagerIntegrationTest, PassThroughWhenNotInspecting) {
+  prependFilter(/*downstream=*/true, /*parse_unconfigured_routes=*/false);
+  runPassThroughWhenNotInspecting();
+}
+
+TEST_P(AiProtocolManagerIntegrationTest, UpstreamPassThroughWhenNotInspecting) {
+  prependFilter(/*downstream=*/false, /*parse_unconfigured_routes=*/false);
+  runPassThroughWhenNotInspecting();
+}
+
 TEST_P(AiProtocolManagerIntegrationTest, LocalReplyDuringReplayTearsDownCleanly) {
   runLocalReplyDuringReplay(/*downstream=*/true);
 }
@@ -329,7 +371,9 @@ protected:
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  response_handling: {}
+  response_handling:
+    token_usage:
+      include_unconfigured_routes: true
 )EOF",
                                  /*downstream=*/!upstream_filter);
     initialize();
@@ -378,7 +422,7 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, SseTokenUsageInAccessLog) {
   EXPECT_EQ(chunk1 + chunk2, response->body());
 
   const std::string log = waitForAccessLog(access_log_name_);
-  EXPECT_THAT(log, testing::HasSubstr("\"api_format\":\"openai\""));
+  EXPECT_THAT(log, testing::HasSubstr("\"api_protocol\":\"OPENAI_CHAT_COMPLETIONS\""));
   EXPECT_THAT(log, testing::HasSubstr("\"input_tokens\":19"));
   EXPECT_THAT(log, testing::HasSubstr("\"output_tokens\":10"));
   EXPECT_THAT(log, testing::HasSubstr("\"total_tokens\":29"));
@@ -406,7 +450,7 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, UpstreamFilterJsonTokenUsage) {
   EXPECT_EQ(body, response->body());
 
   const std::string log = waitForAccessLog(access_log_name_);
-  EXPECT_THAT(log, testing::HasSubstr("\"api_format\":\"anthropic\""));
+  EXPECT_THAT(log, testing::HasSubstr("\"api_protocol\":\"ANTHROPIC_MESSAGES\""));
   EXPECT_THAT(log, testing::HasSubstr("\"input_tokens\":2095"));
   EXPECT_THAT(log, testing::HasSubstr("\"output_tokens\":503"));
   EXPECT_THAT(log, testing::HasSubstr("\"total_tokens\":2598"));
@@ -458,19 +502,19 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, RetryPublishesWinningAttemptOnl
   EXPECT_THAT(log, testing::HasSubstr("\"output_tokens\":8"));
 }
 
-// Response-only installation on the cluster: request headers flow to the
-// upstream immediately, while the body is still pending -- the shape that
-// deadlocks under the full offload (which holds headers until the payload
-// completes). Response extraction is unaffected.
+// Response-only installation on the cluster (no declared AI endpoints):
+// request headers flow to the upstream immediately, while the body is still
+// pending -- undeclared routes are passthrough by default, so nothing holds
+// the headers. Response extraction is unaffected.
 TEST_P(AiProtocolManagerResponseIntegrationTest, ResponseOnlyModeDoesNotHoldRequestHeaders) {
   useAccessLog("%DYNAMIC_METADATA(envoy.ai.token_usage)%");
   config_helper_.prependFilter(R"EOF(
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  request_handling:
-    payload_offload_enabled: false
-  response_handling: {}
+  response_handling:
+    token_usage:
+      include_unconfigured_routes: true
 )EOF",
                                /*downstream=*/false);
   initialize();
@@ -497,7 +541,7 @@ typed_config:
 
   const std::string log = waitForAccessLog(access_log_name_);
   EXPECT_THAT(log, testing::HasSubstr("\"total_tokens\":12"));
-  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"complete\""));
+  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"COMPLETE\""));
 }
 
 // Both placements at once (allowed by the API): the upstream instance
@@ -513,7 +557,9 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, BothPlacementsSinglePublication
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  response_handling: {}
+  response_handling:
+    token_usage:
+      include_unconfigured_routes: true
 )EOF",
                                /*downstream=*/false);
   config_helper_.prependFilter(R"EOF(
@@ -521,7 +567,10 @@ name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
   response_handling:
-    max_event_size: 64
+    token_usage:
+      include_unconfigured_routes: true
+      limits:
+        max_sse_event_size: 64
 )EOF",
                                /*downstream=*/true);
   initialize();
@@ -546,7 +595,7 @@ typed_config:
   // The upstream instance's complete record, unmixed with the downstream
   // instance's would-be partial one.
   EXPECT_THAT(log, testing::HasSubstr("\"total_tokens\":29"));
-  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"complete\""));
+  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"COMPLETE\""));
   EXPECT_THAT(log, testing::HasSubstr("\"model\":\"gpt-4o\""));
 }
 
@@ -581,7 +630,9 @@ TEST_P(AiProtocolManagerHedgeIntegrationTest, HedgedRequestPublishesWinnerOnly) 
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  response_handling: {}
+  response_handling:
+    token_usage:
+      include_unconfigured_routes: true
 )EOF",
                                /*downstream=*/false);
   initialize();
@@ -639,7 +690,7 @@ typed_config:
   const std::string log = waitForAccessLog(access_log_name_);
   EXPECT_THAT(log, testing::HasSubstr("\"input_tokens\":7"));
   EXPECT_THAT(log, testing::HasSubstr("\"output_tokens\":8"));
-  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"complete\""));
+  EXPECT_THAT(log, testing::HasSubstr("\"extraction_status\":\"COMPLETE\""));
 }
 
 // The documented ext_proc consumer path: usage metadata written on the
@@ -701,7 +752,9 @@ public:
 name: envoy.filters.http.ai_protocol_manager
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  response_handling: {}
+  response_handling:
+    token_usage:
+      include_unconfigured_routes: true
 )EOF",
                                  /*downstream=*/!upstream_filter);
 
@@ -787,13 +840,13 @@ typed_config:
     EXPECT_THAT(captured_metadata_, testing::HasSubstr("\"input_tokens\":5"));
     EXPECT_THAT(captured_metadata_, testing::HasSubstr("\"output_tokens\":7"));
     EXPECT_THAT(captured_metadata_, testing::HasSubstr("\"total_tokens\":12"));
-    EXPECT_THAT(captured_metadata_, testing::HasSubstr("\"api_format\":\"anthropic\""));
+    EXPECT_THAT(captured_metadata_, testing::HasSubstr("\"api_protocol\":\"ANTHROPIC_MESSAGES\""));
     // The authoritative typed record arrives through the typed forwarding
     // namespace with full integer fidelity.
     EXPECT_EQ(captured_typed_usage_.input_tokens().value(), 5);
     EXPECT_EQ(captured_typed_usage_.output_tokens().value(), 7);
     EXPECT_EQ(captured_typed_usage_.total_tokens().value(), 12);
-    EXPECT_EQ(captured_typed_usage_.api_format(), envoy::data::ai::v3::TokenUsage::ANTHROPIC);
+    EXPECT_EQ(captured_typed_usage_.api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
     EXPECT_EQ(captured_typed_usage_.extraction_status(), envoy::data::ai::v3::TokenUsage::COMPLETE);
   }
 

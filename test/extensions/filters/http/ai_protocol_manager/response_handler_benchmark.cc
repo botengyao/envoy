@@ -1,7 +1,7 @@
 // Benchmarks for SSE response token-usage extraction. Guards the scanner's
 // linear-work property (previously asserted via production counters): the
-// per-byte cost must stay flat across fragmentation granularities, and a
-// content-delta-dominated stream must not regress superlinearly with length.
+// per-byte cost must stay flat across frame sizes, and a
+// content-delta-dominated stream must stay linear in stream length.
 //
 // Run with:
 //   bazel run //test/extensions/filters/http/ai_protocol_manager:response_handler_benchmark
@@ -47,7 +47,7 @@ void sseExtractionThroughput(benchmark::State& state) {
       ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(*store.rootScope(), "benchmark."))};
 
   for (auto _ : state) { // NOLINT(clang-analyzer-deadcode.DeadStores)
-    SseResponseHandler handler(ApiFormat::Unknown, /*max_event_size=*/1024 * 1024,
+    SseResponseHandler handler(ApiProtocol::Unspecified, /*max_event_size=*/1024 * 1024,
                                /*max_parsed_events=*/1 << 20, stats);
     if (frame_size == 0) {
       Buffer::OwnedImpl all(stream);
@@ -87,7 +87,8 @@ void sseNearLimitEvent(benchmark::State& state) {
       ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(*store.rootScope(), "benchmark."))};
 
   for (auto _ : state) { // NOLINT(clang-analyzer-deadcode.DeadStores)
-    SseResponseHandler handler(ApiFormat::Gemini, cap, /*max_parsed_events=*/1 << 20, stats);
+    SseResponseHandler handler(ApiProtocol::GeminiGenerateContent, cap,
+                               /*max_parsed_events=*/1 << 20, stats);
     if (frame_size == 0) {
       Buffer::OwnedImpl all(stream);
       handler.onData(all);
@@ -130,7 +131,7 @@ void sseAnthropicDeltaStream(benchmark::State& state) {
   AiProtocolManagerStats stats{
       ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(*store.rootScope(), "benchmark."))};
   for (auto _ : state) { // NOLINT(clang-analyzer-deadcode.DeadStores)
-    SseResponseHandler handler(ApiFormat::Unknown, /*max_event_size=*/1024 * 1024,
+    SseResponseHandler handler(ApiProtocol::Unspecified, /*max_event_size=*/1024 * 1024,
                                /*max_parsed_events=*/1 << 20, stats);
     Buffer::OwnedImpl all(stream);
     handler.onData(all);
@@ -160,8 +161,8 @@ void jsonDenseBody(benchmark::State& state) {
   AiProtocolManagerStats stats{
       ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(*store.rootScope(), "benchmark."))};
   for (auto _ : state) { // NOLINT(clang-analyzer-deadcode.DeadStores)
-    JsonResponseHandler handler(ApiFormat::Unknown, /*max_inspected_body_size=*/4 * 1024 * 1024,
-                                stats);
+    JsonResponseHandler handler(ApiProtocol::Unspecified,
+                                /*max_inspected_body_size=*/4 * 1024 * 1024, stats);
     Buffer::OwnedImpl all(body);
     handler.onData(all);
     handler.onEndStream();

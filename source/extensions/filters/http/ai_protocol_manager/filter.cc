@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "envoy/data/ai/v3/token_usage.pb.h"
+#include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/utility.h"
@@ -10,10 +11,10 @@
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
+#include "source/extensions/filters/http/ai_protocol_manager/schema/schema_registry.h"
 
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
-
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
@@ -26,29 +27,12 @@ constexpr absl::string_view SseContentType{"text/event-stream"};
 constexpr absl::string_view JsonContentType{"application/json"};
 // Sized so that ordinary OpenAI Responses API terminal lifecycle events --
 // which embed the complete response object, generated output included -- are
-// extractable by default; see the proto for the rationale.
-constexpr uint32_t DefaultMaxEventSize = 1024 * 1024;
-constexpr uint32_t DefaultMaxInspectedBodySize = 4 * 1024 * 1024;
+// extracted by default; see the proto for the rationale.
+constexpr uint32_t DefaultMaxSseEventSize = 1024 * 1024;
+constexpr uint32_t DefaultMaxJsonBodySize = 4 * 1024 * 1024;
 // Far above ordinary streams (hundreds to low thousands of events) while
 // bounding the parse work a lifetime event flood can extract; see the proto.
-constexpr uint32_t DefaultMaxParsedEvents = 65536;
-
-ApiFormat formatFromProto(
-    envoy::extensions::filters::http::ai_protocol_manager::v3::BuiltinTokenUsageExtractor::ApiFormat
-        format) {
-  using ProtoFormat =
-      envoy::extensions::filters::http::ai_protocol_manager::v3::BuiltinTokenUsageExtractor;
-  switch (format) {
-  case ProtoFormat::OPENAI:
-    return ApiFormat::OpenAi;
-  case ProtoFormat::ANTHROPIC:
-    return ApiFormat::Anthropic;
-  case ProtoFormat::GEMINI:
-    return ApiFormat::Gemini;
-  default:
-    return ApiFormat::Unknown; // AUTO_DETECT
-  }
-}
+constexpr uint32_t DefaultMaxParsedSseEvents = 65536;
 
 // HTTP Content-Type is case-insensitive and may carry parameters
 // (`application/json; charset=utf-8`).
@@ -81,27 +65,29 @@ void setCount(Protobuf::Struct& metadata, absl::string_view key,
   }
 }
 
-envoy::data::ai::v3::TokenUsage::ApiFormat typedApiFormat(ApiFormat format) {
-  using TypedUsage = envoy::data::ai::v3::TokenUsage;
-  switch (format) {
-  case ApiFormat::OpenAi:
-    return TypedUsage::OPENAI;
-  case ApiFormat::Anthropic:
-    return TypedUsage::ANTHROPIC;
-  case ApiFormat::Gemini:
-    return TypedUsage::GEMINI;
-  case ApiFormat::Unknown:
+envoy::type::ai::v3::ApiProtocol typedApiProtocol(ApiProtocol protocol) {
+  switch (protocol) {
+  case ApiProtocol::OpenAiChatCompletions:
+    return envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS;
+  case ApiProtocol::OpenAiResponses:
+    return envoy::type::ai::v3::OPENAI_RESPONSES;
+  case ApiProtocol::AnthropicMessages:
+    return envoy::type::ai::v3::ANTHROPIC_MESSAGES;
+  case ApiProtocol::GeminiGenerateContent:
+    return envoy::type::ai::v3::GEMINI_GENERATE_CONTENT;
+  case ApiProtocol::Unspecified:
     break;
   }
-  return TypedUsage::API_FORMAT_UNSPECIFIED;
+  return envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED;
 }
 
 // Converts the finalized accumulator once into the authoritative typed
 // record (envoy.data.ai.v3.TokenUsage); the untyped Struct is projected
-// from it, never built independently.
+// from it, never built independently. A record with no counts at all is
+// status-only and publishes as FAILED.
 envoy::data::ai::v3::TokenUsage typedUsage(const TokenUsage& usage, bool degraded) {
   envoy::data::ai::v3::TokenUsage typed;
-  typed.set_api_format(typedApiFormat(usage.api_format));
+  typed.set_api_protocol(typedApiProtocol(usage.api_protocol));
   if (!usage.model.empty()) {
     typed.set_model(usage.model);
   }
@@ -113,43 +99,38 @@ envoy::data::ai::v3::TokenUsage typedUsage(const TokenUsage& usage, bool degrade
   set(usage.input_tokens, [&](uint64_t v) { typed.mutable_input_tokens()->set_value(v); });
   set(usage.output_tokens, [&](uint64_t v) { typed.mutable_output_tokens()->set_value(v); });
   set(usage.total_tokens, [&](uint64_t v) { typed.mutable_total_tokens()->set_value(v); });
-  set(usage.cached_input_tokens,
-      [&](uint64_t v) { typed.mutable_cached_input_tokens()->set_value(v); });
-  set(usage.cache_creation_input_tokens,
-      [&](uint64_t v) { typed.mutable_cache_creation_input_tokens()->set_value(v); });
-  set(usage.tool_use_input_tokens,
-      [&](uint64_t v) { typed.mutable_tool_use_input_tokens()->set_value(v); });
-  set(usage.reasoning_tokens, [&](uint64_t v) { typed.mutable_reasoning_tokens()->set_value(v); });
-  set(usage.reported_total_tokens,
-      [&](uint64_t v) { typed.mutable_reported_total_tokens()->set_value(v); });
-  typed.set_extraction_status(degraded ? envoy::data::ai::v3::TokenUsage::PARTIAL
-                                       : envoy::data::ai::v3::TokenUsage::COMPLETE);
+  set(usage.cached_input_tokens, [&](uint64_t v) {
+    typed.mutable_input_token_details()->mutable_cached_tokens()->set_value(v);
+  });
+  set(usage.cache_creation_input_tokens, [&](uint64_t v) {
+    typed.mutable_input_token_details()->mutable_cache_creation_tokens()->set_value(v);
+  });
+  set(usage.tool_use_input_tokens, [&](uint64_t v) {
+    typed.mutable_input_token_details()->mutable_tool_use_tokens()->set_value(v);
+  });
+  set(usage.reasoning_tokens, [&](uint64_t v) {
+    typed.mutable_output_token_details()->mutable_reasoning_tokens()->set_value(v);
+  });
+  set(usage.provider_total_tokens,
+      [&](uint64_t v) { typed.mutable_provider_total_tokens()->set_value(v); });
+  if (!usage.hasAny()) {
+    typed.set_extraction_status(envoy::data::ai::v3::TokenUsage::FAILED);
+  } else {
+    typed.set_extraction_status(degraded ? envoy::data::ai::v3::TokenUsage::PARTIAL
+                                         : envoy::data::ai::v3::TokenUsage::COMPLETE);
+  }
   return typed;
 }
 
-// The untyped Struct projection: identical keys and values to the historic
-// Struct interface, for consumers that only read untyped metadata
+// The untyped Struct projection: the typed record's fields and enum-value
+// names mirrored key-for-key, for consumers that only read untyped metadata
 // (%DYNAMIC_METADATA%, CEL). Counts are double-backed here; the typed record
 // carries full uint64 precision.
 Protobuf::Struct structProjection(const envoy::data::ai::v3::TokenUsage& typed) {
-  using TypedUsage = envoy::data::ai::v3::TokenUsage;
   Protobuf::Struct metadata;
   auto& fields = *metadata.mutable_fields();
-  absl::string_view format_name = "unknown";
-  switch (typed.api_format()) {
-  case TypedUsage::OPENAI:
-    format_name = "openai";
-    break;
-  case TypedUsage::ANTHROPIC:
-    format_name = "anthropic";
-    break;
-  case TypedUsage::GEMINI:
-    format_name = "gemini";
-    break;
-  default:
-    break;
-  }
-  fields["api_format"].set_string_value(std::string(format_name));
+  fields["api_protocol"].set_string_value(
+      envoy::type::ai::v3::ApiProtocol_Name(typed.api_protocol()));
   if (!typed.model().empty()) {
     fields["model"].set_string_value(typed.model());
   }
@@ -161,56 +142,61 @@ Protobuf::Struct structProjection(const envoy::data::ai::v3::TokenUsage& typed) 
   set_count("input_tokens", typed.has_input_tokens(), typed.input_tokens().value());
   set_count("output_tokens", typed.has_output_tokens(), typed.output_tokens().value());
   set_count("total_tokens", typed.has_total_tokens(), typed.total_tokens().value());
-  set_count("cached_input_tokens", typed.has_cached_input_tokens(),
-            typed.cached_input_tokens().value());
-  set_count("cache_creation_input_tokens", typed.has_cache_creation_input_tokens(),
-            typed.cache_creation_input_tokens().value());
-  set_count("tool_use_input_tokens", typed.has_tool_use_input_tokens(),
-            typed.tool_use_input_tokens().value());
-  set_count("reasoning_tokens", typed.has_reasoning_tokens(), typed.reasoning_tokens().value());
-  set_count("reported_total_tokens", typed.has_reported_total_tokens(),
-            typed.reported_total_tokens().value());
+  set_count("provider_total_tokens", typed.has_provider_total_tokens(),
+            typed.provider_total_tokens().value());
+  const auto set_detail = [](Protobuf::Struct& target, absl::string_view key, bool present,
+                             uint64_t value) {
+    if (present) {
+      setCount(target, key, value);
+    }
+  };
+  if (typed.has_input_token_details()) {
+    const auto& details = typed.input_token_details();
+    Protobuf::Struct& details_struct = *fields["input_token_details"].mutable_struct_value();
+    set_detail(details_struct, "cached_tokens", details.has_cached_tokens(),
+               details.cached_tokens().value());
+    set_detail(details_struct, "cache_creation_tokens", details.has_cache_creation_tokens(),
+               details.cache_creation_tokens().value());
+    set_detail(details_struct, "tool_use_tokens", details.has_tool_use_tokens(),
+               details.tool_use_tokens().value());
+  }
+  if (typed.has_output_token_details()) {
+    const auto& details = typed.output_token_details();
+    Protobuf::Struct& details_struct = *fields["output_token_details"].mutable_struct_value();
+    set_detail(details_struct, "reasoning_tokens", details.has_reasoning_tokens(),
+               details.reasoning_tokens().value());
+  }
   fields["extraction_status"].set_string_value(
-      typed.extraction_status() == TypedUsage::PARTIAL ? "partial" : "complete");
+      envoy::data::ai::v3::TokenUsage::ExtractionStatus_Name(typed.extraction_status()));
   return metadata;
 }
 
 } // namespace
 
 FilterConfig::FilterConfig(
-    const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager& config,
+    const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager& proto,
     Stats::Scope& scope)
     : stats_(AiProtocolManagerStats{
           ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, "ai_protocol_manager."))}),
-      response_handling_enabled_(config.has_response_handling()),
-      request_offload_enabled_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.request_handling(),
-                                                               payload_offload_enabled, true)),
-      api_format_(formatFromProto(config.response_handling().token_usage().api_format())),
-      metadata_namespace_(config.response_handling().metadata_namespace().empty()
+      request_handling_enabled_(proto.has_request_handling()),
+      parse_unconfigured_routes_(proto.request_handling().parse_unconfigured_routes()),
+      token_usage_enabled_(proto.response_handling().has_token_usage()),
+      include_unconfigured_routes_(
+          proto.response_handling().token_usage().include_unconfigured_routes()),
+      default_api_protocol_(
+          protocolFromProto(proto.response_handling().token_usage().default_api_protocol())),
+      metadata_namespace_(proto.response_handling().token_usage().metadata_namespace().empty()
                               ? std::string(DefaultTokenUsageNamespace)
-                              : config.response_handling().metadata_namespace()),
-      max_event_size_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.response_handling(), max_event_size,
-                                                      DefaultMaxEventSize)),
-      max_inspected_body_size_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
-          config.response_handling(), max_inspected_body_size, DefaultMaxInspectedBodySize)),
-      max_parsed_events_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
-          config.response_handling(), max_parsed_events, DefaultMaxParsedEvents)) {}
-
-void AiProtocolManagerFilter::setDecoderFilterCallbacks(
-    Http::StreamDecoderFilterCallbacks& callbacks) {
-  PassThroughFilter::setDecoderFilterCallbacks(callbacks);
-  // Response-only installation: the decode path is a pure passthrough and
-  // needs no manager (no watermark subscription, no external buffer).
-  if (config_ != nullptr && !config_->requestOffloadEnabled()) {
-    return;
-  }
-  // Construct the decode-path manager. Its constructor subscribes to upstream
-  // watermarks (via the bridge) so replay can be paced against upstream
-  // back-pressure; subscribing may immediately deliver high-watermark callbacks
-  // if the upstream is already backed up.
-  decode_manager_ = std::make_unique<BufferManager>(
-      buffer_factory_, std::make_unique<DecoderFilterChainBridge>(*decoder_callbacks_));
-}
+                              : proto.response_handling().token_usage().metadata_namespace()),
+      max_sse_event_size_(
+          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
+                                          max_sse_event_size, DefaultMaxSseEventSize)),
+      max_json_body_size_(
+          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
+                                          max_json_body_size, DefaultMaxJsonBodySize)),
+      max_parsed_sse_events_(
+          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
+                                          max_parsed_sse_events, DefaultMaxParsedSseEvents)) {}
 
 void AiProtocolManagerFilter::onDestroy() {
   if (decode_manager_ != nullptr) {
@@ -228,10 +214,12 @@ void AiProtocolManagerFilter::onDestroy() {
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap&,
                                                                  bool end_stream) {
-  // Response-only installation: requests stream through untouched.
-  if (decode_manager_ == nullptr) {
+  // Request-side processing is off entirely; per-route declarations still
+  // matter to the encode path, which resolves them itself.
+  if (!config_->requestHandlingEnabled()) {
     return Http::FilterHeadersStatus::Continue;
   }
+
   // A headers-only request carries no payload to inspect, so there is nothing to
   // hold the chain for: let the headers flow. (Pausing here would also deadlock,
   // since no body would ever arrive to drive the replay that releases them.)
@@ -239,21 +227,135 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // A body follows: pin the headers at this filter so the subsequent routing and
-  // admission filters do not act on them until the payload has been offloaded.
-  // decodeData() still fires on this filter while iteration is stopped here, so
-  // the BufferManager keeps offloading; the held headers are released when replay
-  // injects the first body frame (or, for an empty/trailer-only body, when the
-  // BufferManager continues iteration).
+  // Copy what the route declared; see the note on route_has_request_ for why the
+  // config is not held by pointer.
+  if (const RouteConfig* route_config =
+          Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(decoder_callbacks_);
+      route_config != nullptr) {
+    route_has_request_ = route_config->hasRequest();
+    route_request_protocol_ = route_config->requestProtocol();
+    if (route_has_request_) {
+      ENVOY_LOG(debug, "ai_protocol_manager: route declares request API {}",
+                apiProtocolName(route_request_protocol_));
+    }
+  }
+
+  // A declared AI endpoint is parsed strictly. Any other route is parsed only if
+  // the filter opted into parsing unconfigured routes, and never fails the
+  // request.
+  // TODO(penguingao): parse_unconfigured_routes takes the buffering path below for every bodied
+  // request on every route, which deadlocks full-duplex requests (e.g. gRPC client/bidi
+  // streaming): headers are held until the request's end_stream, which the client may not send
+  // until it sees a response the upstream cannot produce. Gate the best-effort path on
+  // content-type (only application/json and *+json; never gRPC or upgrades), and on a
+  // best-effort parse failure release the held headers and buffered body immediately and pass
+  // the remainder through unbuffered, rather than buffering to end-of-stream.
+  if (!isAiEndpoint() && !config_->parseUnconfiguredRoutes()) {
+    // Nothing will look at this payload, so stay out of the way: offloading it
+    // would cost a store round-trip and withhold the headers meanwhile, for
+    // nothing. Decided once here; decode_manager_ being null carries it.
+    ENVOY_LOG(trace, "ai_protocol_manager: route has no payload to inspect, passing through");
+    return Http::FilterHeadersStatus::Continue;
+  }
+
+  request_parser_ = std::make_unique<JsonWithExtBufParser>(JsonWithExtBufParser::Config{});
+  // Built here, not at setDecoderFilterCallbacks(), so a pass-through stream pays
+  // for none of it: constructing it subscribes to upstream watermarks and claims
+  // a schedulable callback.
+  decode_manager_ = std::make_unique<BufferManager>(
+      buffer_factory_, std::make_unique<DecoderFilterChainBridge>(*decoder_callbacks_));
+
+  // Pin the headers so routing and admission filters do not act on them before
+  // the payload is offloaded. decodeData() still fires while iteration is stopped
+  // here; the headers are released when replay injects the first body frame (or,
+  // for an empty/trailer-only body, when the manager continues iteration).
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_stream) {
+  // Feed the frame's slices where they lie: the parser accepts a split at any
+  // byte boundary, so there is no need to join them into one block. Copying here
+  // would reintroduce the per-stream footprint the external buffer avoids.
+  absl::Status status = absl::OkStatus();
+  const Buffer::RawSliceVector slices = data.getRawSlices();
+  for (size_t i = 0; i < slices.size() && status.ok(); ++i) {
+    // Only the final slice of a terminal frame closes the document.
+    const bool last_slice = (i + 1 == slices.size());
+    status = request_parser_->feed(
+        absl::string_view(static_cast<const char*>(slices[i].mem_), slices[i].len_),
+        last_slice && end_stream);
+  }
+  if (status.ok() && end_stream && slices.empty()) {
+    // getRawSlices() omits empty slices, so a terminal frame carrying no bytes
+    // leaves the document open; close it here.
+    status = request_parser_->feed("", /*end_stream=*/true);
+  }
+
+  if (!status.ok()) {
+    if (isAiEndpoint()) {
+      rejectInvalidPayload(status);
+      return false;
+    }
+    // Best effort: the payload is forwarded as it stands, just without a
+    // document for later filters to work from.
+    ENVOY_LOG(debug, "ai_protocol_manager: forwarding unparsed payload: {}", status.message());
+    request_parser_.reset();
+    return true;
+  }
+
+  if (end_stream) {
+    request_json_ = request_parser_->takeDocument();
+    request_parser_.reset();
+
+    if (isAiEndpoint()) {
+      // TODO(penguingao): Support validating payload schema on the fly as the Wuffs parser
+      // streams and parses chunks, rejecting invalid fields early before end_stream.
+      if (const PayloadSchema* payload_schema = SchemaRegistry::getSchema(route_request_protocol_);
+          payload_schema != nullptr) {
+        const absl::Status validation_status = payload_schema->validateRequest(request_json_);
+        if (!validation_status.ok()) {
+          rejectInvalidPayload(validation_status);
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
+  ENVOY_LOG(debug, "ai_protocol_manager: rejecting request: {}", status.message());
+  payload_rejected_ = true;
+  request_parser_.reset();
+  decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, status.message(), nullptr,
+                                     std::nullopt, "ai_protocol_manager_invalid_json");
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
   if (decode_manager_ == nullptr) {
+    // decodeHeaders() decided this stream is none of our business.
     return Http::FilterDataStatus::Continue;
   }
+  if (payload_rejected_) {
+    // Already terminated by the local reply; drop whatever is still in flight.
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
+  if (request_parser_ != nullptr) {
+    // The framing promised a body but no byte of one arrived -- a chunked request
+    // whose only chunk is the terminator, or an empty terminal DATA frame. There
+    // is no payload to validate, so the request passes through, the same as one
+    // that ended on its headers. The parser has been fed nothing exactly when the
+    // manager has been given nothing, since every frame reaches both.
+    if (end_stream && data.length() == 0 && decode_manager_->empty()) {
+      request_parser_.reset();
+    } else if (!feedParser(data, end_stream)) {
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+  }
+
   decode_manager_->onData(data);
   if (end_stream) {
     // The full body has been offloaded. The filter owns replay and end-of-stream:
@@ -275,10 +377,23 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
   if (decode_manager_ == nullptr) {
     return Http::FilterTrailersStatus::Continue;
   }
+  if (payload_rejected_) {
+    return Http::FilterTrailersStatus::StopIteration;
+  }
   // A trailer-only request (no body) has nothing to replay; let the trailers flow.
   if (decode_manager_->empty()) {
     return Http::FilterTrailersStatus::Continue;
   }
+
+  // No data frame carried end_stream, so the document is still open. Closing it
+  // here is what catches a truncated payload.
+  if (request_parser_ != nullptr) {
+    Buffer::OwnedImpl empty;
+    if (!feedParser(empty, /*end_stream=*/true)) {
+      return Http::FilterTrailersStatus::StopIteration;
+    }
+  }
+
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();
   decode_manager_->replay(0, decode_manager_->length(), [this]() {
@@ -295,7 +410,18 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
                                                                  bool end_stream) {
   // The encode path is observe-only: headers are never held and the handler
   // selection below can only make the filter inert, never affect the response.
-  if (config_ == nullptr || !config_->responseHandlingEnabled()) {
+  if (config_ == nullptr || !config_->tokenUsageEnabled()) {
+    return Http::FilterHeadersStatus::Continue;
+  }
+
+  // Route scoping: only declared AI endpoints are inspected unless the filter
+  // opted into unconfigured routes, so enabling token usage on a mixed
+  // listener does not silently parse unrelated JSON/SSE responses. Resolved
+  // here rather than reusing the decode-path copy, which is not taken when
+  // request handling is disabled.
+  const RouteConfig* route_config =
+      Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(encoder_callbacks_);
+  if (route_config == nullptr && !config_->includeUnconfiguredRoutes()) {
     return Http::FilterHeadersStatus::Continue;
   }
 
@@ -336,14 +462,23 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   if (is_json) {
     uint64_t content_length = 0;
     if (absl::SimpleAtoi(headers.getContentLengthValue(), &content_length) &&
-        content_length > config_->maxInspectedBodySize()) {
+        content_length > config_->maxJsonBodySize()) {
       ENVOY_LOG(debug,
-                "ai_protocol_manager: content-length {} exceeds max_inspected_body_size ({}), "
+                "ai_protocol_manager: content-length {} exceeds max_json_body_size ({}), "
                 "skipping token extraction",
-                content_length, config_->maxInspectedBodySize());
+                content_length, config_->maxJsonBodySize());
       config_->stats().response_body_too_large_.inc();
       return Http::FilterHeadersStatus::Continue;
     }
+  }
+
+  // The wire API to extract against, in precedence order: the route's declared
+  // response API, the route's declared request API, the configured fallback;
+  // Unspecified auto-detects from the response shape.
+  ApiProtocol protocol = config_->defaultApiProtocol();
+  if (route_config != nullptr &&
+      route_config->effectiveResponseProtocol() != ApiProtocol::Unspecified) {
+    protocol = route_config->effectiveResponseProtocol();
   }
 
   // Observation buffers charge the stream's memory account when tracking is
@@ -352,12 +487,12 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   const Buffer::BufferMemoryAccountSharedPtr account =
       decoder_callbacks_ != nullptr ? decoder_callbacks_->account() : nullptr;
   if (is_sse) {
-    response_handler_ =
-        std::make_unique<SseResponseHandler>(config_->apiFormat(), config_->maxEventSize(),
-                                             config_->maxParsedEvents(), config_->stats(), account);
+    response_handler_ = std::make_unique<SseResponseHandler>(protocol, config_->maxSseEventSize(),
+                                                             config_->maxParsedSseEvents(),
+                                                             config_->stats(), account);
   } else {
-    response_handler_ = std::make_unique<JsonResponseHandler>(
-        config_->apiFormat(), config_->maxInspectedBodySize(), config_->stats(), account);
+    response_handler_ = std::make_unique<JsonResponseHandler>(protocol, config_->maxJsonBodySize(),
+                                                              config_->stats(), account);
   }
   return Http::FilterHeadersStatus::Continue;
 }
@@ -416,7 +551,7 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
   // Convert the finalized accumulator once into the authoritative typed
   // record; both the typed publication and the untyped Struct projection come
   // from it. When extraction failed outright the record is status-only
-  // (api_format/model/extraction_status, no counts), letting consumers
+  // (api_protocol/model/extraction_status, no counts), letting consumers
   // distinguish "failed to extract" from "no usage supplied".
   const envoy::data::ai::v3::TokenUsage typed = typedUsage(usage, degraded);
   // In both roles streamInfo() resolves to the downstream request's
@@ -432,15 +567,16 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
                                                       structProjection(typed));
 
   if (!usage.hasAny()) {
-    config_->stats().token_usage_partial_.inc();
-    ENVOY_LOG(trace, "ai_protocol_manager: status-only (partial) record published to namespace {}",
+    config_->stats().token_usage_failed_.inc();
+    ENVOY_LOG(trace, "ai_protocol_manager: status-only (failed) record published to namespace {}",
               config_->metadataNamespace());
     return;
   }
   if (degraded) {
     config_->stats().token_usage_partial_.inc();
   }
-  if (usage.reported_total_tokens.has_value()) {
+  if (usage.provider_total_tokens.has_value() && usage.total_tokens.has_value() &&
+      usage.provider_total_tokens.value() != usage.total_tokens.value()) {
     config_->stats().token_usage_total_mismatch_.inc();
   }
   config_->stats().token_usage_found_.inc();

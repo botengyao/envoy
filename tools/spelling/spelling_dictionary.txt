@@ -3,6 +3,7 @@
 # will accept title case (e.g. lyft matches Lyft). Prefixes (e.g., un-) or suffixes (e.g. -ing)
 # are allowed for any otherwise correctly spelled word.
 
+AI
 Allshard
 FCS
 FLUSHALL
@@ -35,6 +36,7 @@ ARRAYSIZE
 ARN
 ASAN
 ASCII
+ASLR
 ASM
 ASN
 ASSERTed
@@ -1190,6 +1192,7 @@ oauth
 observability
 observations
 ocagent
+offloadable
 offsetof
 oneof
 oneway
@@ -1430,6 +1433,7 @@ serializable
 serializer
 serv
 servercert
+setarch
 setenv
 SETNAME
 setsockopt
@@ -1603,6 +1607,7 @@ udpa
 uint
 un-
 unacked
+uname
 unary
 unconfigurable
 undef

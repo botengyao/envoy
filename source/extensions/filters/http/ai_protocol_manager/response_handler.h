@@ -10,6 +10,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/token_usage_extractor.h"
 
 #include "absl/strings/string_view.h"
@@ -25,6 +26,7 @@ namespace AiProtocolManager {
 #define ALL_AI_PROTOCOL_MANAGER_STATS(COUNTER)                                                     \
   COUNTER(token_usage_found)                                                                       \
   COUNTER(token_usage_partial)                                                                     \
+  COUNTER(token_usage_failed)                                                                      \
   COUNTER(token_usage_missing)                                                                     \
   COUNTER(token_usage_total_mismatch)                                                              \
   COUNTER(token_usage_duplicate)                                                                   \
@@ -49,7 +51,7 @@ struct AiProtocolManagerStats {
 // possibly empty, or trailers) so pending parse work still resolves.
 class ResponseHandler {
 public:
-  ResponseHandler(ApiFormat format, AiProtocolManagerStats& stats)
+  ResponseHandler(ApiProtocol format, AiProtocolManagerStats& stats)
       : format_(format), stats_(stats) {}
   virtual ~ResponseHandler() = default;
 
@@ -72,9 +74,9 @@ protected:
   // event's data payload, a whole JSON body, or one element of a streamed
   // array. Returns true when the document is the dialect's terminal event, so
   // callers stop processing later input against an authoritative result.
-  bool processDocument(const Json::Object& json);
+  bool processDocument(const nlohmann::json& json);
 
-  ApiFormat format_;
+  ApiProtocol format_;
   TokenUsage usage_;
   bool parsing_complete_{false};
   bool degraded_{false};
@@ -98,7 +100,7 @@ using ResponseHandlerPtr = std::unique_ptr<ResponseHandler>;
 // bytes are charged to the stream's buffer memory account when present.
 class SseResponseHandler : public ResponseHandler, public Logger::Loggable<Logger::Id::filter> {
 public:
-  SseResponseHandler(ApiFormat format, uint32_t max_event_size, uint32_t max_parsed_events,
+  SseResponseHandler(ApiProtocol format, uint32_t max_event_size, uint32_t max_parsed_events,
                      AiProtocolManagerStats& stats,
                      const Buffer::BufferMemoryAccountSharedPtr& account = nullptr)
       : ResponseHandler(format, stats), max_event_size_(max_event_size),
@@ -160,27 +162,27 @@ private:
 };
 
 // Non-streaming JSON responses, including Gemini's default (non-SSE)
-// streaming whose body is a root-level array of chunks. The body copy is
-// capped at max_inspected_body_size (account-charged when present); larger
-// bodies skip extraction.
+// streaming whose body is a root-level array of chunks. The body is streamed
+// incrementally into a JsonWithExtBufParser as frames arrive -- no side copy
+// of the bytes is retained -- and the resulting document (with oversized
+// strings left unmaterialized as external references) is walked at end of
+// stream. Bodies over max_inspected_body_size abandon extraction.
 class JsonResponseHandler : public ResponseHandler, public Logger::Loggable<Logger::Id::filter> {
 public:
-  JsonResponseHandler(ApiFormat format, uint32_t max_inspected_body_size,
+  JsonResponseHandler(ApiProtocol format, uint32_t max_inspected_body_size,
                       AiProtocolManagerStats& stats,
-                      const Buffer::BufferMemoryAccountSharedPtr& account = nullptr)
-      : ResponseHandler(format, stats), max_inspected_body_size_(max_inspected_body_size) {
-    if (account != nullptr) {
-      buffer_.bindAccount(account);
-    }
-  }
+                      const Buffer::BufferMemoryAccountSharedPtr& account = nullptr);
 
   void onData(const Buffer::Instance& data) override;
   void onEndStream() override;
 
 private:
   const uint32_t max_inspected_body_size_;
+  uint64_t bytes_fed_{0};
   bool over_limit_{false};
-  Buffer::OwnedImpl buffer_;
+  bool parse_failed_{false};
+  // Released on failure or completion; non-null while a parse is in progress.
+  std::unique_ptr<JsonWithExtBufParser> parser_;
 };
 
 } // namespace AiProtocolManager
