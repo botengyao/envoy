@@ -43,6 +43,40 @@ struct SslSocketFactoryStats {
 
 enum class InitialState { Client, Server };
 
+/**
+ * The pointer and length to hand to the next SSL_write(), plus whether producing it required
+ * linearizing the write buffer.
+ */
+struct SslWriteChunk {
+  const void* data_;
+  uint64_t length_;
+  bool linearized_;
+};
+
+/**
+ * Select the contiguous chunk for the next SSL_write().
+ *
+ * SSL_write() needs contiguous memory, which normally means linearize(). But linearize() copies
+ * `bytes_to_write` into a freshly allocated slice and drains the same amount, which leaves the
+ * following slice short by exactly the same offset. Since a slice holds at most
+ * Slice::default_slice_size_ (16KB) and that is also the most we ever write at once, a write buffer
+ * that starts out misaligned - as it does whenever a small header slice is moved in ahead of full
+ * body slices - stays misaligned, and every subsequent write repeats the allocation and the copy.
+ *
+ * So when the previous write already had to linearize and this one would too, write just the
+ * contiguous front slice instead. That costs one short TLS record, after which the buffer is
+ * aligned and every following write is copy-free.
+ *
+ * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
+ * @param bytes_to_write the number of bytes the caller wants to write.
+ * @param linearized_last_write whether the previous call to this function linearized.
+ * @param avoid_repeated_linearize whether the short-record escape is enabled.
+ * @return the chunk to write. The returned length is never larger than @param bytes_to_write, and
+ *         is only smaller when the short-record escape is taken.
+ */
+SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
+                                  bool linearized_last_write, bool avoid_repeated_linearize);
+
 class SslSocket : public Network::TransportSocket,
                   public Envoy::Ssl::PrivateKeyConnectionCallbacks,
                   public Ssl::HandshakeCallbacks,
@@ -108,6 +142,9 @@ private:
   std::string failure_reason_;
   std::optional<Api::IoError::IoErrorCode> detected_io_error_;
   bool read_disabled_{false};
+  // Whether the previous SSL_write() had to linearize the write buffer. See doWrite().
+  bool linearized_last_write_{false};
+  const bool avoid_repeated_linearize_;
 
   SslHandshakerImplSharedPtr info_;
 };

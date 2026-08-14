@@ -47,7 +47,9 @@ SslSocket::create(Envoy::Ssl::ContextSharedPtr ctx, InitialState state,
 SslSocket::SslSocket(Envoy::Ssl::ContextSharedPtr ctx,
                      const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options)
     : transport_socket_options_(transport_socket_options),
-      ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)) {}
+      ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)),
+      avoid_repeated_linearize_(Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.tls_avoid_repeated_linearize")) {}
 
 absl::Status SslSocket::initialize(InitialState state,
                                    Ssl::HandshakerFactoryCb handshaker_factory_cb,
@@ -327,6 +329,24 @@ void SslSocket::drainErrorQueue() {
   }
 }
 
+SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
+                                  bool linearized_last_write, bool avoid_repeated_linearize) {
+  ASSERT(bytes_to_write > 0 && bytes_to_write <= write_buffer.length());
+  const Buffer::RawSlice front_slice = write_buffer.frontSlice();
+
+  if (front_slice.len_ >= bytes_to_write) {
+    // Already contiguous, so linearize() would hand back this same pointer without copying.
+    return {front_slice.mem_, bytes_to_write, false};
+  }
+
+  if (avoid_repeated_linearize && linearized_last_write && front_slice.len_ > 0) {
+    // Break the misalignment cycle with one short record. See the header comment.
+    return {front_slice.mem_, front_slice.len_, false};
+  }
+
+  return {write_buffer.linearize(bytes_to_write), bytes_to_write, true};
+}
+
 Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_stream) {
   ASSERT(info_->state() != Ssl::SocketState::ShutdownSent || write_buffer.length() == 0);
   if (info_->state() != Ssl::SocketState::HandshakeComplete &&
@@ -352,9 +372,14 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
 
     // SSL_write() requires that if a previous call returns SSL_ERROR_WANT_WRITE, we need to call
     // it again with the same parameters. This is done by tracking last write size, but not write
-    // data, since linearize() will return the same undrained data anyway.
+    // data, since the data at the front of the buffer is the same undrained data anyway: nothing
+    // is drained until the write succeeds, and new data is only ever appended at the back.
     ASSERT(bytes_to_write <= write_buffer.length());
-    int rc = SSL_write(rawSsl(), write_buffer.linearize(bytes_to_write), bytes_to_write);
+    const SslWriteChunk chunk = selectSslWriteChunk(
+        write_buffer, bytes_to_write, linearized_last_write_, avoid_repeated_linearize_);
+    linearized_last_write_ = chunk.linearized_;
+    bytes_to_write = chunk.length_;
+    int rc = SSL_write(rawSsl(), chunk.data_, bytes_to_write);
     ENVOY_CONN_LOG(trace, "ssl write returns: {}", callbacks_->connection(), rc);
     if (rc > 0) {
       ASSERT(rc == static_cast<int>(bytes_to_write));

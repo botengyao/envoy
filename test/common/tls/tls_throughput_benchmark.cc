@@ -1,4 +1,7 @@
+#include <fcntl.h>
+
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/tls/ssl_socket.h"
 
 #include "test/test_common/environment.h"
 
@@ -71,7 +74,18 @@ static void testThroughput(benchmark::State& state) {
   Envoy::TestEnvironment::setRunfiles(runfiles.get());
 
   int sockets[2];
-  socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets);
+  // SOCK_NONBLOCK is not portable (it does not exist on macOS), so set O_NONBLOCK explicitly.
+  RELEASE_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0, "socketpair");
+  for (int fd : sockets) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    RELEASE_ASSERT(flags != -1 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0, "set O_NONBLOCK");
+    // Each iteration writes more than the default socket buffer holds on some platforms (notably
+    // macOS), which would fail the non-blocking writes below. Size the buffers explicitly so the
+    // benchmark measures the same thing everywhere.
+    const int buf_size = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+  }
 
   bssl::UniquePtr<SSL_CTX> server_ctx(SSL_CTX_new(TLS_method()));
   bssl::UniquePtr<SSL_CTX> client_ctx(SSL_CTX_new(TLS_method()));
@@ -113,8 +127,14 @@ static void testThroughput(benchmark::State& state) {
   unsigned num_short_slices = state.range(1);
   unsigned align_to_16kb = state.range(2);
   unsigned move_slices = state.range(3);
+  // Whether SslSocket's escape from a permanently misaligned slice chain is enabled, i.e. runtime
+  // guard envoy.reloadable_features.tls_avoid_repeated_linearize.
+  const bool avoid_repeated_linearize = state.range(4) != 0;
 
   uint64_t bytes_written = 0;
+  // Models SslSocket::linearized_last_write_, so it persists across iterations the way it would
+  // across calls to doWrite() on a live connection.
+  bool linearized_last_write = false;
   for (auto _ : state) {
     UNREFERENCED_PARAMETER(_);
     state.PauseTiming();
@@ -150,18 +170,19 @@ static void testThroughput(benchmark::State& state) {
     uint32_t num_writes = 0;
     uint32_t num_times_linearize_did_something = 0;
     while (write_buf.length() > 0) {
-      const Buffer::RawSlice initial = write_buf.frontSlice();
-      void* mem;
-      size_t len = std::min<uint64_t>(write_buf.length(), 16384);
-      mem = write_buf.linearize(len);
-      if (write_buf.frontSlice() != initial) {
+      // Mirrors SslSocket::doWrite(): pick the contiguous chunk, then write it.
+      const uint64_t want = std::min<uint64_t>(write_buf.length(), 16384);
+      const SslWriteChunk chunk =
+          selectSslWriteChunk(write_buf, want, linearized_last_write, avoid_repeated_linearize);
+      linearized_last_write = chunk.linearized_;
+      if (chunk.linearized_) {
         ++num_times_linearize_did_something;
       }
 
-      err = SSL_write(client_ssl.get(), mem, len);
-      RELEASE_ASSERT(err == static_cast<int>(len),
-                     absl::StrCat("SSL_write got: ", err, " expected: ", len));
-      write_buf.drain(len);
+      err = SSL_write(client_ssl.get(), chunk.data_, chunk.length_);
+      RELEASE_ASSERT(err == static_cast<int>(chunk.length_),
+                     absl::StrCat("SSL_write got: ", err, " expected: ", chunk.length_));
+      write_buf.drain(chunk.length_);
       num_writes++;
     }
 
@@ -175,15 +196,20 @@ static void testThroughput(benchmark::State& state) {
 }
 
 static void testParams(benchmark::internal::Benchmark* b) {
-  for (auto move_slices : {false, true}) {
-    for (auto align_to_16kb : {false, true}) {
-      // Add a single case of no short slices; don't iterate over the sizes
-      // which duplicates test cases when count is zero.
-      b->Args({0, 0, align_to_16kb, move_slices});
+  // The last parameter is the tls_avoid_repeated_linearize runtime guard, so each case is measured
+  // both with the old always-linearize behavior and with the misalignment escape.
+  for (auto avoid_repeated_linearize : {0, 1}) {
+    for (auto move_slices : {false, true}) {
+      for (auto align_to_16kb : {false, true}) {
+        // Add a single case of no short slices; don't iterate over the sizes
+        // which duplicates test cases when count is zero.
+        b->Args({0, 0, align_to_16kb, move_slices, avoid_repeated_linearize});
 
-      for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
-        for (auto num_short_slices : {1, 2, 3}) {
-          b->Args({short_slice_size, num_short_slices, align_to_16kb, move_slices});
+        for (auto short_slice_size : {1, 128, 4095, 4096, 4097}) {
+          for (auto num_short_slices : {1, 2, 3}) {
+            b->Args({short_slice_size, num_short_slices, align_to_16kb, move_slices,
+                     avoid_repeated_linearize});
+          }
         }
       }
     }
