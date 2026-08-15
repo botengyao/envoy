@@ -9,22 +9,20 @@ namespace TransportSockets {
 namespace Tls {
 namespace {
 
-// Appends `size` bytes as a slice of its own, filled with a byte pattern derived from `seed` so
-// that reassembled output can be compared against the original.
+// Appends `size` bytes as a slice of its own, with a `seed`-derived pattern so reassembled output
+// can be compared against the original.
 void appendSlice(Buffer::Instance& buffer, uint64_t size, uint8_t seed) {
   std::string data(size, 0);
   for (uint64_t i = 0; i < size; i++) {
     data[i] = static_cast<char>((seed + i) % 251);
   }
-  // add() of a standalone buffer moves whole slices in, which is what ConnectionImpl::write() does
-  // and is what produces the misaligned chains this function has to cope with.
+  // move() of a standalone buffer brings whole slices in, as ConnectionImpl::write() does.
   Buffer::OwnedImpl slice;
   slice.add(data);
   buffer.move(slice);
 }
 
-// Builds the shape a proxied response produces: a short header slice ahead of full-size body
-// slices. See ConnectionImpl::write() -> write_buffer_->move(data).
+// The shape a proxied response produces: a short header slice ahead of full-size body slices.
 void buildMisalignedBuffer(Buffer::Instance& buffer, uint64_t header_size, uint32_t body_slices) {
   appendSlice(buffer, header_size, 1);
   for (uint32_t i = 0; i < body_slices; i++) {
@@ -62,8 +60,8 @@ TEST(SslWriteChunkTest, ShortFrontSliceLinearizesOnFirstWrite) {
   EXPECT_EQ(buffer.frontSlice().mem_, chunk.data_);
 }
 
-// A second consecutive linearize means the chain is permanently misaligned, so the front slice is
-// written directly instead - a shorter record, but no allocation and no copy.
+// A second consecutive linearize means the chain is misaligned, so the front slice goes out
+// directly: a shorter record, but no allocation and no copy.
 TEST(SslWriteChunkTest, SecondConsecutiveLinearizeTakesShortRecord) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 2);
@@ -86,10 +84,8 @@ TEST(SslWriteChunkTest, GuardDisabledAlwaysLinearizes) {
   EXPECT_EQ(MaxSslWriteSize, chunk.length_);
 }
 
-// SSL_write() must be retried with the same pointer and length after SSL_ERROR_WANT_WRITE, and
-// BoringSSL is not configured with SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER. Nothing is drained on a
-// failed write, so re-selecting must be stable - including after the escape shortened the record,
-// and including when more data was appended at the back in between.
+// BoringSSL requires the retry to present the same pointer and length, so re-selecting must be
+// stable even when more data was appended at the back in between.
 TEST(SslWriteChunkTest, ReselectAfterWantWriteIsStable) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 2);
@@ -108,9 +104,8 @@ TEST(SslWriteChunkTest, ReselectAfterWantWriteIsStable) {
   EXPECT_FALSE(retry.linearized_);
 }
 
-// The point of the change: drain a realistically misaligned buffer and confirm that the copying
-// stops after one linearize instead of repeating for every slice, and that the bytes handed to
-// SSL_write() still reconstruct the original stream exactly.
+// The point of the change: copying stops after one linearize, and the bytes handed to SSL_write()
+// still reconstruct the original stream exactly.
 TEST(SslWriteChunkTest, MisalignedBufferCopiesOnceAndPreservesBytes) {
   constexpr uint32_t BodySlices = 8;
   Buffer::OwnedImpl expected;
@@ -167,8 +162,8 @@ TEST(SslWriteChunkTest, MisalignedBufferCopiesEveryWriteWithGuardDisabled) {
   EXPECT_EQ(BodySlices, linearize_count);
 }
 
-// Drives the selector the way SslSocket::doWrite() does, draining what each chunk covers.
-// `want_write_at` forces one SSL_ERROR_WANT_WRITE before the write at that index succeeds.
+// Drives the selector as SslSocket::doWrite() does. `want_write_at` forces one
+// SSL_ERROR_WANT_WRITE before the write at that index succeeds.
 struct DriveResult {
   uint32_t linearize_count{0};
   uint32_t write_count{0};
@@ -182,9 +177,8 @@ DriveResult drive(SslWriteChunkSelector& selector, Buffer::Instance& buffer,
   while (buffer.length() > 0) {
     const uint64_t bytes_to_write =
         selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxSslWriteSize));
-    // Count actual copies by watching the front of the buffer move, rather than trusting the
-    // returned flag. A copy performed by an attempt that then fails with WANT_WRITE is still real
-    // work, and a retry that reuses it must not be counted twice.
+    // Count copies by watching the front of the buffer move: a copy made by an attempt that then
+    // fails with WANT_WRITE is real work, and the retry reusing it must not count twice.
     const void* front_before = buffer.frontSlice().mem_;
     const SslWriteChunk chunk = selector.nextChunk(buffer, bytes_to_write);
     if (buffer.frontSlice().mem_ != front_before) {
@@ -192,8 +186,7 @@ DriveResult drive(SslWriteChunkSelector& selector, Buffer::Instance& buffer,
     }
 
     if (want_write_at.has_value() && *want_write_at == result.write_count && !want_write_pending) {
-      // SSL_write() returned SSL_ERROR_WANT_WRITE: nothing is drained, and the same write is
-      // retried on the next pass.
+      // WANT_WRITE: nothing is drained, and the same write is retried on the next pass.
       selector.onWantWrite(chunk);
       want_write_pending = true;
       continue;
@@ -201,8 +194,7 @@ DriveResult drive(SslWriteChunkSelector& selector, Buffer::Instance& buffer,
     want_write_pending = false;
 
     result.written.append(static_cast<const char*>(chunk.data_), chunk.length_);
-    // Production order: SslSocket::doWrite discharges the write before draining, because drain()
-    // can synchronously re-enter the connection.
+    // Production order: discharge before draining.
     selector.onWriteSucceeded(chunk);
     buffer.drain(chunk.length_);
     result.write_count++;
@@ -224,9 +216,8 @@ TEST(SslWriteChunkSelectorTest, MisalignedBufferCopiesOnce) {
   EXPECT_EQ(1, result.linearize_count);
 }
 
-// A write that returns SSL_ERROR_WANT_WRITE must be repeated verbatim, and repeating it must not
-// erase the fact that it came from a linearize. Re-deciding at that point would see the buffer
-// already linearized, conclude nothing was copied, and linearize again on the next write.
+// A retried write must be repeated verbatim without erasing the fact that it came from a
+// linearize; re-deciding would see the buffer already linearized and copy again on the next write.
 TEST(SslWriteChunkSelectorTest, WantWriteOnLinearizedChunkKeepsHistory) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 3);
@@ -268,9 +259,8 @@ TEST(SslWriteChunkSelectorTest, WantWriteDoesNotCostExtraCopies) {
   }
 }
 
-// A short record is only worth emitting if a slice chain survives it to be re-aligned. When the
-// write covers the whole buffer there is nothing left to fix, so linearizing is better: it keeps
-// the batch to a single TLS record instead of splitting it in two.
+// When the write covers the whole buffer there is no chain left to re-align, so linearizing keeps
+// the batch to a single record instead of splitting it in two.
 TEST(SslWriteChunkSelectorTest, NoShortRecordWhenTheWriteDrainsTheBuffer) {
   // The second slice must be at least Buffer::CopyThreshold or move() would coalesce the two.
   Buffer::OwnedImpl buffer;
@@ -285,9 +275,9 @@ TEST(SslWriteChunkSelectorTest, NoShortRecordWhenTheWriteDrainsTheBuffer) {
   EXPECT_EQ(2200, chunk.length_);
 }
 
-// The regime the retry bug actually bit in: a congested socket that accepts less than one full
-// record per write-ready event, so every single write reports WANT_WRITE first. Re-deciding the
-// retry there loses the history on every write and the optimization never engages at all.
+// A congested socket that accepts less than one record per write-ready event, so every write
+// reports WANT_WRITE first. Losing the history on each retry would disable the optimization
+// entirely.
 TEST(SslWriteChunkSelectorTest, SustainedWantWriteStillCopiesOnce) {
   Buffer::OwnedImpl expected;
   buildMisalignedBuffer(expected, 200, 8);
@@ -326,8 +316,7 @@ TEST(SslWriteChunkSelectorTest, SustainedWantWriteStillCopiesOnce) {
   EXPECT_EQ(1, copies);
 }
 
-// The runtime guard must still turn the whole thing off through the selector, pending writes
-// included: every fragmented write copies, exactly as before the change.
+// With the guard off every fragmented write copies, exactly as before the change.
 TEST(SslWriteChunkSelectorTest, GuardDisabledCopiesEveryWriteEvenWithWantWrite) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 8);
@@ -337,9 +326,8 @@ TEST(SslWriteChunkSelectorTest, GuardDisabledCopiesEveryWriteEvenWithWantWrite) 
   EXPECT_EQ(8, result.linearize_count);
 }
 
-// The history is deliberately connection-scoped: the misalignment describes how the connection
-// assembles writes, not one batch. Carrying it across a drained buffer is what keeps a
-// request/response connection copy-free instead of re-linearizing once per response.
+// The history is connection-scoped, so a request/response connection stays copy-free instead of
+// re-linearizing once per response.
 TEST(SslWriteChunkSelectorTest, HistoryCarriesAcrossBatches) {
   SslWriteChunkSelector selector(true);
 
@@ -362,8 +350,7 @@ TEST(SslWriteChunkSelectorTest, HistoryCarriesAcrossBatches) {
   EXPECT_EQ(0, b.linearize_count);
 }
 
-// Counts records and copied bytes for a whole buffer, with the guard on and off, so the two can be
-// compared directly. This is what the change must not make worse.
+// Records and copied bytes for a whole buffer, so guard on and off can be compared directly.
 struct Cost {
   uint32_t records{0};
   uint64_t copied_bytes{0};
@@ -393,10 +380,8 @@ void buildUniformSlices(Buffer::Instance& buffer, uint64_t slice_size, uint32_t 
   }
 }
 
-// A chain of uniformly sized sub-16KB slices - HTTP/1 chunked framing, small HTTP/2 frames, buffer
-// fragments - is fragmented more than one slice deep. Writing the front slice there does not
-// re-align anything, so the short record would be pure overhead: an extra TLS record and an extra
-// writev syscall, with the same bytes still copied. The escape must not fire.
+// A chain of uniform sub-16KB slices is fragmented more than one slice deep, so writing the front
+// slice re-aligns nothing and the short record would be pure overhead. The escape must not fire.
 TEST(SslWriteChunkTest, UniformFragmentsAreNotWorsened) {
   // 16384 % slice_size is small for these, so a short record would carry almost no payload.
   for (const uint64_t slice_size : {1024, 4096, 4097, 5462, 8193}) {
@@ -412,11 +397,9 @@ TEST(SslWriteChunkTest, UniformFragmentsAreNotWorsened) {
   }
 }
 
-// A slice larger than the write size self-heals on its own: one linearize leaves a remainder that
-// is already contiguous. Splitting a short record off in front of it would shift every record
-// boundary behind it and can cost an extra write - an extra TLS record and an extra writev - to
-// save a single copy. The escape must decline these, including when history carried in from an
-// earlier batch says the last write copied.
+// A slice larger than the write size self-heals: one linearize leaves a contiguous remainder.
+// Splitting a short record off in front of it can cost an extra write to save a single copy, so the
+// escape must decline - including when history carried in from an earlier batch says it copied.
 TEST(SslWriteChunkTest, OversizedSecondSliceNeverCostsAnExtraWrite) {
   for (const uint64_t second : {20000, 24576, 32768, 33000, 40000}) {
     Buffer::OwnedImpl expected;
@@ -437,9 +420,8 @@ TEST(SslWriteChunkTest, OversizedSecondSliceNeverCostsAnExtraWrite) {
   }
 }
 
-// The shape the change targets keeps its full win. The short record costs nothing here: it simply
-// moves the leading fragment to the front of the batch instead of leaving it as a trailing write,
-// so the record count is unchanged and only one copy remains for the whole buffer.
+// The target shape keeps its full win: the short record replaces what would have been a trailing
+// write, so the record count is unchanged and one copy remains for the whole buffer.
 TEST(SslWriteChunkTest, MisalignedChainKeepsItsWin) {
   Buffer::OwnedImpl with_guard;
   buildMisalignedBuffer(with_guard, 300, 16);

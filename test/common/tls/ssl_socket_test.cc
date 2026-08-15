@@ -9306,9 +9306,8 @@ TEST_P(SslSocketTest, DrainErrorQueuePrefersOtherTlsErrorOverEconnreset) {
               ContainsRegex("TLS_error:.*NO_SHARED_CIPHER"));
 }
 
-// envoy.reloadable_features.tls_avoid_repeated_linearize is read once when the socket is created,
-// so a runtime change reaches new connections and leaves existing ones alone. That is what the
-// changelog promises operators, and it is what makes reading the guard off the hot write path safe.
+// The guard is read once when the socket is created, so a runtime change reaches new connections
+// and leaves existing ones alone.
 TEST_P(SslSocketTest, AvoidRepeatedLinearizeGuardIsLatchedPerSocket) {
   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
   ContextManagerImpl manager(factory_context_.serverFactoryContext());
@@ -9327,7 +9326,7 @@ TEST_P(SslSocketTest, AvoidRepeatedLinearizeGuardIsLatchedPerSocket) {
   EXPECT_FALSE(
       SslSocketPeer::avoidRepeatedLinearize(*dynamic_cast<SslSocket*>(disabled_socket.get())));
 
-  // Flipping the runtime must not disturb the socket that already exists...
+  // Flipping the runtime must not disturb an existing socket...
   scoped_runtime.mergeValues({{"envoy.reloadable_features.tls_avoid_repeated_linearize", "true"}});
   EXPECT_FALSE(
       SslSocketPeer::avoidRepeatedLinearize(*dynamic_cast<SslSocket*>(disabled_socket.get())));

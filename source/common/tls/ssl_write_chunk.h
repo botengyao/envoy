@@ -10,14 +10,12 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Tls {
 
-// The most plaintext a single TLS record can carry, and so the most that is ever handed to one
-// SSL_write(). It is also Buffer::Slice::default_slice_size_, which is what makes a misaligned
-// write buffer self-perpetuating; see selectSslWriteChunk().
+// The most plaintext one TLS record carries, so the most ever handed to a single SSL_write().
+// Equal to Buffer::Slice::default_slice_size_, which is what makes misalignment self-perpetuating.
 constexpr uint64_t MaxSslWriteSize = 16384;
 
 /**
- * The pointer and length to hand to the next SSL_write(), plus whether producing it required
- * linearizing the write buffer.
+ * The pointer and length for the next SSL_write(), and whether producing it required a linearize.
  */
 struct SslWriteChunk {
   const void* data_;
@@ -28,41 +26,32 @@ struct SslWriteChunk {
 /**
  * Select the contiguous chunk for the next SSL_write().
  *
- * SSL_write() needs contiguous memory, which normally means linearize(). But linearize() copies
- * `bytes_to_write` into a freshly allocated slice and drains the same amount, which leaves the
- * following slice short. The read path reserves slices of MaxSslWriteSize, and that is also the
- * most we ever write at once, so for a chain of full-size slices the drain leaves the next one
- * holding exactly the offset the first one introduced. A write buffer that starts out misaligned -
- * as it does whenever a small header slice is moved in ahead of full body slices - therefore stays
- * misaligned, and every subsequent write repeats the allocation and the copy.
- *
- * The way out is to write just the contiguous front slice, as one short TLS record, after which the
- * chain is aligned and the writes that follow are copy-free. That is only taken when it is free:
- * see shortRecordRealignsBuffer() for the two conditions.
+ * linearize() copies `bytes_to_write` into a fresh slice and drains the same amount, leaving the
+ * next slice short by exactly the offset the first one introduced - so a buffer holding a small
+ * header slice ahead of full-size body slices stays misaligned, and every write repeats the
+ * allocation and the copy. Writing just the contiguous front slice as one short TLS record breaks
+ * that, when it is free to do so; see shortRecordRealignsBuffer().
  *
  * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
  * @param bytes_to_write the number of bytes the caller wants to write.
  * @param linearized_last_write whether the previous successful write had to linearize.
  * @param avoid_repeated_linearize whether the short-record escape is enabled.
- * @return the chunk to write. The returned length is never larger than @param bytes_to_write, and
- *         is only smaller when the short-record escape is taken.
+ * @return the chunk to write, never longer than @param bytes_to_write.
  */
 SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
                                   bool linearized_last_write, bool avoid_repeated_linearize);
 
 /**
- * Drives selectSslWriteChunk() across a sequence of SSL_write() calls, holding the little state
- * those decisions need. Two pieces of history matter, and they are not the same:
+ * Drives selectSslWriteChunk() across successive SSL_write() calls. Holds two distinct pieces of
+ * history:
  *
- * - A write that returned SSL_ERROR_WANT_WRITE must be repeated with identical bytes, and must not
- *   be decided again. Re-deciding would see the buffer as it is *after* a linearize and conclude
- *   nothing was copied, losing the very fact the next decision depends on. (BoringSSL is not
- *   configured with SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, so the pointer must match too.)
- * - Whether the previous *successful* write had to copy. That is what identifies a misaligned
- *   chain. It is deliberately connection-scoped rather than reset when the buffer drains: the
- *   misalignment is a property of how the connection assembles writes, not of one doWrite batch,
- *   and carrying it across a drained buffer is what keeps request/response connections in the
- *   copy-free steady state instead of paying a fresh linearize per response.
+ * - A write that returned SSL_ERROR_WANT_WRITE, repeated verbatim rather than decided again.
+ *   Re-deciding would inspect the buffer *after* the linearize, conclude nothing was copied, and
+ *   lose the fact the next decision needs.
+ * - Whether the previous successful write copied, which is what identifies a misaligned chain.
+ *   Deliberately connection-scoped: the misalignment belongs to the connection's write pattern, not
+ *   to one doWrite batch, so carrying it across a drained buffer keeps request/response connections
+ *   copy-free instead of re-linearizing per response.
  *
  * One per SslSocket, used only from the connection's dispatcher thread.
  */
@@ -80,18 +69,16 @@ public:
 
   /**
    * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
-   * @param bytes_to_write how much the caller wants to write. Ignored while a write is pending,
-   *        since that one must be repeated exactly.
+   * @param bytes_to_write how much to write. Ignored while a write is pending, since that one must
+   *        be repeated exactly.
    * @return the chunk for the next SSL_write().
    */
   SslWriteChunk nextChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write);
 
   /**
-   * Record that @param chunk was written in full.
-   *
-   * Must be called before the write buffer is drained: drain() can synchronously run low-watermark
-   * callbacks and slice drain trackers, which may re-enter the connection, and a nested write must
-   * not find this one still pending.
+   * Record that @param chunk was written in full. Must be called before draining the write buffer:
+   * drain() can run callbacks that re-enter the connection, and a nested write must not find this
+   * one still pending.
    */
   void onWriteSucceeded(const SslWriteChunk& chunk) {
     pending_.reset();

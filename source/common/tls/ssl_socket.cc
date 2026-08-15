@@ -48,9 +48,6 @@ SslSocket::SslSocket(Envoy::Ssl::ContextSharedPtr ctx,
                      const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options)
     : transport_socket_options_(transport_socket_options),
       ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)),
-      // Latched here rather than read per write: this is a per-connection object, matching how
-      // other hot-path reloadable guards are handled (e.g. ConnectionManagerImpl), so a runtime
-      // change takes effect on new connections.
       write_chunk_selector_(Runtime::runtimeFeatureEnabled(
           "envoy.reloadable_features.tls_avoid_repeated_linearize")) {}
 
@@ -342,8 +339,7 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     }
   }
 
-  // A write that previously returned SSL_ERROR_WANT_WRITE has to be repeated exactly; otherwise
-  // write as much as one TLS record can carry.
+  // A pending SSL_ERROR_WANT_WRITE must be repeated exactly; otherwise write one record's worth.
   const uint64_t bytes_wanted = std::min(write_buffer.length(), MaxSslWriteSize);
   uint64_t bytes_to_write = write_chunk_selector_.pendingLength().value_or(bytes_wanted);
 
@@ -358,9 +354,8 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     if (rc > 0) {
       ASSERT(rc == static_cast<int>(chunk.length_));
       total_bytes_written += rc;
-      // Discharge the write before draining, not after. drain() is not a leaf call - it can run
-      // low-watermark callbacks and slice drain trackers, which may close the connection and
-      // re-enter doWrite() synchronously. A nested call must not find this write still pending.
+      // Before draining: drain() can run low-watermark callbacks and drain trackers that re-enter
+      // doWrite(), and a nested call must not find this write still pending.
       write_chunk_selector_.onWriteSucceeded(chunk);
       write_buffer.drain(rc);
       bytes_to_write = std::min(write_buffer.length(), MaxSslWriteSize);
