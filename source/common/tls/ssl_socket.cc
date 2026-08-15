@@ -348,7 +348,9 @@ bool nextSliceCoversWrite(Buffer::Instance& write_buffer, uint64_t bytes_to_writ
 SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
                                   bool linearized_last_write, bool avoid_repeated_linearize) {
   ASSERT(bytes_to_write > 0 && bytes_to_write <= write_buffer.length());
+  // Non-empty by the precondition: the buffer holds data, and frontSlice() skips empty slices.
   const Buffer::RawSlice front_slice = write_buffer.frontSlice();
+  ASSERT(front_slice.len_ > 0);
 
   if (front_slice.len_ >= bytes_to_write) {
     // Already contiguous, so linearize() would hand back this same pointer without copying.
@@ -361,7 +363,7 @@ SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes
   // fragments - writing the front slice re-aligns nothing, and the short record is pure overhead:
   // an extra TLS record and an extra writev syscall for the same bytes copied. This also implies
   // bytes_to_write < write_buffer.length(), so a write that drains the buffer never splits.
-  if (avoid_repeated_linearize && linearized_last_write && front_slice.len_ > 0 &&
+  if (avoid_repeated_linearize && linearized_last_write &&
       nextSliceCoversWrite(write_buffer, bytes_to_write)) {
     return {front_slice.mem_, front_slice.len_, false};
   }
@@ -408,8 +410,11 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     if (rc > 0) {
       ASSERT(rc == static_cast<int>(chunk.length_));
       total_bytes_written += rc;
-      write_buffer.drain(rc);
+      // Discharge the write before draining, not after. drain() is not a leaf call - it can run
+      // low-watermark callbacks and slice drain trackers, which may close the connection and
+      // re-enter doWrite() synchronously. A nested call must not find this write still pending.
       write_chunk_selector_.onWriteSucceeded(chunk);
+      write_buffer.drain(rc);
       bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
     } else {
       int err = SSL_get_error(rawSsl(), rc);

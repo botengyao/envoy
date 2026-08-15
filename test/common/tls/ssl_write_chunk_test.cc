@@ -286,6 +286,58 @@ TEST(SslWriteChunkSelectorTest, NoShortRecordWhenTheWriteDrainsTheBuffer) {
   EXPECT_EQ(2200, chunk.length_);
 }
 
+// The regime the retry bug actually bit in: a congested socket that accepts less than one full
+// record per write-ready event, so every single write reports WANT_WRITE first. Re-deciding the
+// retry there loses the history on every write and the optimization never engages at all.
+TEST(SslWriteChunkSelectorTest, SustainedWantWriteStillCopiesOnce) {
+  Buffer::OwnedImpl expected;
+  buildMisalignedBuffer(expected, 200, 8);
+  Buffer::OwnedImpl buffer;
+  buildMisalignedBuffer(buffer, 200, 8);
+
+  SslWriteChunkSelector selector(true);
+  std::string written;
+  uint32_t copies = 0;
+  uint32_t writes = 0;
+  while (buffer.length() > 0) {
+    const uint64_t bytes_to_write =
+        selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxWrite));
+
+    // Attempt: the socket refuses it.
+    const void* front_before = buffer.frontSlice().mem_;
+    const SslWriteChunk attempt = selector.nextChunk(buffer, bytes_to_write);
+    if (buffer.frontSlice().mem_ != front_before) {
+      copies++;
+    }
+    selector.onWantWrite(attempt);
+
+    // Retry: the same write, which now lands.
+    ASSERT_TRUE(selector.pendingLength().has_value());
+    const SslWriteChunk retry = selector.nextChunk(buffer, *selector.pendingLength());
+    EXPECT_EQ(attempt.data_, retry.data_);
+    EXPECT_EQ(attempt.length_, retry.length_);
+    written.append(static_cast<const char*>(retry.data_), retry.length_);
+    selector.onWriteSucceeded(retry);
+    buffer.drain(retry.length_);
+    writes++;
+    RELEASE_ASSERT(writes < 100, "write loop failed to make progress");
+  }
+
+  EXPECT_EQ(expected.toString(), written);
+  EXPECT_EQ(1, copies);
+}
+
+// The runtime guard must still turn the whole thing off through the selector, pending writes
+// included: every fragmented write copies, exactly as before the change.
+TEST(SslWriteChunkSelectorTest, GuardDisabledCopiesEveryWriteEvenWithWantWrite) {
+  Buffer::OwnedImpl buffer;
+  buildMisalignedBuffer(buffer, 200, 8);
+
+  SslWriteChunkSelector selector(false);
+  const DriveResult result = drive(selector, buffer, /*want_write_at=*/1);
+  EXPECT_EQ(8, result.linearize_count);
+}
+
 // The history is deliberately connection-scoped: the misalignment describes how the connection
 // assembles writes, not one batch. Carrying it across a drained buffer is what keeps a
 // request/response connection copy-free instead of re-linearizing once per response.
