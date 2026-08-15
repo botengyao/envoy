@@ -1,5 +1,6 @@
 #include "source/common/tls/ssl_write_chunk.h"
 
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 
 namespace Envoy {
@@ -7,8 +8,19 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Tls {
 
+// The escape below only works because a write is capped at exactly the size of a read-path slice:
+// linearize() copies bytes_to_write into a fresh slice and drains the same amount, so for a chain
+// of full-size slices the next one is left holding exactly the offset the first one introduced.
+static_assert(MaxSslWriteSize == Buffer::Slice::default_slice_size_,
+              "the short-record escape assumes writes and buffer slices are the same size");
+
 namespace {
 
+// linearize() leaves the following slice short by exactly the offset the front one introduced, so
+// a buffer holding a small header slice ahead of full-size body slices stays misaligned and every
+// write repeats the allocation and the copy. Writing just the contiguous front slice breaks that,
+// at the price of one short TLS record.
+//
 // The short record costs at most one extra TLS record, and Envoy issues one writev syscall per
 // record, so it is only worth taking when it buys more than it costs. Three bounds, each measured:
 //
@@ -40,7 +52,8 @@ bool shortRecordIsWorthwhile(Buffer::Instance& write_buffer, const Buffer::RawSl
 
 SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
                                   bool linearized_last_write, bool avoid_repeated_linearize) {
-  ASSERT(bytes_to_write > 0 && bytes_to_write <= write_buffer.length());
+  ASSERT(bytes_to_write > 0);
+  ASSERT(bytes_to_write <= write_buffer.length());
   const Buffer::RawSlice front_slice = write_buffer.frontSlice();
   // Non-empty by the precondition above, since frontSlice() skips empty slices.
   ASSERT(front_slice.len_ > 0);
@@ -64,7 +77,9 @@ SslWriteChunk SslWriteChunkSelector::nextChunk(Buffer::Instance& write_buffer,
   if (pending_.has_value()) {
     // Repeat verbatim: nothing is drained while a write is outstanding and new data only appends at
     // the back, so the same bytes are still at the same address.
-    ASSERT(write_buffer.frontSlice().len_ >= pending_->length_);
+    // Bounds check, not just an invariant: this pointer and length go straight to SSL_write().
+    SECURITY_ASSERT(write_buffer.frontSlice().len_ >= pending_->length_,
+                    "pending TLS write no longer fits the write buffer's front slice");
     return {write_buffer.frontSlice().mem_, pending_->length_, pending_->linearized_};
   }
   return selectSslWriteChunk(write_buffer, bytes_to_write, linearized_last_write_,

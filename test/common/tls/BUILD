@@ -80,6 +80,7 @@ envoy_cc_test(
 envoy_cc_test(
     name = "ssl_write_chunk_test",
     srcs = ["ssl_write_chunk_test.cc"],
+    rbe_pool = "6gig",
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/common/tls:ssl_write_chunk_lib",

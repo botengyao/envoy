@@ -67,6 +67,7 @@ envoy_cc_library(
     hdrs = ["ssl_write_chunk.h"],
     deps = [
         "//envoy/buffer:buffer_interface",
+        "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
     ],
 )

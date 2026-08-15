@@ -18,25 +18,23 @@ constexpr uint64_t MaxSslWriteSize = 16384;
  * The pointer and length for the next SSL_write(), and whether producing it required a linearize.
  */
 struct SslWriteChunk {
-  const void* data_;
-  uint64_t length_;
-  bool linearized_;
+  const void* data_{nullptr};
+  uint64_t length_{0};
+  bool linearized_{false};
 };
 
 /**
- * Select the contiguous chunk for the next SSL_write().
+ * Select the contiguous chunk for the next SSL_write(). Normally that means linearize(), which
+ * copies; where the write buffer is left permanently misaligned by doing so, the contiguous front
+ * slice is written on its own instead. See the implementation for why.
  *
- * linearize() copies `bytes_to_write` into a fresh slice and drains the same amount, leaving the
- * next slice short by exactly the offset the first one introduced - so a buffer holding a small
- * header slice ahead of full-size body slices stays misaligned, and every write repeats the
- * allocation and the copy. Writing just the contiguous front slice as one short TLS record breaks
- * that, when it is free to do so; see shortRecordIsWorthwhile().
+ * Exposed for the unit test and the throughput benchmark, which measure this decision directly.
  *
  * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
  * @param bytes_to_write the number of bytes the caller wants to write.
  * @param linearized_last_write whether the previous successful write had to linearize.
  * @param avoid_repeated_linearize whether the short-record escape is enabled.
- * @return the chunk to write, never longer than @param bytes_to_write.
+ * @return SslWriteChunk the chunk to write, never longer than bytes_to_write.
  */
 SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
                                   bool linearized_last_write, bool avoid_repeated_linearize);
@@ -61,31 +59,39 @@ public:
       : avoid_repeated_linearize_(avoid_repeated_linearize) {}
 
   /**
-   * @return the length the pending write must be repeated with, or nullopt if none is outstanding.
+   * @return std::optional<uint64_t> the length the pending write must be repeated with, or nullopt
+   *         if none is outstanding.
    */
   std::optional<uint64_t> pendingLength() const {
-    return pending_.has_value() ? std::make_optional(pending_->length_) : std::nullopt;
+    if (!pending_.has_value()) {
+      return std::nullopt;
+    }
+    return pending_->length_;
   }
 
   /**
    * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
    * @param bytes_to_write how much to write. Ignored while a write is pending, since that one must
    *        be repeated exactly.
-   * @return the chunk for the next SSL_write().
+   * @return SslWriteChunk the chunk for the next SSL_write().
    */
   SslWriteChunk nextChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write);
 
   /**
-   * Record that @param chunk was written in full. Must be called before draining the write buffer:
+   * Record that a chunk was written in full. Must be called before draining the write buffer:
    * drain() can run callbacks that re-enter the connection, and a nested write must not find this
    * one still pending.
+   * @param chunk the chunk that SSL_write() consumed.
    */
   void onWriteSucceeded(const SslWriteChunk& chunk) {
     pending_.reset();
     linearized_last_write_ = chunk.linearized_;
   }
 
-  /** Record that SSL_write() returned SSL_ERROR_WANT_WRITE for @param chunk. */
+  /**
+   * Record that SSL_write() could not proceed and must be retried with the same bytes.
+   * @param chunk the chunk SSL_write() returned SSL_ERROR_WANT_WRITE for.
+   */
   void onWantWrite(const SslWriteChunk& chunk) {
     pending_ = PendingWrite{chunk.length_, chunk.linearized_};
   }
