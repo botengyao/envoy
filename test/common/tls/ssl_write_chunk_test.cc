@@ -64,7 +64,7 @@ TEST(SslWriteChunkTest, ShortFrontSliceLinearizesOnFirstWrite) {
 // directly: a shorter record, but no allocation and no copy.
 TEST(SslWriteChunkTest, SecondConsecutiveLinearizeTakesShortRecord) {
   Buffer::OwnedImpl buffer;
-  buildMisalignedBuffer(buffer, 200, 2);
+  buildMisalignedBuffer(buffer, 200, 4);
   const Buffer::RawSlice front = buffer.frontSlice();
   ASSERT_LT(front.len_, MaxSslWriteSize);
 
@@ -88,7 +88,7 @@ TEST(SslWriteChunkTest, GuardDisabledAlwaysLinearizes) {
 // stable even when more data was appended at the back in between.
 TEST(SslWriteChunkTest, ReselectAfterWantWriteIsStable) {
   Buffer::OwnedImpl buffer;
-  buildMisalignedBuffer(buffer, 200, 2);
+  buildMisalignedBuffer(buffer, 200, 4);
 
   // Take the escape, as if SSL_write() then returned SSL_ERROR_WANT_WRITE.
   const SslWriteChunk first = selectSslWriteChunk(buffer, MaxSslWriteSize, true, true);
@@ -220,7 +220,7 @@ TEST(SslWriteChunkSelectorTest, MisalignedBufferCopiesOnce) {
 // linearize; re-deciding would see the buffer already linearized and copy again on the next write.
 TEST(SslWriteChunkSelectorTest, WantWriteOnLinearizedChunkKeepsHistory) {
   Buffer::OwnedImpl buffer;
-  buildMisalignedBuffer(buffer, 200, 3);
+  buildMisalignedBuffer(buffer, 200, 5);
   SslWriteChunkSelector selector(true);
 
   // First write linearizes, then reports WANT_WRITE.
@@ -418,6 +418,40 @@ TEST(SslWriteChunkTest, OversizedSecondSliceNeverCostsAnExtraWrite) {
     EXPECT_LE(on.records, off.records) << "second slice " << second;
     EXPECT_LE(on.copied_bytes, off.copied_bytes) << "second slice " << second;
   }
+}
+
+// A real response body rarely ends on a 16KB boundary. The partial tail must not stop the escape:
+// this is the shape the change exists for, and blocking it here costs a copy per full-size slice.
+TEST(SslWriteChunkTest, PartialTailStillGetsTheWin) {
+  for (const uint64_t tail : {1, 576, 4000, 9000, 16383}) {
+    Buffer::OwnedImpl with_guard;
+    buildMisalignedBuffer(with_guard, 150, 20);
+    appendSlice(with_guard, tail, 9);
+    Buffer::OwnedImpl without_guard;
+    buildMisalignedBuffer(without_guard, 150, 20);
+    appendSlice(without_guard, tail, 9);
+
+    const Cost on = costOf(with_guard, true);
+    const Cost off = costOf(without_guard, false);
+    // One copy for the whole body instead of one per full-size slice, for at most one more record.
+    EXPECT_EQ(MaxSslWriteSize, on.copied_bytes) << "tail " << tail;
+    EXPECT_LT(on.copied_bytes * 10, off.copied_bytes) << "tail " << tail;
+    EXPECT_LE(on.records, off.records + 1) << "tail " << tail;
+  }
+}
+
+// A large front slice is not a cheap fragment to split off, and where the chain behind it is also
+// fragmented the short record realigns nothing. The escape must decline.
+TEST(SslWriteChunkTest, LargeFrontSliceIsNotSplitOff) {
+  Buffer::OwnedImpl buffer;
+  appendSlice(buffer, 15000, 1);
+  appendSlice(buffer, MaxSslWriteSize, 2);
+  appendSlice(buffer, 20000, 3);
+  appendSlice(buffer, 25000, 4);
+  ASSERT_LT(buffer.frontSlice().len_, MaxSslWriteSize);
+
+  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxSslWriteSize, true, true);
+  EXPECT_TRUE(chunk.linearized_);
 }
 
 // The target shape keeps its full win: the short record replaces what would have been a trailing

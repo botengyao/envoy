@@ -9,32 +9,31 @@ namespace Tls {
 
 namespace {
 
-uint64_t writesNeededFor(uint64_t bytes, uint64_t bytes_per_write) {
-  return (bytes + bytes_per_write - 1) / bytes_per_write;
-}
-
-// Whether writing just the contiguous front slice earns a TLS record of its own. Two independent
-// conditions:
+// The short record costs at most one extra TLS record, and Envoy issues one writev syscall per
+// record, so it is only worth taking when it buys more than it costs. Three bounds, each measured:
 //
-// 1. The slice behind it must cover the following write alone, or nothing is re-aligned. Chains
-//    fragmented more than one slice deep (HTTP/1 chunked framing, small HTTP/2 frames, buffer
-//    fragments) would just pay an extra record and writev for the same bytes copied.
-// 2. It must not increase the write count. Splitting the front slice off shifts every record
-//    boundary behind it and can push the tail into one more record. Envoy issues one writev per
-//    record, so requiring the count not to grow keeps this strictly fewer copies, never more
-//    records.
-bool shortRecordRealignsBuffer(Buffer::Instance& write_buffer, const Buffer::RawSlice& front_slice,
-                               uint64_t bytes_to_write) {
+// - The slice behind the front one must cover the following write alone, or nothing is realigned.
+//   Chains fragmented more than one slice deep (HTTP/1 chunked framing, small HTTP/2 frames,
+//   buffer fragments) would pay an extra record and writev for the same bytes copied.
+// - The front slice must be a small fragment. Splitting off a large one is not cheap, and where
+//   the chain behind is also fragmented it realigns nothing.
+// - Enough must remain queued behind it. Without the escape every following full-size write
+//   linearizes, so the copies saved grow with what is queued, while the cost stays one record.
+constexpr uint64_t MaxShortRecordFraction = 4;
+constexpr uint64_t MinQueuedRecords = 3;
+
+bool shortRecordIsWorthwhile(Buffer::Instance& write_buffer, const Buffer::RawSlice& front_slice,
+                             uint64_t bytes_to_write) {
+  if (front_slice.len_ * MaxShortRecordFraction > bytes_to_write) {
+    return false;
+  }
+  if (write_buffer.length() - front_slice.len_ < MinQueuedRecords * bytes_to_write) {
+    return false;
+  }
   // getRawSlices() skips empty slices like frontSlice(), so index 1 becomes the front once the
   // short record is drained.
   const Buffer::RawSliceVector slices = write_buffer.getRawSlices(/*max_slices=*/2);
-  if (slices.size() < 2 || slices[1].len_ < bytes_to_write) {
-    return false;
-  }
-
-  const uint64_t queued = write_buffer.length();
-  const uint64_t with_short_record = 1 + writesNeededFor(queued - front_slice.len_, bytes_to_write);
-  return with_short_record <= writesNeededFor(queued, bytes_to_write);
+  return slices.size() == 2 && slices[1].len_ >= bytes_to_write;
 }
 
 } // namespace
@@ -52,7 +51,7 @@ SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes
   }
 
   if (avoid_repeated_linearize && linearized_last_write &&
-      shortRecordRealignsBuffer(write_buffer, front_slice, bytes_to_write)) {
+      shortRecordIsWorthwhile(write_buffer, front_slice, bytes_to_write)) {
     // Copied last time, about to copy again, and one short record breaks the cycle for free.
     return {front_slice.mem_, front_slice.len_, false};
   }

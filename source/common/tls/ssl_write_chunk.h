@@ -30,7 +30,7 @@ struct SslWriteChunk {
  * next slice short by exactly the offset the first one introduced - so a buffer holding a small
  * header slice ahead of full-size body slices stays misaligned, and every write repeats the
  * allocation and the copy. Writing just the contiguous front slice as one short TLS record breaks
- * that, when it is free to do so; see shortRecordRealignsBuffer().
+ * that, when it is free to do so; see shortRecordIsWorthwhile().
  *
  * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
  * @param bytes_to_write the number of bytes the caller wants to write.
