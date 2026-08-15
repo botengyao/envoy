@@ -80,11 +80,9 @@ envoy_cc_test(
 envoy_cc_test(
     name = "ssl_write_chunk_test",
     srcs = ["ssl_write_chunk_test.cc"],
-    external_deps = ["ssl"],
-    rbe_pool = "6gig",
     deps = [
         "//source/common/buffer:buffer_lib",
-        "//source/common/tls:ssl_socket_lib",
+        "//source/common/tls:ssl_write_chunk_lib",
     ],
 )
 
@@ -396,7 +394,7 @@ envoy_cc_benchmark_binary(
     tags = ["skip_on_windows"],
     deps = [
         "//source/common/buffer:buffer_lib",
-        "//source/common/tls:ssl_socket_lib",
+        "//source/common/tls:ssl_write_chunk_lib",
         "@benchmark",
     ],
 )

@@ -332,58 +332,6 @@ void SslSocket::drainErrorQueue() {
   }
 }
 
-namespace {
-
-// Whether the slice behind the front one is on its own big enough for the write that would follow
-// a short record, i.e. whether writing just the front slice actually re-aligns the buffer.
-bool nextSliceCoversWrite(Buffer::Instance& write_buffer, uint64_t bytes_to_write) {
-  // getRawSlices() skips empty slices, exactly as frontSlice() does, so index 1 is the slice that
-  // becomes the front once the short record is written and drained.
-  const Buffer::RawSliceVector slices = write_buffer.getRawSlices(/*max_slices=*/2);
-  return slices.size() == 2 && slices[1].len_ >= bytes_to_write;
-}
-
-} // namespace
-
-SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
-                                  bool linearized_last_write, bool avoid_repeated_linearize) {
-  ASSERT(bytes_to_write > 0 && bytes_to_write <= write_buffer.length());
-  // Non-empty by the precondition: the buffer holds data, and frontSlice() skips empty slices.
-  const Buffer::RawSlice front_slice = write_buffer.frontSlice();
-  ASSERT(front_slice.len_ > 0);
-
-  if (front_slice.len_ >= bytes_to_write) {
-    // Already contiguous, so linearize() would hand back this same pointer without copying.
-    return {front_slice.mem_, bytes_to_write, false};
-  }
-
-  // Only worth a short record if it actually buys the copy-free steady state, which it does only
-  // when the slice behind the front one can satisfy the next write by itself. If the chain is
-  // fragmented more than one slice deep - HTTP/1 chunked framing, small HTTP/2 frames, buffer
-  // fragments - writing the front slice re-aligns nothing, and the short record is pure overhead:
-  // an extra TLS record and an extra writev syscall for the same bytes copied. This also implies
-  // bytes_to_write < write_buffer.length(), so a write that drains the buffer never splits.
-  if (avoid_repeated_linearize && linearized_last_write &&
-      nextSliceCoversWrite(write_buffer, bytes_to_write)) {
-    return {front_slice.mem_, front_slice.len_, false};
-  }
-
-  return {write_buffer.linearize(bytes_to_write), bytes_to_write, true};
-}
-
-SslWriteChunk SslWriteChunkSelector::nextChunk(Buffer::Instance& write_buffer,
-                                               uint64_t bytes_to_write) {
-  if (pending_.has_value()) {
-    // Repeat the pending write verbatim. Nothing is drained while a write is outstanding and new
-    // data is only ever appended at the back, so the front of the buffer still holds exactly these
-    // bytes at the same address.
-    ASSERT(write_buffer.frontSlice().len_ >= pending_->length_);
-    return {write_buffer.frontSlice().mem_, pending_->length_, pending_->linearized_};
-  }
-  return selectSslWriteChunk(write_buffer, bytes_to_write, linearized_last_write_,
-                             avoid_repeated_linearize_);
-}
-
 Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_stream) {
   ASSERT(info_->state() != Ssl::SocketState::ShutdownSent || write_buffer.length() == 0);
   if (info_->state() != Ssl::SocketState::HandshakeComplete &&
@@ -396,7 +344,7 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
 
   // A write that previously returned SSL_ERROR_WANT_WRITE has to be repeated exactly; otherwise
   // write as much as one TLS record can carry.
-  const uint64_t bytes_wanted = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
+  const uint64_t bytes_wanted = std::min(write_buffer.length(), MaxSslWriteSize);
   uint64_t bytes_to_write = write_chunk_selector_.pendingLength().value_or(bytes_wanted);
 
   uint64_t total_bytes_written = 0;
@@ -415,7 +363,7 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
       // re-enter doWrite() synchronously. A nested call must not find this write still pending.
       write_chunk_selector_.onWriteSucceeded(chunk);
       write_buffer.drain(rc);
-      bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
+      bytes_to_write = std::min(write_buffer.length(), MaxSslWriteSize);
     } else {
       int err = SSL_get_error(rawSsl(), rc);
       ENVOY_CONN_LOG(trace, "ssl error occurred while write: {}", callbacks_->connection(),

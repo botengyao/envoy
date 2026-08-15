@@ -97,6 +97,9 @@ public:
     return socket.detected_io_error_;
   }
   static absl::string_view failureReason(const SslSocket& socket) { return socket.failure_reason_; }
+  static bool avoidRepeatedLinearize(const SslSocket& socket) {
+    return socket.write_chunk_selector_.avoidRepeatedLinearizeForTest();
+  }
 };
 
 class ClientContextImplPeer {
@@ -9301,6 +9304,39 @@ TEST_P(SslSocketTest, DrainErrorQueuePrefersOtherTlsErrorOverEconnreset) {
       << "; expected unset so the TLS protocol error remains the surfaced root cause.";
   EXPECT_THAT(std::string(SslSocketPeer::failureReason(*ssl_socket)),
               ContainsRegex("TLS_error:.*NO_SHARED_CIPHER"));
+}
+
+// envoy.reloadable_features.tls_avoid_repeated_linearize is read once when the socket is created,
+// so a runtime change reaches new connections and leaves existing ones alone. That is what the
+// changelog promises operators, and it is what makes reading the guard off the hot write path safe.
+TEST_P(SslSocketTest, AvoidRepeatedLinearizeGuardIsLatchedPerSocket) {
+  envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+  ContextManagerImpl manager(factory_context_.serverFactoryContext());
+
+  auto make_socket = [&]() {
+    auto client_cfg = *ClientContextConfigImpl::create(tls_context, factory_context_);
+    auto factory = *ClientSslSocketFactory::create(std::move(client_cfg), manager,
+                                                   *factory_context_.store_.rootScope());
+    return factory->createTransportSocket(nullptr, nullptr);
+  };
+
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.tls_avoid_repeated_linearize", "false"}});
+  auto disabled_socket = make_socket();
+  ASSERT_NE(nullptr, disabled_socket);
+  EXPECT_FALSE(
+      SslSocketPeer::avoidRepeatedLinearize(*dynamic_cast<SslSocket*>(disabled_socket.get())));
+
+  // Flipping the runtime must not disturb the socket that already exists...
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.tls_avoid_repeated_linearize", "true"}});
+  EXPECT_FALSE(
+      SslSocketPeer::avoidRepeatedLinearize(*dynamic_cast<SslSocket*>(disabled_socket.get())));
+
+  // ...but the next socket picks the new value up.
+  auto enabled_socket = make_socket();
+  ASSERT_NE(nullptr, enabled_socket);
+  EXPECT_TRUE(
+      SslSocketPeer::avoidRepeatedLinearize(*dynamic_cast<SslSocket*>(enabled_socket.get())));
 }
 
 } // namespace Tls

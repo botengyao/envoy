@@ -18,6 +18,7 @@
 #include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/tls/context_impl.h"
 #include "source/common/tls/ssl_handshaker.h"
+#include "source/common/tls/ssl_write_chunk.h"
 #include "source/common/tls/utility.h"
 
 #include "absl/container/node_hash_map.h"
@@ -42,106 +43,6 @@ struct SslSocketFactoryStats {
 };
 
 enum class InitialState { Client, Server };
-
-/**
- * The pointer and length to hand to the next SSL_write(), plus whether producing it required
- * linearizing the write buffer.
- */
-struct SslWriteChunk {
-  const void* data_;
-  uint64_t length_;
-  bool linearized_;
-};
-
-/**
- * Select the contiguous chunk for the next SSL_write().
- *
- * SSL_write() needs contiguous memory, which normally means linearize(). But linearize() copies
- * `bytes_to_write` into a freshly allocated slice and drains the same amount, which leaves the
- * following slice short. The read path fills slices of Slice::default_slice_size_ (16KB), and that
- * is also the most we ever write at once; for that common chain the drain leaves the next slice
- * holding exactly the offset the first one introduced. So a write buffer that starts out
- * misaligned - as it does whenever a small header slice is moved in ahead of full body slices -
- * stays misaligned, and every subsequent write repeats the allocation and the copy. (Slices larger
- * than the write size are not affected: they self-heal, because the leftover then exceeds the write
- * size and the next write is contiguous.)
- *
- * So when the previous write already had to linearize and this one would too, write just the
- * contiguous front slice instead. That costs one short TLS record, and for the usual chain of
- * full-size slices it re-aligns the buffer so the writes that follow are copy-free. The escape is
- * skipped when this write would drain the buffer completely: no chain survives for it to re-align,
- * so linearizing is the better choice and keeps the batch to a single record.
- *
- * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
- * @param bytes_to_write the number of bytes the caller wants to write.
- * @param linearized_last_write whether the previous call to this function linearized.
- * @param avoid_repeated_linearize whether the short-record escape is enabled.
- * @return the chunk to write. The returned length is never larger than @param bytes_to_write, and
- *         is only smaller when the short-record escape is taken.
- */
-SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
-                                  bool linearized_last_write, bool avoid_repeated_linearize);
-
-/**
- * Drives selectSslWriteChunk() across a sequence of SSL_write() calls, holding the little state
- * those decisions need. Two pieces of history matter, and they are not the same:
- *
- * - A write that returned SSL_ERROR_WANT_WRITE must be repeated with identical bytes, and must not
- *   be decided again. Re-deciding would see the buffer as it is *after* a linearize and conclude
- *   nothing was copied, losing the very fact the next decision depends on. (BoringSSL is not
- *   configured with SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, so the pointer must match too.)
- * - Whether the previous *successful* write had to copy. That is what identifies a misaligned
- *   chain. It is deliberately connection-scoped rather than reset when the buffer drains: the
- *   misalignment is a property of how the connection assembles writes, not of one doWrite batch,
- *   and carrying it across a drained buffer is what keeps request/response connections in the
- *   copy-free steady state instead of paying a fresh linearize per response.
- *
- * One per SslSocket, used only from the connection's dispatcher thread.
- */
-class SslWriteChunkSelector {
-public:
-  explicit SslWriteChunkSelector(bool avoid_repeated_linearize)
-      : avoid_repeated_linearize_(avoid_repeated_linearize) {}
-
-  /**
-   * @return the length the pending write must be repeated with, or nullopt if none is outstanding.
-   */
-  std::optional<uint64_t> pendingLength() const {
-    return pending_.has_value() ? std::make_optional(pending_->length_) : std::nullopt;
-  }
-
-  /**
-   * @param write_buffer the buffer to write from; must not be empty. May be linearized in place.
-   * @param bytes_to_write how much the caller wants to write. Ignored while a write is pending,
-   *        since that one must be repeated exactly.
-   * @return the chunk for the next SSL_write().
-   */
-  SslWriteChunk nextChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write);
-
-  /**
-   * Record that @param chunk was written in full and drained.
-   * @param write_buffer the buffer, already drained.
-   */
-  void onWriteSucceeded(const SslWriteChunk& chunk) {
-    pending_.reset();
-    linearized_last_write_ = chunk.linearized_;
-  }
-
-  /** Record that SSL_write() returned SSL_ERROR_WANT_WRITE for @param chunk. */
-  void onWantWrite(const SslWriteChunk& chunk) {
-    pending_ = PendingWrite{chunk.length_, chunk.linearized_};
-  }
-
-private:
-  struct PendingWrite {
-    uint64_t length_;
-    bool linearized_;
-  };
-
-  const bool avoid_repeated_linearize_;
-  std::optional<PendingWrite> pending_;
-  bool linearized_last_write_{false};
-};
 
 class SslSocket : public Network::TransportSocket,
                   public Envoy::Ssl::PrivateKeyConnectionCallbacks,

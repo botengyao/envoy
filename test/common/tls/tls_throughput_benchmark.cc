@@ -1,7 +1,7 @@
 #include <fcntl.h>
 
 #include "source/common/buffer/buffer_impl.h"
-#include "source/common/tls/ssl_socket.h"
+#include "source/common/tls/ssl_write_chunk.h"
 
 #include "test/test_common/environment.h"
 

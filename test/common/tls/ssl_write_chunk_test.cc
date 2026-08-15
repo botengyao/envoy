@@ -1,5 +1,5 @@
 #include "source/common/buffer/buffer_impl.h"
-#include "source/common/tls/ssl_socket.h"
+#include "source/common/tls/ssl_write_chunk.h"
 
 #include "gtest/gtest.h"
 
@@ -8,9 +8,6 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Tls {
 namespace {
-
-// The most that is ever handed to a single SSL_write(), and also Slice::default_slice_size_.
-constexpr uint64_t MaxWrite = 16384;
 
 // Appends `size` bytes as a slice of its own, filled with a byte pattern derived from `seed` so
 // that reassembled output can be compared against the original.
@@ -31,24 +28,24 @@ void appendSlice(Buffer::Instance& buffer, uint64_t size, uint8_t seed) {
 void buildMisalignedBuffer(Buffer::Instance& buffer, uint64_t header_size, uint32_t body_slices) {
   appendSlice(buffer, header_size, 1);
   for (uint32_t i = 0; i < body_slices; i++) {
-    appendSlice(buffer, MaxWrite, static_cast<uint8_t>(i + 2));
+    appendSlice(buffer, MaxSslWriteSize, static_cast<uint8_t>(i + 2));
   }
 }
 
 uint64_t nextWriteSize(const Buffer::Instance& buffer) {
-  return std::min<uint64_t>(buffer.length(), MaxWrite);
+  return std::min<uint64_t>(buffer.length(), MaxSslWriteSize);
 }
 
 // A contiguous front slice is returned as-is, with no copy, regardless of the guard.
 TEST(SslWriteChunkTest, ContiguousFrontSliceIsNotCopied) {
   for (const bool avoid_repeated : {false, true}) {
     Buffer::OwnedImpl buffer;
-    appendSlice(buffer, MaxWrite, 7);
+    appendSlice(buffer, MaxSslWriteSize, 7);
     const void* front = buffer.frontSlice().mem_;
 
-    const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxWrite, false, avoid_repeated);
+    const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxSslWriteSize, false, avoid_repeated);
     EXPECT_EQ(front, chunk.data_);
-    EXPECT_EQ(MaxWrite, chunk.length_);
+    EXPECT_EQ(MaxSslWriteSize, chunk.length_);
     EXPECT_FALSE(chunk.linearized_);
   }
 }
@@ -58,10 +55,10 @@ TEST(SslWriteChunkTest, ShortFrontSliceLinearizesOnFirstWrite) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 2);
 
-  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxWrite, false, true);
+  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxSslWriteSize, false, true);
   EXPECT_TRUE(chunk.linearized_);
   // The full amount is still written; only the escape path shortens the record.
-  EXPECT_EQ(MaxWrite, chunk.length_);
+  EXPECT_EQ(MaxSslWriteSize, chunk.length_);
   EXPECT_EQ(buffer.frontSlice().mem_, chunk.data_);
 }
 
@@ -71,9 +68,9 @@ TEST(SslWriteChunkTest, SecondConsecutiveLinearizeTakesShortRecord) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 2);
   const Buffer::RawSlice front = buffer.frontSlice();
-  ASSERT_LT(front.len_, MaxWrite);
+  ASSERT_LT(front.len_, MaxSslWriteSize);
 
-  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxWrite, true, true);
+  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxSslWriteSize, true, true);
   EXPECT_FALSE(chunk.linearized_);
   EXPECT_EQ(front.mem_, chunk.data_);
   EXPECT_EQ(front.len_, chunk.length_);
@@ -84,9 +81,9 @@ TEST(SslWriteChunkTest, GuardDisabledAlwaysLinearizes) {
   Buffer::OwnedImpl buffer;
   buildMisalignedBuffer(buffer, 200, 2);
 
-  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxWrite, true, false);
+  const SslWriteChunk chunk = selectSslWriteChunk(buffer, MaxSslWriteSize, true, false);
   EXPECT_TRUE(chunk.linearized_);
-  EXPECT_EQ(MaxWrite, chunk.length_);
+  EXPECT_EQ(MaxSslWriteSize, chunk.length_);
 }
 
 // SSL_write() must be retried with the same pointer and length after SSL_ERROR_WANT_WRITE, and
@@ -98,13 +95,13 @@ TEST(SslWriteChunkTest, ReselectAfterWantWriteIsStable) {
   buildMisalignedBuffer(buffer, 200, 2);
 
   // Take the escape, as if SSL_write() then returned SSL_ERROR_WANT_WRITE.
-  const SslWriteChunk first = selectSslWriteChunk(buffer, MaxWrite, true, true);
-  ASSERT_LT(first.length_, MaxWrite);
+  const SslWriteChunk first = selectSslWriteChunk(buffer, MaxSslWriteSize, true, true);
+  ASSERT_LT(first.length_, MaxSslWriteSize);
 
   // More response data arrives before the retry.
-  appendSlice(buffer, MaxWrite, 42);
+  appendSlice(buffer, MaxSslWriteSize, 42);
 
-  // The retry asks for exactly bytes_to_retry_ bytes and must get the same memory back.
+  // The retry asks for exactly the pending length and must get the same memory back.
   const SslWriteChunk retry = selectSslWriteChunk(buffer, first.length_, false, true);
   EXPECT_EQ(first.data_, retry.data_);
   EXPECT_EQ(first.length_, retry.length_);
@@ -184,7 +181,7 @@ DriveResult drive(SslWriteChunkSelector& selector, Buffer::Instance& buffer,
   bool want_write_pending = false;
   while (buffer.length() > 0) {
     const uint64_t bytes_to_write =
-        selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxWrite));
+        selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxSslWriteSize));
     // Count actual copies by watching the front of the buffer move, rather than trusting the
     // returned flag. A copy performed by an attempt that then fails with WANT_WRITE is still real
     // work, and a retry that reuses it must not be counted twice.
@@ -204,8 +201,10 @@ DriveResult drive(SslWriteChunkSelector& selector, Buffer::Instance& buffer,
     want_write_pending = false;
 
     result.written.append(static_cast<const char*>(chunk.data_), chunk.length_);
-    buffer.drain(chunk.length_);
+    // Production order: SslSocket::doWrite discharges the write before draining, because drain()
+    // can synchronously re-enter the connection.
     selector.onWriteSucceeded(chunk);
+    buffer.drain(chunk.length_);
     result.write_count++;
     RELEASE_ASSERT(result.write_count < 100, "write loop failed to make progress");
   }
@@ -234,7 +233,7 @@ TEST(SslWriteChunkSelectorTest, WantWriteOnLinearizedChunkKeepsHistory) {
   SslWriteChunkSelector selector(true);
 
   // First write linearizes, then reports WANT_WRITE.
-  const SslWriteChunk first = selector.nextChunk(buffer, MaxWrite);
+  const SslWriteChunk first = selector.nextChunk(buffer, MaxSslWriteSize);
   ASSERT_TRUE(first.linearized_);
   selector.onWantWrite(first);
 
@@ -247,9 +246,9 @@ TEST(SslWriteChunkSelectorTest, WantWriteOnLinearizedChunkKeepsHistory) {
   EXPECT_TRUE(retry.linearized_);
 
   // Once it lands, the short remainder takes the escape rather than being copied again.
-  buffer.drain(retry.length_);
   selector.onWriteSucceeded(retry);
-  const SslWriteChunk next = selector.nextChunk(buffer, MaxWrite);
+  buffer.drain(retry.length_);
+  const SslWriteChunk next = selector.nextChunk(buffer, MaxSslWriteSize);
   EXPECT_FALSE(next.linearized_);
   EXPECT_EQ(buffer.frontSlice().len_, next.length_);
 }
@@ -278,7 +277,7 @@ TEST(SslWriteChunkSelectorTest, NoShortRecordWhenTheWriteDrainsTheBuffer) {
   appendSlice(buffer, 200, 1);
   appendSlice(buffer, 2000, 2);
   ASSERT_EQ(2, buffer.getRawSlices().size());
-  ASSERT_LT(buffer.length(), MaxWrite);
+  ASSERT_LT(buffer.length(), MaxSslWriteSize);
 
   // Even with a copy on the previous write, this one covers everything queued, so it linearizes.
   const SslWriteChunk chunk = selectSslWriteChunk(buffer, buffer.length(), true, true);
@@ -301,7 +300,7 @@ TEST(SslWriteChunkSelectorTest, SustainedWantWriteStillCopiesOnce) {
   uint32_t writes = 0;
   while (buffer.length() > 0) {
     const uint64_t bytes_to_write =
-        selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxWrite));
+        selector.pendingLength().value_or(std::min<uint64_t>(buffer.length(), MaxSslWriteSize));
 
     // Attempt: the socket refuses it.
     const void* front_before = buffer.frontSlice().mem_;
@@ -370,9 +369,9 @@ struct Cost {
   uint64_t copied_bytes{0};
 };
 
-Cost costOf(Buffer::Instance& buffer, bool avoid_repeated_linearize) {
+Cost costOf(Buffer::Instance& buffer, bool avoid_repeated_linearize,
+            bool linearized_last_write = false) {
   Cost cost;
-  bool linearized_last_write = false;
   while (buffer.length() > 0) {
     const uint64_t bytes_to_write = nextWriteSize(buffer);
     const SslWriteChunk chunk = selectSslWriteChunk(buffer, bytes_to_write, linearized_last_write,
@@ -413,6 +412,31 @@ TEST(SslWriteChunkTest, UniformFragmentsAreNotWorsened) {
   }
 }
 
+// A slice larger than the write size self-heals on its own: one linearize leaves a remainder that
+// is already contiguous. Splitting a short record off in front of it would shift every record
+// boundary behind it and can cost an extra write - an extra TLS record and an extra writev - to
+// save a single copy. The escape must decline these, including when history carried in from an
+// earlier batch says the last write copied.
+TEST(SslWriteChunkTest, OversizedSecondSliceNeverCostsAnExtraWrite) {
+  for (const uint64_t second : {20000, 24576, 32768, 33000, 40000}) {
+    Buffer::OwnedImpl expected;
+    appendSlice(expected, 200, 1);
+    appendSlice(expected, second, 2);
+    Buffer::OwnedImpl with_guard;
+    appendSlice(with_guard, 200, 1);
+    appendSlice(with_guard, second, 2);
+    Buffer::OwnedImpl without_guard;
+    appendSlice(without_guard, 200, 1);
+    appendSlice(without_guard, second, 2);
+
+    // linearized_last_write starts true, as it would after an earlier batch ended on a copy.
+    const Cost on = costOf(with_guard, true, /*linearized_last_write=*/true);
+    const Cost off = costOf(without_guard, false, /*linearized_last_write=*/true);
+    EXPECT_LE(on.records, off.records) << "second slice " << second;
+    EXPECT_LE(on.copied_bytes, off.copied_bytes) << "second slice " << second;
+  }
+}
+
 // The shape the change targets keeps its full win. The short record costs nothing here: it simply
 // moves the leading fragment to the front of the batch instead of leaving it as a trailing write,
 // so the record count is unchanged and only one copy remains for the whole buffer.
@@ -426,15 +450,15 @@ TEST(SslWriteChunkTest, MisalignedChainKeepsItsWin) {
   const Cost off = costOf(without_guard, false);
   EXPECT_EQ(off.records, on.records);
   // One copy at the start, versus one per full-size slice.
-  EXPECT_EQ(MaxWrite, on.copied_bytes);
-  EXPECT_EQ(16 * MaxWrite, off.copied_bytes);
+  EXPECT_EQ(MaxSslWriteSize, on.copied_bytes);
+  EXPECT_EQ(16 * MaxSslWriteSize, off.copied_bytes);
 }
 
 // An aligned buffer must not be made worse: it never copies and never emits a short record.
 TEST(SslWriteChunkTest, AlignedBufferNeverCopiesOrShortens) {
   Buffer::OwnedImpl buffer;
   for (uint32_t i = 0; i < 4; i++) {
-    appendSlice(buffer, MaxWrite, static_cast<uint8_t>(i));
+    appendSlice(buffer, MaxSslWriteSize, static_cast<uint8_t>(i));
   }
 
   uint32_t writes = 0;
@@ -444,7 +468,7 @@ TEST(SslWriteChunkTest, AlignedBufferNeverCopiesOrShortens) {
         selectSslWriteChunk(buffer, nextWriteSize(buffer), linearized_last_write, true);
     linearized_last_write = chunk.linearized_;
     EXPECT_FALSE(chunk.linearized_);
-    EXPECT_EQ(MaxWrite, chunk.length_);
+    EXPECT_EQ(MaxSslWriteSize, chunk.length_);
     buffer.drain(chunk.length_);
     writes++;
   }
