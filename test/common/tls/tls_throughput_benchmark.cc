@@ -81,10 +81,14 @@ static void testThroughput(benchmark::State& state) {
     RELEASE_ASSERT(flags != -1 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0, "set O_NONBLOCK");
     // Each iteration writes more than the default socket buffer holds on some platforms (notably
     // macOS), which would fail the non-blocking writes below. Size the buffers explicitly so the
-    // benchmark measures the same thing everywhere.
+    // benchmark measures the same thing everywhere. The kernel may grant less than requested, so
+    // this only asserts that the calls were accepted; an undersized grant still shows up as the
+    // SSL_write() assertion below.
     const int buf_size = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    RELEASE_ASSERT(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) == 0,
+                   "setsockopt(SO_SNDBUF)");
+    RELEASE_ASSERT(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) == 0,
+                   "setsockopt(SO_RCVBUF)");
   }
 
   bssl::UniquePtr<SSL_CTX> server_ctx(SSL_CTX_new(TLS_method()));

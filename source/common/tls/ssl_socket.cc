@@ -48,7 +48,10 @@ SslSocket::SslSocket(Envoy::Ssl::ContextSharedPtr ctx,
                      const Network::TransportSocketOptionsConstSharedPtr& transport_socket_options)
     : transport_socket_options_(transport_socket_options),
       ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)),
-      avoid_repeated_linearize_(Runtime::runtimeFeatureEnabled(
+      // Latched here rather than read per write: this is a per-connection object, matching how
+      // other hot-path reloadable guards are handled (e.g. ConnectionManagerImpl), so a runtime
+      // change takes effect on new connections.
+      write_chunk_selector_(Runtime::runtimeFeatureEnabled(
           "envoy.reloadable_features.tls_avoid_repeated_linearize")) {}
 
 absl::Status SslSocket::initialize(InitialState state,
@@ -329,6 +332,19 @@ void SslSocket::drainErrorQueue() {
   }
 }
 
+namespace {
+
+// Whether the slice behind the front one is on its own big enough for the write that would follow
+// a short record, i.e. whether writing just the front slice actually re-aligns the buffer.
+bool nextSliceCoversWrite(Buffer::Instance& write_buffer, uint64_t bytes_to_write) {
+  // getRawSlices() skips empty slices, exactly as frontSlice() does, so index 1 is the slice that
+  // becomes the front once the short record is written and drained.
+  const Buffer::RawSliceVector slices = write_buffer.getRawSlices(/*max_slices=*/2);
+  return slices.size() == 2 && slices[1].len_ >= bytes_to_write;
+}
+
+} // namespace
+
 SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes_to_write,
                                   bool linearized_last_write, bool avoid_repeated_linearize) {
   ASSERT(bytes_to_write > 0 && bytes_to_write <= write_buffer.length());
@@ -339,12 +355,31 @@ SslWriteChunk selectSslWriteChunk(Buffer::Instance& write_buffer, uint64_t bytes
     return {front_slice.mem_, bytes_to_write, false};
   }
 
-  if (avoid_repeated_linearize && linearized_last_write && front_slice.len_ > 0) {
-    // Break the misalignment cycle with one short record. See the header comment.
+  // Only worth a short record if it actually buys the copy-free steady state, which it does only
+  // when the slice behind the front one can satisfy the next write by itself. If the chain is
+  // fragmented more than one slice deep - HTTP/1 chunked framing, small HTTP/2 frames, buffer
+  // fragments - writing the front slice re-aligns nothing, and the short record is pure overhead:
+  // an extra TLS record and an extra writev syscall for the same bytes copied. This also implies
+  // bytes_to_write < write_buffer.length(), so a write that drains the buffer never splits.
+  if (avoid_repeated_linearize && linearized_last_write && front_slice.len_ > 0 &&
+      nextSliceCoversWrite(write_buffer, bytes_to_write)) {
     return {front_slice.mem_, front_slice.len_, false};
   }
 
   return {write_buffer.linearize(bytes_to_write), bytes_to_write, true};
+}
+
+SslWriteChunk SslWriteChunkSelector::nextChunk(Buffer::Instance& write_buffer,
+                                               uint64_t bytes_to_write) {
+  if (pending_.has_value()) {
+    // Repeat the pending write verbatim. Nothing is drained while a write is outstanding and new
+    // data is only ever appended at the back, so the front of the buffer still holds exactly these
+    // bytes at the same address.
+    ASSERT(write_buffer.frontSlice().len_ >= pending_->length_);
+    return {write_buffer.frontSlice().mem_, pending_->length_, pending_->linearized_};
+  }
+  return selectSslWriteChunk(write_buffer, bytes_to_write, linearized_last_write_,
+                             avoid_repeated_linearize_);
 }
 
 Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_stream) {
@@ -357,34 +392,24 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     }
   }
 
-  uint64_t bytes_to_write;
-  if (bytes_to_retry_) {
-    bytes_to_write = bytes_to_retry_;
-    bytes_to_retry_ = 0;
-  } else {
-    bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
-  }
+  // A write that previously returned SSL_ERROR_WANT_WRITE has to be repeated exactly; otherwise
+  // write as much as one TLS record can carry.
+  const uint64_t bytes_wanted = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
+  uint64_t bytes_to_write = write_chunk_selector_.pendingLength().value_or(bytes_wanted);
 
   uint64_t total_bytes_written = 0;
   while (bytes_to_write > 0) {
     // TODO(mattklein123): As it relates to our fairness efforts, we might want to limit the number
     // of iterations of this loop, either by pure iterations, bytes written, etc.
-
-    // SSL_write() requires that if a previous call returns SSL_ERROR_WANT_WRITE, we need to call
-    // it again with the same parameters. This is done by tracking last write size, but not write
-    // data, since the data at the front of the buffer is the same undrained data anyway: nothing
-    // is drained until the write succeeds, and new data is only ever appended at the back.
     ASSERT(bytes_to_write <= write_buffer.length());
-    const SslWriteChunk chunk = selectSslWriteChunk(
-        write_buffer, bytes_to_write, linearized_last_write_, avoid_repeated_linearize_);
-    linearized_last_write_ = chunk.linearized_;
-    bytes_to_write = chunk.length_;
-    int rc = SSL_write(rawSsl(), chunk.data_, bytes_to_write);
+    const SslWriteChunk chunk = write_chunk_selector_.nextChunk(write_buffer, bytes_to_write);
+    int rc = SSL_write(rawSsl(), chunk.data_, chunk.length_);
     ENVOY_CONN_LOG(trace, "ssl write returns: {}", callbacks_->connection(), rc);
     if (rc > 0) {
-      ASSERT(rc == static_cast<int>(bytes_to_write));
+      ASSERT(rc == static_cast<int>(chunk.length_));
       total_bytes_written += rc;
       write_buffer.drain(rc);
+      write_chunk_selector_.onWriteSucceeded(chunk);
       bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
     } else {
       int err = SSL_get_error(rawSsl(), rc);
@@ -392,7 +417,7 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
                      Utility::getErrorDescription(err));
       switch (err) {
       case SSL_ERROR_WANT_WRITE:
-        bytes_to_retry_ = bytes_to_write;
+        write_chunk_selector_.onWantWrite(chunk);
         break;
       case SSL_ERROR_WANT_READ:
       // Renegotiation has started. We don't handle renegotiation so just fall through.
