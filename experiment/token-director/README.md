@@ -242,7 +242,7 @@ python3 -m venv .venv && .venv/bin/pip install grpcio grpcio-tools protobuf open
 ./run.sh up              # Director + both proxies
 ./run.sh demo            # all four dialects, JSON and SSE, through the DFP hop
 ./run.sh tunnel          # the same, through the extra hop
-./run.sh ledger          # what the Director recorded
+./run.sh report          # everything below in one pass
 ./run.sh down
 ```
 
@@ -253,6 +253,30 @@ Useful variations:
 ./run.sh demo --provider openai --max-tokens 2000 --repeat 5   # walk into the budget
 BUDGET=500 ./run.sh up                                         # make denials easy to trigger
 ```
+
+### Reading the results
+
+| command | shows |
+|---|---|
+| `./run.sh ledger` | per-request accounting, per-model and per-hop totals, and how the admission estimate scored against actual usage |
+| `./run.sh access` | Envoy's access logs from both proxies — and, deliberately, the two typed fields that render `null` next to the ledger that doesn't |
+| `./run.sh stats` | filter counters split by instance (downstream request side vs. upstream response side) and the ext_proc traffic to the Director |
+| `./run.sh report` | all three |
+| `./run.sh director [n]` | tail the Director's admit/settle log |
+| `./run.sh logs [n]` | tail every process log |
+
+`stats` is where the design claim gets checked. The request-side counters only
+ever move on the downstream instance and the response-side ones only on the
+upstream (`cluster.*`) instance — which is the ordering argument, visible as
+numbers. And the last line reports bytes-per-request to the Director:
+
+```
+dfp: 1396 bytes per request to the Director -- flat, no body in either direction
+```
+
+Flat is the point. It does not grow with prompt or generation size, because
+neither ever crosses the gRPC boundary. Switch `response_body_mode` to
+`STREAMED` and watch that number track the size of the response instead.
 
 Logs land in `/tmp/token-director/`: `director.log`, `envoy-dfp.log`,
 `envoy-tunnel.log`, the two access logs, and `ledger.jsonl`.

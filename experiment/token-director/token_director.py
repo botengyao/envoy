@@ -182,6 +182,8 @@ class TokenDirector(ep_grpc.ExternalProcessorServicer):
         # Worst case for this request: everything it may consume.
         estimate = estimated_input + max_output
         state["estimate"] = estimate
+        state["estimated_input"] = estimated_input
+        state["max_output"] = max_output
 
         admitted, headroom = self._budget.reserve(info.model, estimate)
         if not admitted:
@@ -248,6 +250,8 @@ class TokenDirector(ep_grpc.ExternalProcessorServicer):
             "api_protocol": PROTOCOL_NAMES.get(usage.api_protocol, str(usage.api_protocol)),
             "streaming": state["streaming"],
             "estimated_total": state["estimate"],
+            "estimated_input_tokens": state.get("estimated_input", 0),
+            "requested_max_output_tokens": state.get("max_output", 0),
             "input_tokens": actual_in,
             "output_tokens": actual_out,
             "total_tokens": actual_total,
