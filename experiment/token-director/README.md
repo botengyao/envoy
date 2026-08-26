@@ -93,8 +93,10 @@ routes — the provider comes from the Host header, not from configuration. The
 `dfp_passthrough` route is that shape: `prefix: "/"`, no `typed_per_filter_config`
 of any kind.
 
-`request_info.include_unconfigured_routes: true` makes it work anyway, by
-detecting the dialect from the request target. Verified live:
+`request_info.include_unconfigured_routes: true` brings that route into scope,
+and the wire API then resolves the same way the response side resolves it —
+per-route declaration, then `default_api_protocol`, then detection from the
+request. Here nothing is declared, so detection decides. Verified live:
 
 ```bash
 curl http://127.0.0.1:10000/v1/chat/completions \
@@ -106,6 +108,14 @@ curl http://127.0.0.1:10000/v1/chat/completions \
 [   dfp] #1 settle  gpt-4o-mini  in=12 out=2 total=14 (complete)
 
 ai_protocol_manager.request_info_protocol_detected: 1
+```
+
+The same undeclared route handles Gemini too — `:generateContent` in the
+target, model read out of the path:
+
+```
+[   dfp] #2 admit   gemini-3.6-flash  reserved 43 (est_in=11, max_out=32)
+[   dfp] #2 settle  gemini-3.6-flash  in=6 out=0 total=6 (complete)
 ```
 
 Detection only fills a gap: run the declared routes afterwards and

@@ -18,13 +18,16 @@ payload string lengths, including those of values offloaded out of the parsed
 document, so a large prompt is measured without being read.
 :ref:`request_info.include_unconfigured_routes
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.include_unconfigured_routes>`
-extends publication to routes that declare no wire API, detecting it from the
-request target (and, as a fallback, from unambiguous payload markers) so that a
-dynamic-forward-proxy egress listener can publish without per-route
-configuration. Detection names the dialect a record is read with and nothing
-else: a route's own declaration always wins, schema validation still runs only
-against a declared API, and an unconfigured route is never failed over its
-payload.
+extends publication to routes carrying no per-route configuration, so a
+dynamic-forward-proxy egress listener can publish without declaring routes, and
+the wire API a record is read with now resolves in the same precedence order
+the response side uses: per-route ``request.api_protocol``, then
+:ref:`request_info.default_api_protocol
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.default_api_protocol>`,
+then detection from the request target (and, as a fallback, from unambiguous
+payload markers). Resolution names the dialect a record is read with and
+nothing else: schema validation still runs only against a wire API the route
+declared, and an unconfigured route is never failed over its payload.
 Setting :ref:`token_usage.usage_signal
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.usage_signal>`
 to ``SYNTHESIZE_TRAILERS`` adds empty response trailers at a clean end of

@@ -183,31 +183,37 @@ the model and a cost bound without being sent the body:
           typed:
           - envoy.ai.request_info
 
-Only a route that declares its wire API produces a record, because reading a
-payload requires knowing its dialect and the request path has no
-auto-detection by default. :ref:`include_unconfigured_routes
+Two separate questions decide whether a record appears: which routes are
+inspected, and which wire API the payload is read with.
+
+**Route scoping.** By default only routes carrying a per-route configuration
+are inspected. :ref:`include_unconfigured_routes
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.include_unconfigured_routes>`
 widens that to routes that declare nothing — the deployment shape a
 dynamic-forward-proxy egress listener has, where the provider comes from the
-request rather than from configuration:
+request rather than from configuration. Such a route is parsed best-effort, as
+with ``parse_unconfigured_routes``, and never failed over its payload.
+
+**Wire API resolution**, in the same precedence order the encode path uses:
+per-route ``request.api_protocol``, then :ref:`default_api_protocol
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.default_api_protocol>`,
+then detection from the request. Detection reads the target first — every
+supported API names its operation in the path — and the payload only as a
+fallback for gateways that rewrite the path away. Only unambiguous markers
+decide: a ``messages`` array with nothing to separate OpenAI from Anthropic
+publishes nothing rather than guessing.
 
 .. code-block:: yaml
 
   request_handling:
     request_info:
-      include_unconfigured_routes: true
+      include_unconfigured_routes: true   # inspect DFP routes
+      # default_api_protocol: OPENAI_CHAT_COMPLETIONS   # or pin it, skipping detection
 
-Such a route is parsed best-effort (as with ``parse_unconfigured_routes``) and
-its dialect is detected from the request: the target first — every dialect here
-names its operation in the path — and the payload only as a fallback for
-gateways that rewrite the path away. Only unambiguous markers decide; a
-``messages`` array with nothing to separate OpenAI from Anthropic publishes
-nothing rather than guessing.
-
-Detection never decides what a payload *is*. A route's own declaration always
-wins, schema validation continues to run only against a wire API the route
-declared, and an unconfigured route is never failed over its payload — so a
-detected dialect can name a record but can never reject a request.
+Neither the fallback nor detection can decide what a payload *is*. Schema
+validation runs only against a wire API the *route* declared, and an
+unconfigured route is never failed over its payload — so a resolved dialect
+can name a record but can never reject a request.
 
 ``estimated_input_tokens`` is an admission bound, not an accounting figure. It
 is measured from the byte length of the payload's prompt-bearing text — string

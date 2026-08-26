@@ -154,6 +154,8 @@ FilterConfig::FilterConfig(
                                   : proto.request_handling().request_info().metadata_namespace()),
       request_info_unconfigured_routes_(
           proto.request_handling().request_info().include_unconfigured_routes()),
+      request_info_default_protocol_(
+          protocolFromProto(proto.request_handling().request_info().default_api_protocol())),
       token_usage_enabled_(proto.response_handling().has_token_usage()),
       synthesize_usage_trailers_(proto.response_handling().token_usage().usage_signal() ==
                                  envoy::extensions::filters::http::ai_protocol_manager::v3::
@@ -326,12 +328,18 @@ void AiProtocolManagerFilter::publishRequestInfo() {
     path = headers->getPathValue();
   }
 
-  // The route's declaration wins. Detection fills in only where the route
-  // named no API, and only for reading this record: route_request_protocol_ is
-  // left alone, so schema validation -- which already ran, against the route's
-  // own declaration -- can never act on a detected dialect.
-  ApiProtocol protocol = route_request_protocol_;
-  if (protocol == ApiProtocol::Unspecified && config_->requestInfoUnconfiguredRoutes()) {
+  // The wire API to read the record with, in precedence order: the route's
+  // declared request API, the configured fallback, then detection from the
+  // request itself. Mirrors the encode path's resolution.
+  //
+  // route_request_protocol_ is deliberately left alone throughout: schema
+  // validation -- which already ran, against the route's own declaration --
+  // must never be able to act on a fallback or a detected dialect.
+  ApiProtocol protocol = config_->requestInfoDefaultProtocol();
+  if (route_request_protocol_ != ApiProtocol::Unspecified) {
+    protocol = route_request_protocol_;
+  }
+  if (protocol == ApiProtocol::Unspecified) {
     protocol = AdapterRegistry::detectRequest(path, request_json_.json());
     if (protocol != ApiProtocol::Unspecified) {
       config_->stats().request_info_protocol_detected_.inc();

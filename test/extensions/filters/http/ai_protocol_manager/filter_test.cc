@@ -174,7 +174,9 @@ public:
 
   // Rebuilds the filter with request-info publication enabled.
   void createPublishingFilter(const std::string& metadata_namespace = "",
-                              bool include_unconfigured_routes = false) {
+                              bool include_unconfigured_routes = false,
+                              envoy::type::ai::v3::ApiProtocol default_protocol =
+                                  envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED) {
     if (filter_ != nullptr) {
       filter_->onDestroy();
     }
@@ -184,6 +186,7 @@ public:
       request_info->set_metadata_namespace(metadata_namespace);
     }
     request_info->set_include_unconfigured_routes(include_unconfigured_routes);
+    request_info->set_default_api_protocol(default_protocol);
     config_ = std::make_shared<const FilterConfig>(proto, *stats_store_.rootScope());
     filter_ = std::make_unique<AiProtocolManagerFilter>(factory_, config_);
     filter_->setDecoderFilterCallbacks(callbacks_);
@@ -303,14 +306,48 @@ TEST_F(AiProtocolManagerFilterRequestInfoTest, CustomNamespace) {
   EXPECT_TRUE(singleTypedWrite("acme.ai.request").has_value());
 }
 
-// A route that declared no wire API has no dialect to read the payload
-// against, so nothing is published -- publication never guesses.
-TEST_F(AiProtocolManagerFilterRequestInfoTest, UndeclaredRoutePublishesNothing) {
+// A route that declares itself an AI endpoint without naming an API falls
+// through to detection, the same way the encode path does -- no opt-in
+// needed, because the route was configured, it just left the dialect open.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, UndeclaredApiFallsThroughToDetection) {
   createPublishingFilter();
   setRouteProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
-  sendPayload(R"({"model":"gpt-4o-mini","messages":[{"content":"hi"}]})");
-  EXPECT_TRUE(typed_metadata_writes_.empty());
-  EXPECT_EQ(counterValue("request_info_empty"), 1);
+  setPath("/v1/chat/completions");
+  sendPayload(R"({"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 1);
+}
+
+// The configured fallback sits between the route and detection: it is used
+// when the route named no API...
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DefaultProtocolUsedWhenRouteIsSilent) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true,
+                         envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  // A target that would detect as OpenAI, to prove the fallback beats it.
+  setPath("/v1/chat/completions");
+  sendPayload(R"({"model":"claude-haiku-4-5","max_tokens":32,)"
+              R"("messages":[{"role":"user","content":"hi"}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 0);
+}
+
+// ...and is itself beaten by the route's own declaration.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, RouteDeclarationBeatsDefaultProtocol) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/false,
+                         envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  sendPayload(R"({"model":"gpt-4o-mini","max_tokens":64,)"
+              R"("messages":[{"role":"user","content":"hi"}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
 }
 
 // With include_unconfigured_routes, a route that declared nothing still gets a

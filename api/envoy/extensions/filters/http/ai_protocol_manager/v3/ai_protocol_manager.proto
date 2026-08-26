@@ -79,31 +79,46 @@ message RequestHandling {
 // ``metadata_context`` on its ``request_headers`` message, instead of being
 // sent the body to parse again.
 //
-// By default only routes whose declared wire API is known produce a record;
-// :ref:`include_unconfigured_routes
-// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.include_unconfigured_routes>`
-// widens that to routes whose dialect is detected from the request.
+// Which routes are inspected is controlled by :ref:`include_unconfigured_routes
+// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.include_unconfigured_routes>`;
+// which wire API a record is read with resolves in precedence order:
+// per-route ``request.api_protocol``, then :ref:`default_api_protocol
+// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.default_api_protocol>`,
+// then detection from the request itself.
 message RequestInfoPublication {
   // Namespace for the emitted typed dynamic metadata.
   // Defaults to ``envoy.ai.request_info``.
   string metadata_namespace = 1;
 
   // Also publish on routes without a per-route request declaration, parsing
-  // their payload best-effort and detecting the wire API from the request
-  // itself.
+  // their payload best-effort.
   //
-  // Defaults to ``false``: only routes that declare their API produce a
-  // record. Enable this for installations whose routes cannot be declared --
-  // a dynamic-forward-proxy egress listener, where the provider is chosen
-  // from the request rather than from configuration.
+  // Defaults to ``false``: only routes carrying an
+  // :ref:`AiProtocolManagerPerRoute
+  // <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`
+  // configuration are inspected. Enable this for installations whose routes
+  // cannot be declared -- a dynamic-forward-proxy egress listener, where the
+  // provider is chosen from the request rather than from configuration.
   //
-  // Detection reads the request target first and the payload only as a
-  // fallback, and never decides anything but which dialect a record is read
-  // with: an unconfigured route is parsed best-effort, so a payload the
-  // filter cannot detect -- or cannot parse -- is forwarded unchanged rather
-  // than rejected. Schema validation continues to run only against a wire API
-  // the *route* declared, never a detected one.
+  // This is route scoping only; it does not decide how the wire API is
+  // resolved. Such a route is parsed best-effort and never failed over its
+  // payload, so a body that does not parse is forwarded unchanged.
   bool include_unconfigured_routes = 2;
+
+  // Fallback wire API used when the route does not declare one.
+  //
+  // ``API_PROTOCOL_UNSPECIFIED`` means auto-detect from the request: the
+  // target first -- every supported API names its operation in the path --
+  // and the payload only as a fallback, where just unambiguous markers
+  // decide. This is a fallback, not an override of the per-route
+  // declaration; the full precedence is per-route ``request.api_protocol``,
+  // then ``default_api_protocol``, then detection.
+  //
+  // Neither the fallback nor detection can decide what a payload *is*:
+  // schema validation runs only against a wire API the *route* declared, so
+  // a request on an undeclared route is never rejected over a resolved
+  // dialect.
+  type.ai.v3.ApiProtocol default_api_protocol = 3 [(validate.rules).enum = {defined_only: true}];
 }
 
 // Response-side processing configuration. Individual response features are
