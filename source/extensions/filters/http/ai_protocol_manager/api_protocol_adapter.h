@@ -132,6 +132,22 @@ public:
   // markers decide; anything else stays Unspecified for a later document.
   // Marker checks are ordered from most to least structurally distinctive.
   static ApiProtocol detect(const nlohmann::json& json);
+
+  // Detect the API dialect a *request* speaks, from its target and payload.
+  //
+  // Unlike response detection this is never used to decide what a payload
+  // *is* for validation -- a request the filter guesses wrong about could be
+  // rejected, and a guess must not be able to fail a request. It only names a
+  // dialect for reading a record out of an already-accepted payload, on a
+  // route that declared none.
+  //
+  // The target is the primary signal and is checked first: request paths are
+  // far more distinctive than request bodies, and every dialect here
+  // addresses its operation in the path. Body markers are a fallback for
+  // gateways that rewrite the path away, and only unambiguous ones decide --
+  // `messages` alone is shared by OpenAI and Anthropic and resolves to
+  // Unspecified rather than a coin flip.
+  static ApiProtocol detectRequest(absl::string_view path, const nlohmann::json& json);
 };
 
 // Canonicalizes a finalized accumulation with its own protocol's adapter --

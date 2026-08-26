@@ -152,6 +152,8 @@ FilterConfig::FilterConfig(
       request_info_namespace_(proto.request_handling().request_info().metadata_namespace().empty()
                                   ? std::string(DefaultRequestInfoNamespace)
                                   : proto.request_handling().request_info().metadata_namespace()),
+      request_info_unconfigured_routes_(
+          proto.request_handling().request_info().include_unconfigured_routes()),
       token_usage_enabled_(proto.response_handling().has_token_usage()),
       synthesize_usage_trailers_(proto.response_handling().token_usage().usage_signal() ==
                                  envoy::extensions::filters::http::ai_protocol_manager::v3::
@@ -223,8 +225,15 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // TODO(penguingao): on a best-effort parse failure, release the held headers
   // and buffered body immediately and pass the remainder through unbuffered,
   // rather than buffering to end-of-stream.
+  // Publishing on unconfigured routes needs a parsed payload, so it opts into
+  // the same best-effort parse: engaged for JSON, never failed over. The
+  // content-type gate is what keeps full-duplex protocols out of the held-
+  // headers path, so it applies to both opt-ins alike.
+  const bool parse_unconfigured =
+      config_->parseUnconfiguredRoutes() ||
+      (config_->requestInfoEnabled() && config_->requestInfoUnconfiguredRoutes());
   if (!isAiEndpoint() &&
-      (!config_->parseUnconfiguredRoutes() || !isJsonContentType(headers.getContentTypeValue()))) {
+      (!parse_unconfigured || !isJsonContentType(headers.getContentTypeValue()))) {
     // Nothing will look at this payload, so stay out of the way: offloading it
     // would cost a store round-trip and withhold the headers meanwhile, for
     // nothing. Decided once here; decode_manager_ being null carries it.
@@ -317,8 +326,21 @@ void AiProtocolManagerFilter::publishRequestInfo() {
     path = headers->getPathValue();
   }
 
+  // The route's declaration wins. Detection fills in only where the route
+  // named no API, and only for reading this record: route_request_protocol_ is
+  // left alone, so schema validation -- which already ran, against the route's
+  // own declaration -- can never act on a detected dialect.
+  ApiProtocol protocol = route_request_protocol_;
+  if (protocol == ApiProtocol::Unspecified && config_->requestInfoUnconfiguredRoutes()) {
+    protocol = AdapterRegistry::detectRequest(path, request_json_.json());
+    if (protocol != ApiProtocol::Unspecified) {
+      config_->stats().request_info_protocol_detected_.inc();
+      ENVOY_LOG(trace, "ai_protocol_manager: detected request API {}", apiProtocolName(protocol));
+    }
+  }
+
   const RequestInfo info =
-      AdapterRegistry::get(route_request_protocol_).extractRequestInfo(request_json_.json(), path);
+      AdapterRegistry::get(protocol).extractRequestInfo(request_json_.json(), path);
   if (!info.hasAny()) {
     // An undeclared route resolves to the no-op adapter, and a payload that
     // declares nothing this dialect names reads as empty. Either way there is

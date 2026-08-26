@@ -883,6 +883,62 @@ TEST(RequestInfoTest, UnspecifiedProtocolExtractsNothing) {
 }
 
 // ---------------------------------------------------------------------------
+// Request dialect detection.
+
+ApiProtocol detectRequest(absl::string_view path, const std::string& json = "{}") {
+  return AdapterRegistry::detectRequest(path, parse(json));
+}
+
+TEST(DetectRequestTest, TargetDecidesEveryDialect) {
+  EXPECT_EQ(detectRequest("/v1/chat/completions"), ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(detectRequest("/v1/responses"), ApiProtocol::OpenAiResponses);
+  EXPECT_EQ(detectRequest("/v1/messages"), ApiProtocol::AnthropicMessages);
+  EXPECT_EQ(detectRequest("/v1beta/models/gemini-3.6-flash:generateContent"),
+            ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(detectRequest("/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse"),
+            ApiProtocol::GeminiGenerateContent);
+  // A gateway prefix ahead of the provider path does not disturb the suffix.
+  EXPECT_EQ(detectRequest("/openai/v1/chat/completions"), ApiProtocol::OpenAiChatCompletions);
+}
+
+TEST(DetectRequestTest, TargetMatchesOnSuffixNotSubstring) {
+  // A prefix that merely contains another dialect's operation must not decide
+  // the dialect of the operation actually being called.
+  EXPECT_EQ(detectRequest("/messages/v1/chat/completions"), ApiProtocol::OpenAiChatCompletions);
+  // ...and a path that only contains the word mid-way names nothing.
+  EXPECT_EQ(detectRequest("/messages/send"), ApiProtocol::Unspecified);
+}
+
+TEST(DetectRequestTest, BodyFallbackWhenTargetIsSilent) {
+  EXPECT_EQ(detectRequest("/proxy", R"({"contents": [{"parts": [{"text": "hi"}]}]})"),
+            ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(detectRequest("/proxy", R"({"messages": [{"role": "user"}], )"
+                                    R"("max_completion_tokens": 10})"),
+            ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(detectRequest("/proxy", R"({"messages": [{"role": "user"}], "system": "be terse"})"),
+            ApiProtocol::AnthropicMessages);
+  EXPECT_EQ(detectRequest("/proxy", R"({"input": "what is 2+2", "model": "gpt-4o-mini"})"),
+            ApiProtocol::OpenAiResponses);
+}
+
+TEST(DetectRequestTest, AmbiguousBodyDecidesNothing) {
+  // `messages` alone is shared by OpenAI and Anthropic. Guessing here would be
+  // a coin flip, so the record is simply not read.
+  EXPECT_EQ(detectRequest("/proxy", R"({"model": "x", "messages": [{"role": "user"}]})"),
+            ApiProtocol::Unspecified);
+  EXPECT_EQ(detectRequest("/proxy", R"({"model": "x", "messages": [], "system": "s"})"),
+            ApiProtocol::Unspecified);
+}
+
+TEST(DetectRequestTest, WeaklyShapedBodyDecidesNothing) {
+  EXPECT_EQ(detectRequest("", "{}"), ApiProtocol::Unspecified);
+  // Scalars of the right name are not the right shape.
+  EXPECT_EQ(detectRequest("/proxy", R"({"contents": "hi"})"), ApiProtocol::Unspecified);
+  EXPECT_EQ(detectRequest("/proxy", R"({"messages": "hi", "system": "s"})"),
+            ApiProtocol::Unspecified);
+}
+
+// ---------------------------------------------------------------------------
 // The estimator itself.
 
 TEST(EstimateInputTokensTest, RoundsUpAndAddsFraming) {

@@ -420,6 +420,68 @@ bool isOpenAiResponsesTerminalEventType(absl::string_view event_type) {
 // checks are ordered from most to least structurally distinctive across
 // dialects, and that cross-adapter ordering is part of the detection
 // contract.
+namespace {
+
+// Whether a member is a non-empty array -- the shape every "list of turns"
+// member in these dialects actually has, so a scalar of the same name cannot
+// decide a dialect.
+bool isNonEmptyArray(const nlohmann::json& json, const std::string& key) {
+  const auto it = json.find(key);
+  return it != json.end() && it->is_array() && !it->empty();
+}
+
+bool hasMember(const nlohmann::json& json, const std::string& key) {
+  return json.find(key) != json.end();
+}
+
+} // namespace
+
+ApiProtocol AdapterRegistry::detectRequest(absl::string_view path, const nlohmann::json& json) {
+  // Target first. Every dialect here names its operation in the path, and a
+  // path is not attacker-shaped the way a body is.
+  const absl::string_view target = path.substr(0, path.find('?'));
+  if (absl::StrContains(target, ":generateContent") ||
+      absl::StrContains(target, ":streamGenerateContent")) {
+    return ApiProtocol::GeminiGenerateContent;
+  }
+  // Suffix, not substring: a gateway prefix that happens to contain
+  // "/messages" must not decide the dialect of the operation being called.
+  if (absl::EndsWith(target, "/chat/completions")) {
+    return ApiProtocol::OpenAiChatCompletions;
+  }
+  if (absl::EndsWith(target, "/responses")) {
+    return ApiProtocol::OpenAiResponses;
+  }
+  if (absl::EndsWith(target, "/messages")) {
+    return ApiProtocol::AnthropicMessages;
+  }
+
+  // Body fallback, for a gateway that rewrote the path away. Only markers
+  // exclusive to one dialect decide.
+  if (isNonEmptyArray(json, JsonKeys::get().Contents)) {
+    return ApiProtocol::GeminiGenerateContent;
+  }
+  if (isNonEmptyArray(json, JsonKeys::get().Messages)) {
+    // `messages` is shared; the discriminator has to be something only one
+    // dialect defines.
+    if (hasMember(json, JsonKeys::get().MaxCompletionTokens)) {
+      return ApiProtocol::OpenAiChatCompletions;
+    }
+    // Anthropic carries the system prompt as a top-level member; OpenAI puts
+    // it in a `messages` entry.
+    if (hasMember(json, JsonKeys::get().System)) {
+      return ApiProtocol::AnthropicMessages;
+    }
+    // Shared shape with no discriminator: a guess here would be a coin flip.
+    return ApiProtocol::Unspecified;
+  }
+  // The Responses API is the only dialect whose turns live under `input`.
+  if (hasMember(json, JsonKeys::get().Input) && !hasMember(json, JsonKeys::get().Messages)) {
+    return ApiProtocol::OpenAiResponses;
+  }
+  return ApiProtocol::Unspecified;
+}
+
 ApiProtocol AdapterRegistry::detect(const nlohmann::json& json) {
   // Gemini markers, validated by value shape: a foreign document with e.g. a
   // `candidates` *string* must not lock the stream. Real candidates lists are

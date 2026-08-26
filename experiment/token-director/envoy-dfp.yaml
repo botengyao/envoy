@@ -133,6 +133,17 @@ static_resources:
                     request: {api_protocol: GEMINI_GENERATE_CONTENT}
                     response: {api_protocol: GEMINI_GENERATE_CONTENT}
 
+              # A true dynamic-forward-proxy route: no per-route configuration
+              # at all, the provider chosen by the Host header the client sent.
+              # This is the shape the registry filter would leave behind, and
+              # what request_info.include_unconfigured_routes exists for --
+              # the dialect is detected from the request instead of declared.
+              - name: dfp_passthrough
+                match: {prefix: "/"}
+                route:
+                  cluster: dfp_egress
+                  timeout: 300s
+
           http_filters:
           - name: envoy.filters.http.mcp
             typed_config:
@@ -153,7 +164,11 @@ static_resources:
               # path this instance would run after ext_proc and be useless to
               # it (see the header comment).
               request_handling:
-                request_info: {}
+                request_info:
+                  # Needed by the dfp_passthrough route above, which declares
+                  # no wire API. The four declared routes are unaffected: a
+                  # route's own declaration always wins over detection.
+                  include_unconfigured_routes: true
 
           - name: envoy.filters.http.ext_proc
             typed_config:

@@ -183,6 +183,32 @@ the model and a cost bound without being sent the body:
           typed:
           - envoy.ai.request_info
 
+Only a route that declares its wire API produces a record, because reading a
+payload requires knowing its dialect and the request path has no
+auto-detection by default. :ref:`include_unconfigured_routes
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.include_unconfigured_routes>`
+widens that to routes that declare nothing — the deployment shape a
+dynamic-forward-proxy egress listener has, where the provider comes from the
+request rather than from configuration:
+
+.. code-block:: yaml
+
+  request_handling:
+    request_info:
+      include_unconfigured_routes: true
+
+Such a route is parsed best-effort (as with ``parse_unconfigured_routes``) and
+its dialect is detected from the request: the target first — every dialect here
+names its operation in the path — and the payload only as a fallback for
+gateways that rewrite the path away. Only unambiguous markers decide; a
+``messages`` array with nothing to separate OpenAI from Anthropic publishes
+nothing rather than guessing.
+
+Detection never decides what a payload *is*. A route's own declaration always
+wins, schema validation continues to run only against a wire API the route
+declared, and an unconfigured route is never failed over its payload — so a
+detected dialect can name a record but can never reject a request.
+
 ``estimated_input_tokens`` is an admission bound, not an accounting figure. It
 is measured from the byte length of the payload's prompt-bearing text — string
 values offloaded out of the parsed document contribute their recorded length,
@@ -483,7 +509,8 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   :widths: 1, 1, 2
 
   request_info_published, Counter, A parsed request payload yielded a record and request-info metadata was written.
-  request_info_empty, Counter, "A parsed request payload yielded nothing to publish (an undeclared route, or a payload declaring none of the dialect's fields)."
+  request_info_empty, Counter, "A parsed request payload yielded nothing to publish (an undeclared or undetected route, or a payload declaring none of the dialect's fields)."
+  request_info_protocol_detected, Counter, The wire API for a request-info record was detected rather than declared by the route."
   usage_trailers_synthesized, Counter, End-of-stream trailers were added to carry a published usage record to a trailer-driven consumer.
   token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).
   token_usage_partial, Counter, A published record was flagged ``extraction_status: PARTIAL``.

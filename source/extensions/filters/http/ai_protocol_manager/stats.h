@@ -13,6 +13,7 @@ namespace AiProtocolManager {
 #define ALL_AI_PROTOCOL_MANAGER_STATS(COUNTER)                                                     \
   COUNTER(request_info_published)                                                                  \
   COUNTER(request_info_empty)                                                                      \
+  COUNTER(request_info_protocol_detected)                                                          \
   COUNTER(usage_trailers_synthesized)                                                              \
   COUNTER(token_usage_found)                                                                       \
   COUNTER(token_usage_partial)                                                                     \

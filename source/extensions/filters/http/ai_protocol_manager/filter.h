@@ -79,6 +79,7 @@ public:
   bool parseUnconfiguredRoutes() const { return parse_unconfigured_routes_; }
   bool requestInfoEnabled() const { return request_info_enabled_; }
   const std::string& requestInfoNamespace() const { return request_info_namespace_; }
+  bool requestInfoUnconfiguredRoutes() const { return request_info_unconfigured_routes_; }
   bool tokenUsageEnabled() const { return token_usage_enabled_; }
   bool synthesizeUsageTrailers() const { return synthesize_usage_trailers_; }
   bool includeUnconfiguredRoutes() const { return include_unconfigured_routes_; }
@@ -97,6 +98,7 @@ private:
   const bool parse_unconfigured_routes_ = false;
   const bool request_info_enabled_ = false;
   const std::string request_info_namespace_;
+  const bool request_info_unconfigured_routes_ = false;
   const bool token_usage_enabled_ = false;
   const bool synthesize_usage_trailers_ = false;
   const bool include_unconfigured_routes_ = false;

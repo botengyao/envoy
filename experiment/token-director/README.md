@@ -85,6 +85,35 @@ A prompt large enough to be offloaded is not in the DOM at all — it rides as a
 external reference carrying its length — so a multi-megabyte prompt is measured
 without reading a byte of it.
 
+## Declared routes vs. a true DFP catch-all
+
+The four provider routes declare their wire API, which is what lets the filter
+read a request payload at all. But a real DFP egress listener has no such
+routes — the provider comes from the Host header, not from configuration. The
+`dfp_passthrough` route is that shape: `prefix: "/"`, no `typed_per_filter_config`
+of any kind.
+
+`request_info.include_unconfigured_routes: true` makes it work anyway, by
+detecting the dialect from the request target. Verified live:
+
+```bash
+curl http://127.0.0.1:10000/v1/chat/completions \
+  -H "Host: api.openai.com" -H "authorization: Bearer $OPENAI_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}'
+
+[   dfp] #1 admit   gpt-4o-mini  reserved 43 (est_in=11, max_out=32)
+[   dfp] #1 settle  gpt-4o-mini  in=12 out=2 total=14 (complete)
+
+ai_protocol_manager.request_info_protocol_detected: 1
+```
+
+Detection only fills a gap: run the declared routes afterwards and
+`request_info_published` climbs while `request_info_protocol_detected` stays
+put. And it can only name a record, never reject a request — an unconfigured
+route is parsed best-effort, and schema validation still runs solely against a
+wire API the route itself declared.
+
 ## Getting the record to ext_proc
 
 `ext_proc` rebuilds `metadata_context` on **every** message it sends

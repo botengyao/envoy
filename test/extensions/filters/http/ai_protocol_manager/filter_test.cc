@@ -173,7 +173,8 @@ public:
   }
 
   // Rebuilds the filter with request-info publication enabled.
-  void createPublishingFilter(const std::string& metadata_namespace = "") {
+  void createPublishingFilter(const std::string& metadata_namespace = "",
+                              bool include_unconfigured_routes = false) {
     if (filter_ != nullptr) {
       filter_->onDestroy();
     }
@@ -182,6 +183,7 @@ public:
     if (!metadata_namespace.empty()) {
       request_info->set_metadata_namespace(metadata_namespace);
     }
+    request_info->set_include_unconfigured_routes(include_unconfigured_routes);
     config_ = std::make_shared<const FilterConfig>(proto, *stats_store_.rootScope());
     filter_ = std::make_unique<AiProtocolManagerFilter>(factory_, config_);
     filter_->setDecoderFilterCallbacks(callbacks_);
@@ -309,6 +311,87 @@ TEST_F(AiProtocolManagerFilterRequestInfoTest, UndeclaredRoutePublishesNothing) 
   sendPayload(R"({"model":"gpt-4o-mini","messages":[{"content":"hi"}]})");
   EXPECT_TRUE(typed_metadata_writes_.empty());
   EXPECT_EQ(counterValue("request_info_empty"), 1);
+}
+
+// With include_unconfigured_routes, a route that declared nothing still gets a
+// record: the dialect is detected from the request target.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DetectsDialectOnUnconfiguredRoute) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true);
+  setPath("/v1/chat/completions");
+  sendPayload(R"({"model":"gpt-4o-mini","max_tokens":64,)"
+              R"("messages":[{"role":"user","content":"hi"}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(typed->model(), "gpt-4o-mini");
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 1);
+  EXPECT_EQ(counterValue("request_info_published"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DetectsGeminiOnUnconfiguredRoute) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true);
+  setPath("/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse");
+  sendPayload(R"({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  EXPECT_EQ(typed->model(), "gemini-3.6-flash");
+  EXPECT_TRUE(typed->streaming());
+}
+
+// The route's own declaration always wins; detection only fills a gap.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, RouteDeclarationBeatsDetection) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true);
+  setRouteProtocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  // A target that would detect as OpenAI if detection were consulted.
+  setPath("/v1/chat/completions");
+  sendPayload(R"({"model":"claude-haiku-4-5","max_tokens":32,)"
+              R"("messages":[{"role":"user","content":"hi"}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 0);
+}
+
+// The safety property: a detected dialect names a record, it never decides
+// what a payload *is*. This body violates the OpenAI Chat Completions schema
+// (no role), and the target detects as that dialect -- but the route declared
+// nothing, so the request is forwarded unchanged rather than rejected.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DetectionNeverRejectsARequest) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true);
+  setPath("/v1/chat/completions");
+  sendPayload(R"({"model":"gpt-4o-mini","messages":[{"content":"no role here"}]})");
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_GT(inject_calls_, 0); // the payload was replayed, not dropped
+  EXPECT_EQ(counterValue("request_info_published"), 1);
+}
+
+// A payload that no marker identifies publishes nothing, rather than being
+// read against a guessed dialect.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, UndetectableRequestPublishesNothing) {
+  createPublishingFilter("", /*include_unconfigured_routes=*/true);
+  setPath("/some/gateway/path");
+  sendPayload(R"({"model":"x","messages":[{"role":"user","content":"hi"}]})");
+
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 0);
+  EXPECT_EQ(counterValue("request_info_empty"), 1);
+  EXPECT_EQ(local_reply_calls_, 0);
+}
+
+// Detection is opt-in: without the knob an unconfigured route is untouched.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DetectionOffByDefault) {
+  createPublishingFilter();
+  setPath("/v1/chat/completions");
+  Http::TestRequestHeaderMapImpl headers = *request_headers_;
+  // Not engaged at all: no per-route declaration and no opt-in.
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::Continue);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
 }
 
 // Publication is opt-in: without request_info the decode path behaves exactly
