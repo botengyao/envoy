@@ -84,6 +84,8 @@ envoy_extension_cc_test(
     deps = [
         "//source/common/json:json_loader_lib",
         "//source/extensions/filters/http/ai_protocol_manager:api_protocol_adapters_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_readers_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
         "//source/extensions/filters/http/ai_protocol_manager:schema_lib",
         "//source/extensions/filters/http/ai_protocol_manager:token_usage_lib",
         "//test/test_common:utility_lib",

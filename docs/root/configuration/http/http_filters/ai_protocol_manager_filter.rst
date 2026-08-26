@@ -143,6 +143,55 @@ does not parse is forwarded unchanged.
       request_handling:
         parse_unconfigured_routes: true
 
+Request info publication
+------------------------
+
+When :ref:`request_handling.request_info
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.request_info>`
+is set, what the parsed payload declares is published as typed dynamic
+metadata (:ref:`envoy.data.ai.v3.RequestInfo
+<envoy_v3_api_msg_data.ai.v3.RequestInfo>`, default namespace
+``envoy.ai.request_info``): the model, whether the client asked to stream, the
+declared output cap, a pre-flight ``estimated_input_tokens`` with the
+:ref:`estimation method
+<envoy_v3_api_enum_data.ai.v3.RequestInfo.EstimationMethod>` that produced it,
+and the turn and tool counts. Only a route whose declared wire API is known
+produces a record; an undeclared route has no dialect to read the payload
+against.
+
+Publication happens at end of payload, *while the request headers are still
+held* and before replay. Every later decode filter therefore observes the
+record on its first callback, which is what lets an admission service act on
+the model and a cost bound without being sent the body:
+
+.. code-block:: yaml
+
+  http_filters:
+  - name: envoy.filters.http.ai_protocol_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+      request_handling:
+        request_info: {}
+  - name: envoy.filters.http.ext_proc
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+      processing_mode:
+        request_header_mode: SEND
+        request_body_mode: NONE      # the record replaces the body, not augments it
+      metadata_options:
+        forwarding_namespaces:
+          typed:
+          - envoy.ai.request_info
+
+``estimated_input_tokens`` is an admission bound, not an accounting figure. It
+is measured from the byte length of the payload's prompt-bearing text — string
+values offloaded out of the parsed document contribute their recorded length,
+so a large prompt is measured without being read — divided by a fixed
+bytes-per-token ratio, plus a per-turn framing allowance. It is
+tokenizer-independent and will run high on non-Latin scripts and low on dense
+code; settle it against the provider-reported counts in
+:ref:`TokenUsage <envoy_v3_api_msg_data.ai.v3.TokenUsage>`.
+
 Response token-usage extraction
 -------------------------------
 
@@ -341,6 +390,43 @@ namespace alone is not sufficient:
       typed:
       - envoy.ai.token_usage
 
+``response_body_mode: STREAMED`` costs a copy of every response byte across the
+gRPC boundary, which for a long streamed generation is the whole response. When
+the processor only needs the record, :ref:`usage_signal
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.usage_signal>`
+avoids that: ``SYNTHESIZE_TRAILERS`` adds empty response trailers at a clean
+end of stream when the response carries none of its own, so a processor
+configured for trailers alone receives one small message carrying the record
+and no body at all. A response that already has trailers is left untouched —
+publication precedes them either way.
+
+.. code-block:: yaml
+
+  # In the cluster's upstream filter chain.
+  response_handling:
+    token_usage:
+      usage_signal: SYNTHESIZE_TRAILERS
+
+.. code-block:: yaml
+
+  # In the downstream ext_proc filter.
+  processing_mode:
+    response_header_mode: SKIP
+    response_body_mode: NONE
+    response_trailer_mode: SEND
+
+Note that HTTP/1.1 downstreams drop the added trailers at the codec unless
+:ref:`enable_trailers
+<envoy_v3_api_field_config.core.v3.Http1ProtocolOptions.enable_trailers>` is
+set, while HTTP/2 and HTTP/3 clients receive an empty trailers frame.
+
+Extraction requires a body the proxy can read: a response carrying a
+non-identity ``content-encoding`` is skipped (``unsupported_content_encoding``).
+Provider SDKs advertise compression by default, so a gateway that accounts for
+tokens on an egress hop generally has to request an identity encoding on the
+way out, for example with ``request_headers_to_add`` setting
+``accept-encoding: identity``.
+
 Upstream (cluster) installation
 -------------------------------
 
@@ -396,6 +482,9 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   :header: Name, Type, Description
   :widths: 1, 1, 2
 
+  request_info_published, Counter, A parsed request payload yielded a record and request-info metadata was written.
+  request_info_empty, Counter, "A parsed request payload yielded nothing to publish (an undeclared route, or a payload declaring none of the dialect's fields)."
+  usage_trailers_synthesized, Counter, End-of-stream trailers were added to carry a published usage record to a trailer-driven consumer.
   token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).
   token_usage_partial, Counter, A published record was flagged ``extraction_status: PARTIAL``.
   token_usage_failed, Counter, A status-only record was published (``extraction_status: FAILED``; no counts recovered).

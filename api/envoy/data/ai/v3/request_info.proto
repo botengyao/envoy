@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package envoy.data.ai.v3;
+
+import "envoy/type/ai/v3/api_protocol.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.data.ai.v3";
+option java_outer_classname = "RequestInfoProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/data/ai/v3;aiv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI request info]
+
+// What an AI request declares about the work it is asking for, extracted from
+// the payload by the :ref:`AI Protocol Manager filter
+// <config_http_filters_ai_protocol_manager>` and published as typed dynamic
+// metadata before the payload is forwarded.
+//
+// This is the request-side counterpart of :ref:`TokenUsage
+// <envoy_v3_api_msg_data.ai.v3.TokenUsage>`, and it exists so admission and
+// policy can act on a request *before* it is spent: an external admission
+// service (ext_proc, RBAC, rate limit) reads the model and a pre-flight cost
+// bound from metadata rather than re-parsing the body.
+//
+// Publication happens while the filter still holds the request headers, so
+// every later filter on the decode path observes it on its first callback.
+//
+// Only ``api_protocol`` is always populated. Everything else is what the
+// payload actually declared: a field the request omitted stays unset rather
+// than being defaulted, so a consumer can tell "the client asked for no
+// output cap" from "the client asked for zero".
+// [#next-free-field: 9]
+message RequestInfo {
+  // How ``estimated_input_tokens`` was arrived at. The estimate is a bound
+  // for admission, never an accounting figure: settle against the
+  // provider-reported counts in :ref:`TokenUsage
+  // <envoy_v3_api_msg_data.ai.v3.TokenUsage>`.
+  enum EstimationMethod {
+    ESTIMATION_METHOD_UNSPECIFIED = 0;
+
+    // The byte length of the payload's prompt-bearing text, divided by a
+    // fixed bytes-per-token ratio, plus a fixed per-message framing
+    // allowance. Model- and tokenizer-independent: the only property it
+    // guarantees is that it grows with the payload. Expect it to run high on
+    // non-Latin scripts and low on dense code or encoded binary.
+    TEXT_LENGTH_HEURISTIC = 1;
+  }
+
+  // The wire API the request payload follows. Names an API contract, not a
+  // provider identity.
+  type.ai.v3.ApiProtocol api_protocol = 1;
+
+  // The model the request names. Taken from the payload, or from the request
+  // path for wire APIs that address the model there (Gemini).
+  string model = 2;
+
+  // Whether the client asked for an incrementally streamed response.
+  bool streaming = 3;
+
+  // The output cap the request declared (OpenAI ``max_tokens`` /
+  // ``max_completion_tokens`` / ``max_output_tokens``, Anthropic
+  // ``max_tokens``, Gemini ``generationConfig.maxOutputTokens``). Unset when
+  // the request declared none, in which case the provider's own default
+  // bounds the generation and no exact output bound exists at admission time.
+  google.protobuf.UInt64Value requested_max_output_tokens = 4;
+
+  // Estimated input tokens, by ``estimation_method``. Unset when no estimate
+  // could be formed.
+  google.protobuf.UInt64Value estimated_input_tokens = 5;
+
+  // How ``estimated_input_tokens`` was produced.
+  EstimationMethod estimation_method = 6;
+
+  // Number of conversation turns the payload carries. Unset for wire APIs
+  // whose payload has no turn structure.
+  google.protobuf.UInt32Value message_count = 7;
+
+  // Number of tool/function definitions the payload carries. Tool definitions
+  // are re-sent on every turn and can dominate a prompt, so they are surfaced
+  // separately from the turn count.
+  google.protobuf.UInt32Value tool_count = 8;
+}

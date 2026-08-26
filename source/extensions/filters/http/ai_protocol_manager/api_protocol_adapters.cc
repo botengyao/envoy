@@ -92,6 +92,17 @@ protected:
   }
 };
 
+// Shared request reads for both OpenAI dialects: the model and the streaming
+// flag live in the same places; only the prompt-bearing member and the
+// output-cap spelling differ.
+void readOpenAiRequestCommon(const nlohmann::json& json, RequestInfo& info) {
+  if (auto model = readString(json, JsonKeys::get().Model); model.has_value()) {
+    info.model = std::move(model).value();
+  }
+  info.streaming = readFlag(json, JsonKeys::get().Stream);
+  info.tool_count = countArray(json, JsonKeys::get().Tools);
+}
+
 class OpenAiChatCompletionsAdapter : public OpenAiAdapterBase {
 public:
   ApiProtocol protocol() const override { return ApiProtocol::OpenAiChatCompletions; }
@@ -103,6 +114,31 @@ public:
   }
   // Terminates with the non-JSON `[DONE]` sentinel, handled before parsing.
   bool isTerminalEvent(const nlohmann::json&) const override { return false; }
+
+protected:
+  void extractRequestInfoInto(const nlohmann::json& json, absl::string_view,
+                              RequestInfo& info) const override {
+    readOpenAiRequestCommon(json, info);
+    // `max_completion_tokens` is the current spelling; `max_tokens` is the
+    // deprecated one and is what most clients still send. Either bounds the
+    // generation, so whichever is present is the cap.
+    info.requested_max_output_tokens = readRequestCount(json, JsonKeys::get().MaxCompletionTokens);
+    if (!info.requested_max_output_tokens.has_value()) {
+      info.requested_max_output_tokens = readRequestCount(json, JsonKeys::get().MaxTokens);
+    }
+    info.message_count = countArray(json, JsonKeys::get().Messages);
+
+    uint64_t text_bytes = 0;
+    if (const auto messages = json.find(JsonKeys::get().Messages); messages != json.end()) {
+      text_bytes = measureTextBytes(*messages);
+    }
+    // Tool definitions are re-sent on every turn and routinely dominate a
+    // prompt, so they are part of the input the request will be billed for.
+    if (const auto tools = json.find(JsonKeys::get().Tools); tools != json.end()) {
+      text_bytes += measureTextBytes(*tools);
+    }
+    info.estimated_input_tokens = estimateInputTokens(text_bytes, info.message_count.value_or(0));
+  }
 };
 
 class OpenAiResponsesAdapter : public OpenAiAdapterBase {
@@ -114,6 +150,32 @@ public:
     // extractUsage() first.
     const auto type = readString(json, JsonKeys::get().Type);
     return type.has_value() && isOpenAiResponsesTerminalEventType(type.value());
+  }
+
+protected:
+  void extractRequestInfoInto(const nlohmann::json& json, absl::string_view,
+                              RequestInfo& info) const override {
+    readOpenAiRequestCommon(json, info);
+    info.requested_max_output_tokens = readRequestCount(json, JsonKeys::get().MaxOutputTokens);
+    // `input` is either a bare string or a list of typed items; the walk
+    // measures both without caring which, and `instructions` is the system
+    // prompt equivalent. Neither shape has a turn count worth publishing when
+    // `input` is a plain string, so message_count stays unset unless it is a
+    // list.
+    info.message_count = countArray(json, JsonKeys::get().Input);
+
+    uint64_t text_bytes = 0;
+    if (const auto input = json.find(JsonKeys::get().Input); input != json.end()) {
+      text_bytes = measureTextBytes(*input);
+    }
+    if (const auto instructions = json.find(JsonKeys::get().Instructions);
+        instructions != json.end()) {
+      text_bytes += measureTextBytes(*instructions);
+    }
+    if (const auto tools = json.find(JsonKeys::get().Tools); tools != json.end()) {
+      text_bytes += measureTextBytes(*tools);
+    }
+    info.estimated_input_tokens = estimateInputTokens(text_bytes, info.message_count.value_or(0));
   }
 };
 
@@ -182,7 +244,61 @@ protected:
       usage.reasoning_tokens = readCount(*details, JsonKeys::get().ThinkingTokens, malformed);
     }
   }
+
+  void extractRequestInfoInto(const nlohmann::json& json, absl::string_view,
+                              RequestInfo& info) const override {
+    if (auto model = readString(json, JsonKeys::get().Model); model.has_value()) {
+      info.model = std::move(model).value();
+    }
+    info.streaming = readFlag(json, JsonKeys::get().Stream);
+    info.tool_count = countArray(json, JsonKeys::get().Tools);
+    // `max_tokens` is required by this API, so the cap is always present on a
+    // well-formed request.
+    info.requested_max_output_tokens = readRequestCount(json, JsonKeys::get().MaxTokens);
+    info.message_count = countArray(json, JsonKeys::get().Messages);
+
+    uint64_t text_bytes = 0;
+    if (const auto messages = json.find(JsonKeys::get().Messages); messages != json.end()) {
+      text_bytes = measureTextBytes(*messages);
+    }
+    // The system prompt is a top-level member here, not a turn: a string or a
+    // list of content blocks.
+    if (const auto system = json.find(JsonKeys::get().System); system != json.end()) {
+      text_bytes += measureTextBytes(*system);
+    }
+    if (const auto tools = json.find(JsonKeys::get().Tools); tools != json.end()) {
+      text_bytes += measureTextBytes(*tools);
+    }
+    info.estimated_input_tokens = estimateInputTokens(text_bytes, info.message_count.value_or(0));
+  }
 };
+
+// Gemini addresses the model and the streaming choice in the URL rather than
+// the body: `.../models/{model}:generateContent` or `:streamGenerateContent`,
+// optionally with a query string. Reads what it can and leaves the rest unset
+// -- a path that does not match the shape is not an error, just a path this
+// dialect cannot name a model from.
+void readGeminiRequestPath(absl::string_view path, RequestInfo& info) {
+  const absl::string_view without_query = path.substr(0, path.find('?'));
+  // Last occurrence: the prefix ahead of it is the caller's, and a gateway
+  // path may well contain the word "models" earlier.
+  const size_t models_at = without_query.rfind("/models/");
+  if (models_at == absl::string_view::npos) {
+    return;
+  }
+  const absl::string_view target = without_query.substr(models_at + sizeof("/models/") - 1);
+  const size_t method_at = target.find(':');
+  const absl::string_view model =
+      method_at == absl::string_view::npos ? target : target.substr(0, method_at);
+  // A path segment is upstream-influenced; hold it to the same bound as any
+  // other string that becomes metadata.
+  if (!model.empty() && model.size() <= MaxStringValueSize) {
+    info.model = std::string(model);
+  }
+  if (method_at != absl::string_view::npos) {
+    info.streaming = absl::StartsWith(target.substr(method_at + 1), "stream");
+  }
+}
 
 // Gemini generateContent / streamGenerateContent. Every chunk is a
 // GenerateContentResponse; `usageMetadata` snapshots are cumulative (last
@@ -229,6 +345,47 @@ protected:
     usage.tool_use_input_tokens =
         readCount(*usage_node, JsonKeys::get().ToolUsePromptTokenCount, malformed);
     usage.reasoning_tokens = readCount(*usage_node, JsonKeys::get().ThoughtsTokenCount, malformed);
+  }
+
+  void extractRequestInfoInto(const nlohmann::json& json, absl::string_view path,
+                              RequestInfo& info) const override {
+    readGeminiRequestPath(path, info);
+    info.tool_count = countArray(json, JsonKeys::get().Tools);
+    info.message_count = countArray(json, JsonKeys::get().Contents);
+
+    // The API accepts both spellings of its structured members; the official
+    // SDKs send the camel-case spelling.
+    bool ignored = false;
+    const nlohmann::json* generation_config =
+        readObject(json, JsonKeys::get().GenerationConfig, ignored, NullPolicy::AllowNullAsAbsent);
+    if (generation_config == nullptr) {
+      generation_config = readObject(json, JsonKeys::get().GenerationConfigSnake, ignored,
+                                     NullPolicy::AllowNullAsAbsent);
+    }
+    if (generation_config != nullptr) {
+      info.requested_max_output_tokens =
+          readRequestCount(*generation_config, JsonKeys::get().MaxOutputTokensCamel);
+      if (!info.requested_max_output_tokens.has_value()) {
+        info.requested_max_output_tokens =
+            readRequestCount(*generation_config, JsonKeys::get().MaxOutputTokens);
+      }
+    }
+
+    uint64_t text_bytes = 0;
+    if (const auto contents = json.find(JsonKeys::get().Contents); contents != json.end()) {
+      text_bytes = measureTextBytes(*contents);
+    }
+    for (const std::string& key :
+         {JsonKeys::get().SystemInstruction, JsonKeys::get().SystemInstructionSnake}) {
+      if (const auto system = json.find(key); system != json.end()) {
+        text_bytes += measureTextBytes(*system);
+        break;
+      }
+    }
+    if (const auto tools = json.find(JsonKeys::get().Tools); tools != json.end()) {
+      text_bytes += measureTextBytes(*tools);
+    }
+    info.estimated_input_tokens = estimateInputTokens(text_bytes, info.message_count.value_or(0));
   }
 };
 

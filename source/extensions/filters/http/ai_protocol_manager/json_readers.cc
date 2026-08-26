@@ -1,6 +1,10 @@
 #include "source/extensions/filters/http/ai_protocol_manager/json_readers.h"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
+
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 
 #include "nlohmann/json.hpp"
 
@@ -88,6 +92,68 @@ std::optional<uint64_t> addCounts(std::optional<uint64_t> base,
     return std::nullopt;
   }
   return sum;
+}
+
+std::optional<uint64_t> readRequestCount(const nlohmann::json& json, const std::string& key) {
+  bool ignored = false;
+  return readCount(json, key, ignored);
+}
+
+bool readFlag(const nlohmann::json& json, const std::string& key) {
+  const auto it = json.find(key);
+  return it != json.end() && it->is_boolean() && it->get<bool>();
+}
+
+std::optional<uint32_t> countArray(const nlohmann::json& json, const std::string& key) {
+  const auto it = json.find(key);
+  if (it == json.end() || !it->is_array()) {
+    return std::nullopt;
+  }
+  return static_cast<uint32_t>(std::min<size_t>(it->size(), std::numeric_limits<uint32_t>::max()));
+}
+
+uint64_t measureTextBytes(const nlohmann::json& node, int depth) {
+  if (depth > MaxTextWalkDepth) {
+    return 0;
+  }
+  if (node.is_string()) {
+    return node.get_ref<const std::string&>().size();
+  }
+  // An offloaded string is not in the DOM: it rides as a reference carrying
+  // the length of its raw (still-escaped) bytes in the request body. Counting
+  // that length is what lets the estimate cover a multi-megabyte prompt
+  // without reading a byte of it.
+  if (JsonWithExtBuf::isExternalRef(node)) {
+    const absl::StatusOr<JsonWithExtBuf::ExternalRef> ref = JsonWithExtBuf::externalRef(node);
+    return ref.ok() ? ref->length : 0;
+  }
+  // Only containers are descended into: nlohmann gives a primitive a
+  // single-element iteration range containing itself, so iterating one would
+  // recurse to the depth cap for nothing.
+  if (!node.is_array() && !node.is_object()) {
+    return 0;
+  }
+  uint64_t bytes = 0;
+  for (const auto& child : node) {
+    const uint64_t child_bytes = measureTextBytes(child, depth + 1);
+    // The sum runs over an attacker-influenced number of terms; saturate
+    // rather than wrap, at the same bound the token counts use.
+    if (bytes > MaxSafeCount - child_bytes) {
+      return MaxSafeCount;
+    }
+    bytes += child_bytes;
+  }
+  return bytes;
+}
+
+uint64_t estimateInputTokens(uint64_t text_bytes, uint32_t message_count) {
+  // Round up: a payload with any text at all costs at least one token.
+  const uint64_t from_text = text_bytes == 0 ? 0 : (text_bytes - 1) / BytesPerTokenEstimate + 1;
+  const uint64_t framing = uint64_t{message_count} * MessageFramingTokens;
+  if (from_text > MaxSafeCount - framing) {
+    return MaxSafeCount;
+  }
+  return from_text + framing;
 }
 
 } // namespace AiProtocolManager

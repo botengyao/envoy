@@ -77,7 +77,10 @@ public:
 
   bool requestHandlingEnabled() const { return request_handling_enabled_; }
   bool parseUnconfiguredRoutes() const { return parse_unconfigured_routes_; }
+  bool requestInfoEnabled() const { return request_info_enabled_; }
+  const std::string& requestInfoNamespace() const { return request_info_namespace_; }
   bool tokenUsageEnabled() const { return token_usage_enabled_; }
+  bool synthesizeUsageTrailers() const { return synthesize_usage_trailers_; }
   bool includeUnconfiguredRoutes() const { return include_unconfigured_routes_; }
   ApiProtocol defaultApiProtocol() const { return default_api_protocol_; }
   const std::string& metadataNamespace() const { return metadata_namespace_; }
@@ -92,7 +95,10 @@ private:
   mutable AiProtocolManagerStats stats_;
   const bool request_handling_enabled_ = false;
   const bool parse_unconfigured_routes_ = false;
+  const bool request_info_enabled_ = false;
+  const std::string request_info_namespace_;
   const bool token_usage_enabled_ = false;
+  const bool synthesize_usage_trailers_ = false;
   const bool include_unconfigured_routes_ = false;
   const ApiProtocol default_api_protocol_ = ApiProtocol::Unspecified;
   const std::string metadata_namespace_;
@@ -216,13 +222,20 @@ private:
   // Terminates the stream with a 400 for a payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
 
+  // Publish what the parsed payload declares as typed dynamic metadata.
+  // Called once, at end of payload and before the body is replayed, so that
+  // every later decode filter observes the record on its first callback --
+  // which is the whole point of publishing here rather than at stream end.
+  void publishRequestInfo();
+
   // Whether the route handed its request payload to the filter, which is also
   // what makes a parse failure fatal.
   bool isAiEndpoint() const { return route_has_request_; }
 
   // Publish the accumulated token usage as dynamic metadata and account stats.
   // Called exactly once, at response end of stream (data or trailers).
-  void finalizeResponseHandling();
+  // Returns whether a record was published for this stream.
+  bool finalizeResponseHandling();
 
   ExternalBufferFactory& buffer_factory_;
   FilterConfigSharedPtr config_;

@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 
+#include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/http/codes.h"
@@ -156,6 +157,169 @@ public:
   std::optional<Http::Code> local_reply_code_;
   std::string local_reply_details_;
 };
+
+// Request-side publication: the same decode-path machinery, with
+// request_handling.request_info enabled and the typed metadata write captured.
+class AiProtocolManagerFilterRequestInfoTest : public AiProtocolManagerFilterTest {
+public:
+  AiProtocolManagerFilterRequestInfoTest() {
+    ON_CALL(callbacks_.stream_info_, setDynamicTypedMetadata(testing::_, testing::_))
+        .WillByDefault(Invoke([this](const std::string& ns, const Protobuf::Any& value) {
+          typed_metadata_writes_.emplace_back(ns, value);
+        }));
+    ON_CALL(callbacks_.stream_info_, getRequestHeaders())
+        .WillByDefault(testing::Invoke(
+            [this]() -> const Http::RequestHeaderMap* { return request_headers_.get(); }));
+  }
+
+  // Rebuilds the filter with request-info publication enabled.
+  void createPublishingFilter(const std::string& metadata_namespace = "") {
+    if (filter_ != nullptr) {
+      filter_->onDestroy();
+    }
+    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
+    auto* request_info = proto.mutable_request_handling()->mutable_request_info();
+    if (!metadata_namespace.empty()) {
+      request_info->set_metadata_namespace(metadata_namespace);
+    }
+    config_ = std::make_shared<const FilterConfig>(proto, *stats_store_.rootScope());
+    filter_ = std::make_unique<AiProtocolManagerFilter>(factory_, config_);
+    filter_->setDecoderFilterCallbacks(callbacks_);
+  }
+
+  // Declares the route an AI endpoint speaking `protocol`.
+  void setRouteProtocol(envoy::type::ai::v3::ApiProtocol protocol) {
+    PerRouteProto proto;
+    proto.mutable_request()->set_api_protocol(protocol);
+    route_config_ = std::make_unique<RouteConfig>(proto);
+    ON_CALL(callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(testing::Return(route_config_.get()));
+  }
+
+  void setPath(absl::string_view path) {
+    request_headers_ = std::make_unique<Http::TestRequestHeaderMapImpl>(
+        Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                       {":path", std::string(path)},
+                                       {"content-type", "application/json"}});
+  }
+
+  // Drives a whole request payload through the held-headers/offload path.
+  void sendPayload(absl::string_view body) {
+    replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+    Http::TestRequestHeaderMapImpl headers =
+        request_headers_ != nullptr ? *request_headers_ : requestHeaders();
+    ASSERT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+              Http::FilterHeadersStatus::StopIteration);
+    Buffer::OwnedImpl data(body);
+    filter_->decodeData(data, /*end_stream=*/true);
+    drain();
+  }
+
+  uint64_t counterValue(const std::string& name) {
+    const auto counter = TestUtility::findCounter(stats_store_, "ai_protocol_manager." + name);
+    return counter != nullptr ? counter->value() : 0;
+  }
+
+  std::optional<envoy::data::ai::v3::RequestInfo>
+  singleTypedWrite(const std::string& expected_namespace = "envoy.ai.request_info") {
+    if (typed_metadata_writes_.size() != 1 ||
+        typed_metadata_writes_[0].first != expected_namespace) {
+      return std::nullopt;
+    }
+    envoy::data::ai::v3::RequestInfo typed;
+    if (!typed_metadata_writes_[0].second.UnpackTo(&typed)) {
+      return std::nullopt;
+    }
+    return typed;
+  }
+
+  std::unique_ptr<Http::TestRequestHeaderMapImpl> request_headers_;
+  std::vector<std::pair<std::string, Protobuf::Any>> typed_metadata_writes_;
+};
+
+// The record is published while the chain is still held -- before the body is
+// replayed -- so every later decode filter sees it on its first callback.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, PublishedBeforeReplay) {
+  createPublishingFilter();
+  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+  Http::TestRequestHeaderMapImpl headers = requestHeaders();
+  ASSERT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl data(R"({"model":"gpt-4o-mini","max_tokens":64,)"
+                         R"("messages":[{"role":"user","content":"hello"}]})");
+  filter_->decodeData(data, /*end_stream=*/true);
+  // Publication happens synchronously at end of payload; the replay that
+  // releases the headers has not run yet.
+  EXPECT_EQ(typed_metadata_writes_.size(), 1);
+  EXPECT_EQ(inject_calls_, 0);
+
+  drain();
+  EXPECT_GT(inject_calls_, 0);
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->model(), "gpt-4o-mini");
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(typed->requested_max_output_tokens().value(), 64);
+  EXPECT_EQ(typed->message_count().value(), 1);
+  EXPECT_TRUE(typed->has_estimated_input_tokens());
+  EXPECT_EQ(typed->estimation_method(), envoy::data::ai::v3::RequestInfo::TEXT_LENGTH_HEURISTIC);
+  EXPECT_EQ(counterValue("request_info_published"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterRequestInfoTest, StreamingFlagPublished) {
+  createPublishingFilter();
+  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  sendPayload(R"({"model":"gpt-4o-mini","stream":true,)"
+              R"("messages":[{"role":"user","content":"hi"}]})");
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_TRUE(typed->streaming());
+}
+
+// Gemini names the model in the URL, so publication has to reach the request
+// headers the filter is still holding.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, GeminiModelComesFromPath) {
+  createPublishingFilter();
+  setRouteProtocol(envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  setPath("/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
+  sendPayload(R"({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})");
+
+  const auto typed = singleTypedWrite();
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->model(), "gemini-2.5-flash");
+  EXPECT_TRUE(typed->streaming());
+  EXPECT_EQ(typed->api_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+}
+
+TEST_F(AiProtocolManagerFilterRequestInfoTest, CustomNamespace) {
+  createPublishingFilter("acme.ai.request");
+  setRouteProtocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  sendPayload(R"({"model":"claude-haiku-4-5","max_tokens":32,"messages":[{"content":"hi"}]})");
+  EXPECT_TRUE(singleTypedWrite("acme.ai.request").has_value());
+}
+
+// A route that declared no wire API has no dialect to read the payload
+// against, so nothing is published -- publication never guesses.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, UndeclaredRoutePublishesNothing) {
+  createPublishingFilter();
+  setRouteProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  sendPayload(R"({"model":"gpt-4o-mini","messages":[{"content":"hi"}]})");
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(counterValue("request_info_empty"), 1);
+}
+
+// Publication is opt-in: without request_info the decode path behaves exactly
+// as before.
+TEST_F(AiProtocolManagerFilterRequestInfoTest, DisabledByDefault) {
+  createFilter();
+  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  sendPayload(R"({"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(counterValue("request_info_published"), 0);
+}
 
 // With a payload to inspect, iteration pauses so the rest of the chain does not
 // see the headers until it is offloaded.
@@ -435,6 +599,12 @@ public:
         .WillByDefault(Invoke([this](const std::string& ns, const Protobuf::Any& value) {
           typed_metadata_writes_.emplace_back(ns, value);
         }));
+    ON_CALL(encoder_callbacks_, addEncodedTrailers())
+        .WillByDefault(Invoke([this]() -> Http::ResponseTrailerMap& {
+          ++added_trailers_;
+          synthesized_trailers_ = Http::ResponseTrailerMapImpl::create();
+          return *synthesized_trailers_;
+        }));
   }
 
   void TearDown() override {
@@ -490,7 +660,60 @@ public:
   std::unique_ptr<AiProtocolManagerFilter> filter_;
   std::vector<std::pair<std::string, Protobuf::Struct>> metadata_writes_;
   std::vector<std::pair<std::string, Protobuf::Any>> typed_metadata_writes_;
+  int added_trailers_{0};
+  Http::ResponseTrailerMapPtr synthesized_trailers_;
 };
+
+// With the trailer signal configured, a response that ends on a data frame
+// gets empty trailers added after the record is published -- which is what
+// gives a trailer-driven consumer (ext_proc) a message to carry it on.
+TEST_F(AiProtocolManagerFilterResponseTest, UsageSignalSynthesizesTrailers) {
+  setup("{usage_signal: SYNTHESIZE_TRAILERS}");
+  sendHeaders("application/json");
+  sendData(R"({"object":"chat.completion","model":"gpt-4o","usage":)"
+           R"({"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}})",
+           true);
+  ASSERT_TRUE(singleTypedWrite("envoy.ai.token_usage").has_value());
+  EXPECT_EQ(added_trailers_, 1);
+  EXPECT_EQ(counterValue("usage_trailers_synthesized"), 1);
+}
+
+// Nothing published, nothing to signal: a response carrying no usage must not
+// grow trailers it did not have.
+TEST_F(AiProtocolManagerFilterResponseTest, NoTrailersWhenNothingPublished) {
+  setup("{usage_signal: SYNTHESIZE_TRAILERS}");
+  sendHeaders("application/json");
+  sendData(R"({"object":"chat.completion","model":"gpt-4o"})", true);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(added_trailers_, 0);
+  EXPECT_EQ(counterValue("usage_trailers_synthesized"), 0);
+}
+
+// A response that carries its own trailers is left alone: publication in
+// encodeTrailers() already precedes them down the chain, and adding a second
+// set is not possible.
+TEST_F(AiProtocolManagerFilterResponseTest, ResponseWithOwnTrailersNotSynthesized) {
+  setup("{usage_signal: SYNTHESIZE_TRAILERS}");
+  sendHeaders("application/json");
+  sendData(R"({"object":"chat.completion","model":"gpt-4o","usage":)"
+           R"({"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}})",
+           false);
+  Http::TestResponseTrailerMapImpl trailers{{"grpc-status", "0"}};
+  EXPECT_EQ(filter_->encodeTrailers(trailers), Http::FilterTrailersStatus::Continue);
+  ASSERT_TRUE(singleTypedWrite("envoy.ai.token_usage").has_value());
+  EXPECT_EQ(added_trailers_, 0);
+}
+
+// The signal is opt-in; the default publishes and adds nothing.
+TEST_F(AiProtocolManagerFilterResponseTest, DefaultSignalAddsNoTrailers) {
+  setup();
+  sendHeaders("application/json");
+  sendData(R"({"object":"chat.completion","model":"gpt-4o","usage":)"
+           R"({"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}})",
+           true);
+  ASSERT_TRUE(singleTypedWrite("envoy.ai.token_usage").has_value());
+  EXPECT_EQ(added_trailers_, 0);
+}
 
 // An SSE response is teed, usage extracted, and published at end of stream
 // under the default namespace, while every frame passes through untouched.

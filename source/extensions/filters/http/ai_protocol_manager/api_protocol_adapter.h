@@ -1,9 +1,14 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
+#include <string>
+
 #include "envoy/common/pure.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/token_usage.h"
 
+#include "absl/strings/string_view.h"
 #include "nlohmann/json_fwd.hpp"
 
 namespace Envoy {
@@ -12,6 +17,32 @@ namespace HttpFilters {
 namespace AiProtocolManager {
 
 class PayloadSchema;
+
+// Internal mirror of envoy.data.ai.v3.RequestInfo: what a request declares
+// about the work it is asking for. The request-side sibling of TokenUsage,
+// filled in by the dialect's adapter from the parsed payload (and, for wire
+// APIs that address the model in the URL, the request path).
+//
+// Absence is meaningful throughout: a consumer must be able to tell "declared
+// no output cap" from "declared a cap of zero".
+struct RequestInfo {
+  ApiProtocol api_protocol{ApiProtocol::Unspecified};
+  std::string model;
+  bool streaming{false};
+  std::optional<uint64_t> requested_max_output_tokens;
+  std::optional<uint64_t> estimated_input_tokens;
+  std::optional<uint32_t> message_count;
+  std::optional<uint32_t> tool_count;
+
+  // Whether the record carries anything a consumer could act on. A record
+  // with no model and no counts says nothing an access log does not already
+  // have, and is not worth a metadata write.
+  bool hasAny() const {
+    return !model.empty() || requested_max_output_tokens.has_value() ||
+           estimated_input_tokens.has_value() || message_count.has_value() ||
+           tool_count.has_value();
+  }
+};
 
 // Everything the filter needs to know about one wire API, behind one
 // interface: adapters answer "how does this dialect express X" -- its payload
@@ -55,6 +86,18 @@ public:
   // by TokenUsage::finalize().
   virtual void canonicalizeUsage(TokenUsage& usage, bool& overflow) const PURE;
 
+  // Extract what a parsed *request* payload declares. `path` is the request
+  // target, needed by wire APIs that address the model and the streaming
+  // choice in the URL rather than the body (Gemini). Non-virtual for the same
+  // reason as extractUsage(): the shared prologue stamps the adapter's own
+  // protocol and the dialect fills in the rest.
+  RequestInfo extractRequestInfo(const nlohmann::json& json, absl::string_view path) const {
+    RequestInfo info;
+    info.api_protocol = protocol();
+    extractRequestInfoInto(json, path, info);
+    return info;
+  }
+
   // True when this document marks the dialect's logical end of extraction
   // (Anthropic `message_stop`, OpenAI Responses terminal lifecycle events).
   // Callers must extractUsage() first: terminal Responses events also carry
@@ -67,6 +110,13 @@ protected:
   // sets `result.malformed`; an in-band stream error sets
   // `result.stream_error`.
   virtual void extractUsageInto(const nlohmann::json& json, ExtractionResult& result) const PURE;
+
+  // The dialect's request reads, onto a record already stamped with
+  // protocol(). Defaulted to a no-op so a dialect that has no request
+  // contract worth publishing -- and the Unspecified adapter -- needs no
+  // implementation.
+  virtual void extractRequestInfoInto(const nlohmann::json&, absl::string_view,
+                                      RequestInfo&) const {}
 };
 
 // The registry mapping each ApiProtocol to its adapter, plus shape detection.

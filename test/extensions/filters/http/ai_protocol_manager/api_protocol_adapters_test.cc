@@ -2,6 +2,8 @@
 #include <vector>
 
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_adapter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_readers.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 
 #include "gtest/gtest.h"
@@ -700,6 +702,237 @@ TEST(AdapterRegistryTest, AllDeclaredOffloadableFieldsInStreamOrder) {
           << apiProtocolName(protocol);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Request-side extraction.
+
+RequestInfo extractRequest(ApiProtocol format, const std::string& json,
+                           absl::string_view path = "") {
+  return AdapterRegistry::get(format).extractRequestInfo(parse(json), path);
+}
+
+TEST(RequestInfoTest, OpenAiChatCompletions) {
+  const RequestInfo info = extractRequest(ApiProtocol::OpenAiChatCompletions, R"({
+    "model": "gpt-4o-mini",
+    "stream": true,
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "hello there"}]
+  })");
+  EXPECT_EQ(info.api_protocol, ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(info.model, "gpt-4o-mini");
+  EXPECT_TRUE(info.streaming);
+  EXPECT_EQ(info.requested_max_output_tokens, 256);
+  EXPECT_EQ(info.message_count, 1);
+  EXPECT_FALSE(info.tool_count.has_value());
+  EXPECT_TRUE(info.estimated_input_tokens.has_value());
+  EXPECT_TRUE(info.hasAny());
+}
+
+TEST(RequestInfoTest, OpenAiChatCompletionsPrefersMaxCompletionTokens) {
+  // The current spelling wins when a client sends both.
+  EXPECT_EQ(extractRequest(ApiProtocol::OpenAiChatCompletions,
+                           R"({"max_tokens": 10, "max_completion_tokens": 20})")
+                .requested_max_output_tokens,
+            20);
+  // The deprecated spelling is still what most clients send.
+  EXPECT_EQ(extractRequest(ApiProtocol::OpenAiChatCompletions, R"({"max_tokens": 10})")
+                .requested_max_output_tokens,
+            10);
+}
+
+TEST(RequestInfoTest, OpenAiChatCompletionsCountsTools) {
+  const RequestInfo info = extractRequest(ApiProtocol::OpenAiChatCompletions, R"({
+    "messages": [{"role": "user", "content": "hi"}],
+    "tools": [{"type": "function", "function": {"name": "a"}},
+              {"type": "function", "function": {"name": "b"}}]
+  })");
+  EXPECT_EQ(info.tool_count, 2);
+  // An empty tools list is a declaration, not an absence.
+  EXPECT_EQ(extractRequest(ApiProtocol::OpenAiChatCompletions, R"({"tools": []})").tool_count, 0);
+}
+
+TEST(RequestInfoTest, OpenAiChatCompletionsAbsenceIsPreserved) {
+  const RequestInfo info =
+      extractRequest(ApiProtocol::OpenAiChatCompletions, R"({"model": "gpt-4o-mini"})");
+  EXPECT_FALSE(info.streaming);
+  EXPECT_FALSE(info.requested_max_output_tokens.has_value());
+  EXPECT_FALSE(info.message_count.has_value());
+  EXPECT_FALSE(info.tool_count.has_value());
+}
+
+TEST(RequestInfoTest, OpenAiChatCompletionsUnusableFieldsReadAsAbsent) {
+  // A malformed request field costs that field only; nothing else degrades.
+  const RequestInfo info = extractRequest(ApiProtocol::OpenAiChatCompletions, R"({
+    "model": "gpt-4o-mini", "max_tokens": "lots", "stream": "yes", "messages": {}
+  })");
+  EXPECT_EQ(info.model, "gpt-4o-mini");
+  EXPECT_FALSE(info.requested_max_output_tokens.has_value());
+  EXPECT_FALSE(info.streaming);
+  EXPECT_FALSE(info.message_count.has_value());
+}
+
+TEST(RequestInfoTest, OpenAiResponses) {
+  const RequestInfo info = extractRequest(ApiProtocol::OpenAiResponses, R"({
+    "model": "gpt-4o-mini",
+    "max_output_tokens": 512,
+    "instructions": "be terse",
+    "input": "what is 2+2"
+  })");
+  EXPECT_EQ(info.model, "gpt-4o-mini");
+  EXPECT_EQ(info.requested_max_output_tokens, 512);
+  // A bare-string `input` has no turn structure to count.
+  EXPECT_FALSE(info.message_count.has_value());
+  EXPECT_TRUE(info.estimated_input_tokens.has_value());
+
+  const RequestInfo list_input = extractRequest(ApiProtocol::OpenAiResponses, R"({
+    "input": [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]
+  })");
+  EXPECT_EQ(list_input.message_count, 2);
+}
+
+TEST(RequestInfoTest, AnthropicMessages) {
+  const RequestInfo info = extractRequest(ApiProtocol::AnthropicMessages, R"({
+    "model": "claude-haiku-4-5",
+    "max_tokens": 1024,
+    "system": "you are terse",
+    "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+  })");
+  EXPECT_EQ(info.api_protocol, ApiProtocol::AnthropicMessages);
+  EXPECT_EQ(info.model, "claude-haiku-4-5");
+  EXPECT_EQ(info.requested_max_output_tokens, 1024);
+  EXPECT_EQ(info.message_count, 2);
+  EXPECT_FALSE(info.streaming);
+}
+
+TEST(RequestInfoTest, AnthropicSystemBlocksCountTowardEstimate) {
+  // The system prompt is a top-level member, and a long one must move the
+  // estimate even though it is not a turn.
+  const RequestInfo without =
+      extractRequest(ApiProtocol::AnthropicMessages, R"({"messages": [{"content": "hi"}]})");
+  const RequestInfo with = extractRequest(ApiProtocol::AnthropicMessages, R"({
+    "messages": [{"content": "hi"}],
+    "system": [{"type": "text", "text": "0123456789012345678901234567890123456789"}]
+  })");
+  ASSERT_TRUE(without.estimated_input_tokens.has_value());
+  ASSERT_TRUE(with.estimated_input_tokens.has_value());
+  EXPECT_GT(with.estimated_input_tokens.value(), without.estimated_input_tokens.value());
+}
+
+TEST(RequestInfoTest, GeminiReadsModelAndStreamingFromPath) {
+  const RequestInfo json_call = extractRequest(ApiProtocol::GeminiGenerateContent, R"({})",
+                                               "/v1beta/models/gemini-2.5-flash:generateContent");
+  EXPECT_EQ(json_call.model, "gemini-2.5-flash");
+  EXPECT_FALSE(json_call.streaming);
+
+  const RequestInfo stream_call =
+      extractRequest(ApiProtocol::GeminiGenerateContent, R"({})",
+                     "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
+  EXPECT_EQ(stream_call.model, "gemini-2.5-flash");
+  EXPECT_TRUE(stream_call.streaming);
+
+  // A gateway prefix ahead of the API path must not confuse the scan, and a
+  // prefix containing the word "models" must not win over the real segment.
+  EXPECT_EQ(extractRequest(ApiProtocol::GeminiGenerateContent, R"({})",
+                           "/models/proxy/v1beta/models/gemini-3-pro:generateContent")
+                .model,
+            "gemini-3-pro");
+}
+
+TEST(RequestInfoTest, GeminiUnrecognizedPathYieldsNoModel) {
+  EXPECT_TRUE(extractRequest(ApiProtocol::GeminiGenerateContent, R"({})", "/v1beta/generate")
+                  .model.empty());
+  EXPECT_TRUE(extractRequest(ApiProtocol::GeminiGenerateContent, R"({})", "").model.empty());
+  // Empty model segment.
+  EXPECT_TRUE(
+      extractRequest(ApiProtocol::GeminiGenerateContent, R"({})", "/v1beta/models/:generateContent")
+          .model.empty());
+  // A path segment is upstream-influenced; an oversized one is not published.
+  const std::string long_model(MaxStringValueSize + 1, 'm');
+  EXPECT_TRUE(extractRequest(ApiProtocol::GeminiGenerateContent, R"({})",
+                             "/v1beta/models/" + long_model + ":generateContent")
+                  .model.empty());
+}
+
+TEST(RequestInfoTest, GeminiGenerationConfigBothSpellings) {
+  EXPECT_EQ(extractRequest(ApiProtocol::GeminiGenerateContent,
+                           R"({"generationConfig": {"maxOutputTokens": 300}})")
+                .requested_max_output_tokens,
+            300);
+  EXPECT_EQ(extractRequest(ApiProtocol::GeminiGenerateContent,
+                           R"({"generation_config": {"max_output_tokens": 400}})")
+                .requested_max_output_tokens,
+            400);
+}
+
+TEST(RequestInfoTest, GeminiCountsContents) {
+  const RequestInfo info = extractRequest(ApiProtocol::GeminiGenerateContent, R"({
+    "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+    "systemInstruction": {"parts": [{"text": "be terse"}]}
+  })",
+                                          "/v1beta/models/gemini-2.5-flash:generateContent");
+  EXPECT_EQ(info.message_count, 1);
+  EXPECT_TRUE(info.estimated_input_tokens.has_value());
+}
+
+TEST(RequestInfoTest, UnspecifiedProtocolExtractsNothing) {
+  const RequestInfo info =
+      extractRequest(ApiProtocol::Unspecified, R"({"model": "gpt-4o-mini", "max_tokens": 10})");
+  EXPECT_FALSE(info.hasAny());
+  EXPECT_TRUE(info.model.empty());
+}
+
+// ---------------------------------------------------------------------------
+// The estimator itself.
+
+TEST(EstimateInputTokensTest, RoundsUpAndAddsFraming) {
+  EXPECT_EQ(estimateInputTokens(0, 0), 0);
+  // Any text at all costs at least one token.
+  EXPECT_EQ(estimateInputTokens(1, 0), 1);
+  EXPECT_EQ(estimateInputTokens(BytesPerTokenEstimate, 0), 1);
+  EXPECT_EQ(estimateInputTokens(BytesPerTokenEstimate + 1, 0), 2);
+  EXPECT_EQ(estimateInputTokens(0, 3), 3 * MessageFramingTokens);
+}
+
+TEST(EstimateInputTokensTest, StaysWithinTheMetadataSafeBound) {
+  // The estimate is published in the same uint64 record as the real counts, so
+  // it must respect the same bound no matter what the payload declared. The
+  // divide by BytesPerTokenEstimate means the largest measurable payload is
+  // already well inside it; the guard is what keeps that true if either
+  // constant changes.
+  EXPECT_LE(estimateInputTokens(MaxSafeCount, 0xffffffff), MaxSafeCount);
+  EXPECT_GT(estimateInputTokens(MaxSafeCount, 0xffffffff), 0);
+  // Monotonic in payload size -- the one property the heuristic guarantees.
+  EXPECT_GT(estimateInputTokens(1000, 0), estimateInputTokens(100, 0));
+}
+
+TEST(MeasureTextBytesTest, SumsStringValuesOnly) {
+  // Keys are not counted, values are; nested containers are descended.
+  EXPECT_EQ(measureTextBytes(parse(R"({"role": "user"})")), 4);
+  EXPECT_EQ(measureTextBytes(parse(R"([{"text": "ab"}, {"text": "cde"}])")), 5);
+  // Numbers, booleans and nulls contribute nothing.
+  EXPECT_EQ(measureTextBytes(parse(R"({"n": 12345, "b": true, "z": null})")), 0);
+}
+
+TEST(MeasureTextBytesTest, CountsOffloadedStringsByRecordedLength) {
+  // The whole point: a prompt too large to sit in the DOM still contributes
+  // its length, without its bytes ever being read here.
+  nlohmann::json doc = nlohmann::json::object();
+  doc["content"] = JsonWithExtBuf::makeExternalRef({/*offset=*/64, /*length=*/4096});
+  EXPECT_EQ(measureTextBytes(doc), 4096);
+  ASSERT_TRUE(estimateInputTokens(measureTextBytes(doc), 1) > 1000);
+}
+
+TEST(MeasureTextBytesTest, StopsAtDepthCap) {
+  // Build a chain deeper than the cap and check the walk terminates without
+  // counting past it.
+  nlohmann::json deep = "leaf";
+  for (int i = 0; i < MaxTextWalkDepth + 5; ++i) {
+    nlohmann::json wrapper = nlohmann::json::array();
+    wrapper.push_back(std::move(deep));
+    deep = std::move(wrapper);
+  }
+  EXPECT_EQ(measureTextBytes(deep), 0);
 }
 
 } // namespace

@@ -89,7 +89,9 @@ envoy_cc_library(
     srcs = ["json_readers.cc"],
     hdrs = ["json_readers.h"],
     deps = [
+        ":json_with_ext_buf_lib",
         "//source/common/singleton:const_singleton",
+        "@abseil-cpp//absl/status:statusor",
         "@nlohmann_json//:json",
     ],
 )

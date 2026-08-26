@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/http/codes.h"
 
@@ -25,6 +26,7 @@ namespace AiProtocolManager {
 namespace {
 
 constexpr absl::string_view DefaultTokenUsageNamespace{"envoy.ai.token_usage"};
+constexpr absl::string_view DefaultRequestInfoNamespace{"envoy.ai.request_info"};
 constexpr absl::string_view SseContentType{"text/event-stream"};
 constexpr absl::string_view JsonContentType{"application/json"};
 // Sized so that ordinary OpenAI Responses API terminal lifecycle events --
@@ -107,6 +109,36 @@ envoy::data::ai::v3::TokenUsage typedUsage(const TokenUsage& usage, bool degrade
   return typed;
 }
 
+// Converts an extracted request record into the typed message published as
+// dynamic metadata. Absence is preserved: a field the request did not declare
+// stays unset rather than being written as zero.
+envoy::data::ai::v3::RequestInfo typedRequestInfo(const RequestInfo& info) {
+  envoy::data::ai::v3::RequestInfo typed;
+  typed.set_api_protocol(protocolToProto(info.api_protocol));
+  if (!info.model.empty()) {
+    typed.set_model(info.model);
+  }
+  typed.set_streaming(info.streaming);
+  if (info.requested_max_output_tokens.has_value()) {
+    typed.mutable_requested_max_output_tokens()->set_value(
+        info.requested_max_output_tokens.value());
+  }
+  if (info.estimated_input_tokens.has_value()) {
+    typed.mutable_estimated_input_tokens()->set_value(info.estimated_input_tokens.value());
+    // The method is meaningful only alongside a value, and there is one
+    // estimator today; naming it here is what lets a later exact tokenizer be
+    // told apart by consumers without a config lookup.
+    typed.set_estimation_method(envoy::data::ai::v3::RequestInfo::TEXT_LENGTH_HEURISTIC);
+  }
+  if (info.message_count.has_value()) {
+    typed.mutable_message_count()->set_value(info.message_count.value());
+  }
+  if (info.tool_count.has_value()) {
+    typed.mutable_tool_count()->set_value(info.tool_count.value());
+  }
+  return typed;
+}
+
 } // namespace
 
 FilterConfig::FilterConfig(
@@ -116,7 +148,14 @@ FilterConfig::FilterConfig(
           ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, "ai_protocol_manager."))}),
       request_handling_enabled_(proto.has_request_handling()),
       parse_unconfigured_routes_(proto.request_handling().parse_unconfigured_routes()),
+      request_info_enabled_(proto.request_handling().has_request_info()),
+      request_info_namespace_(proto.request_handling().request_info().metadata_namespace().empty()
+                                  ? std::string(DefaultRequestInfoNamespace)
+                                  : proto.request_handling().request_info().metadata_namespace()),
       token_usage_enabled_(proto.response_handling().has_token_usage()),
+      synthesize_usage_trailers_(proto.response_handling().token_usage().usage_signal() ==
+                                 envoy::extensions::filters::http::ai_protocol_manager::v3::
+                                     TokenUsageExtraction::SYNTHESIZE_TRAILERS),
       include_unconfigured_routes_(
           proto.response_handling().token_usage().include_unconfigured_routes()),
       default_api_protocol_(
@@ -256,8 +295,45 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
         }
       }
     }
+
+    // Published here, not at stream end: the chain is still held, so the
+    // record lands before any later decode filter runs and is already in
+    // place on that filter's first callback. A payload rejected above never
+    // reaches this point.
+    if (config_->requestInfoEnabled()) {
+      publishRequestInfo();
+    }
   }
   return true;
+}
+
+void AiProtocolManagerFilter::publishRequestInfo() {
+  // Wire APIs that address the model in the URL need the request target; the
+  // headers are still held here, and StreamInfo carries them from the moment
+  // the stream was created.
+  absl::string_view path;
+  if (const Http::RequestHeaderMap* headers = decoder_callbacks_->streamInfo().getRequestHeaders();
+      headers != nullptr) {
+    path = headers->getPathValue();
+  }
+
+  const RequestInfo info =
+      AdapterRegistry::get(route_request_protocol_).extractRequestInfo(request_json_.json(), path);
+  if (!info.hasAny()) {
+    // An undeclared route resolves to the no-op adapter, and a payload that
+    // declares nothing this dialect names reads as empty. Either way there is
+    // nothing to publish.
+    config_->stats().request_info_empty_.inc();
+    return;
+  }
+
+  Protobuf::Any typed_any;
+  MessageUtil::packFrom(typed_any, typedRequestInfo(info));
+  decoder_callbacks_->streamInfo().setDynamicTypedMetadata(config_->requestInfoNamespace(),
+                                                           typed_any);
+  config_->stats().request_info_published_.inc();
+  ENVOY_LOG(trace, "ai_protocol_manager: request info published to namespace {}",
+            config_->requestInfoNamespace());
 }
 
 void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
@@ -436,7 +512,16 @@ Http::FilterDataStatus AiProtocolManagerFilter::encodeData(Buffer::Instance& dat
     response_handler_->onData(data);
     if (end_stream) {
       response_handler_->onEndStream();
-      finalizeResponseHandling();
+      // Only a response that ends on a data frame can have trailers added:
+      // one that carries its own reaches encodeTrailers() instead, where
+      // publication already happens ahead of those trailers continuing down
+      // the chain. addEncodedTrailers() is valid exactly here -- in
+      // encodeData with end_stream set, on a stream with no trailers yet.
+      if (finalizeResponseHandling() && config_->synthesizeUsageTrailers()) {
+        encoder_callbacks_->addEncodedTrailers();
+        config_->stats().usage_trailers_synthesized_.inc();
+        ENVOY_LOG(trace, "ai_protocol_manager: added end-of-stream trailers to carry usage");
+      }
     }
   }
   return Http::FilterDataStatus::Continue;
@@ -453,7 +538,7 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::encodeTrailers(Http::Respons
   return Http::FilterTrailersStatus::Continue;
 }
 
-void AiProtocolManagerFilter::finalizeResponseHandling() {
+bool AiProtocolManagerFilter::finalizeResponseHandling() {
   response_finalized_ = true;
 
   TokenUsage usage = response_handler_->usage();
@@ -463,7 +548,7 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
     // Legitimately absent usage: e.g. an OpenAI stream without
     // `stream_options.include_usage`, or an unrecognized response shape.
     config_->stats().token_usage_missing_.inc();
-    return;
+    return false;
   }
 
   // Two publications for one stream (both-placement installs) would leave
@@ -477,7 +562,7 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
               "(both-placement installation); skipping duplicate publication",
               config_->metadataNamespace());
     config_->stats().token_usage_duplicate_.inc();
-    return;
+    return false;
   }
 
   // Convert the finalized accumulator once into the authoritative typed
@@ -504,7 +589,7 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
     config_->stats().token_usage_failed_.inc();
     ENVOY_LOG(trace, "ai_protocol_manager: status-only (failed) record published to namespace {}",
               config_->metadataNamespace());
-    return;
+    return true;
   }
   if (degraded) {
     config_->stats().token_usage_partial_.inc();
@@ -516,6 +601,7 @@ void AiProtocolManagerFilter::finalizeResponseHandling() {
   config_->stats().token_usage_found_.inc();
   ENVOY_LOG(trace, "ai_protocol_manager: token usage published to namespace {}",
             config_->metadataNamespace());
+  return true;
 }
 
 } // namespace AiProtocolManager

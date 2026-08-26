@@ -65,6 +65,48 @@ const nlohmann::json* readObject(const nlohmann::json& json, const std::string& 
 std::optional<uint64_t> addCounts(std::optional<uint64_t> base,
                                   const std::optional<uint64_t>& extra, bool& overflow);
 
+// Request-side readers. A request's own declared values are not
+// provider-reported counts: a client that sends a malformed `max_tokens` gets
+// no value for that field and nothing else about the record is degraded by
+// it, so these have no `malformed` out-parameter.
+
+// A non-negative integer request field; anything unusable reads as absent.
+std::optional<uint64_t> readRequestCount(const nlohmann::json& json, const std::string& key);
+
+// A boolean request field; missing or non-boolean reads as false.
+bool readFlag(const nlohmann::json& json, const std::string& key);
+
+// The element count of an array field. Absent or non-array reads as nullopt,
+// so "sent no tools key" stays distinguishable from "sent an empty list".
+std::optional<uint32_t> countArray(const nlohmann::json& json, const std::string& key);
+
+// The estimator's two constants. They are deliberately crude: the estimate is
+// an admission bound, not an accounting figure, and a real tokenizer is both
+// model-specific and far too expensive for a proxy hot path. Four bytes per
+// token is the usual rule of thumb for Latin-script prose; the per-message
+// allowance covers the role/delimiter framing every chat wire format adds
+// around a turn.
+constexpr uint64_t BytesPerTokenEstimate = 4;
+constexpr uint64_t MessageFramingTokens = 4;
+
+// Bound on how deep measureTextBytes() descends. Payload nesting is already
+// capped by the parser; this only keeps the walk's own recursion finite if
+// that ever changes.
+constexpr int MaxTextWalkDepth = 32;
+
+// Sums the byte length of every string reachable from `node`, values only.
+//
+// A string the parser offloaded is not in the DOM -- it rides as an external
+// reference carrying the length of its raw bytes -- and contributes that
+// length. So the walk measures the whole payload without materializing, or
+// even reading, the large values in it: exactly the strings a prompt is made
+// of.
+uint64_t measureTextBytes(const nlohmann::json& node, int depth = 0);
+
+// Turns measured text bytes and a turn count into a token estimate,
+// saturating at MaxSafeCount rather than wrapping.
+uint64_t estimateInputTokens(uint64_t text_bytes, uint32_t message_count);
+
 // Keys materialized once: nlohmann's object map is keyed by std::string
 // without a transparent comparator, so per-probe temporaries would allocate on
 // the hot path. The pool is shared across adapters; each adapter reads only
@@ -102,6 +144,24 @@ struct JsonKeyValues {
   const std::string Type{"type"};
   const std::string Role{"role"};
   const std::string Delta{"delta"};
+  // Request-payload keys.
+  const std::string Messages{"messages"};
+  const std::string Tools{"tools"};
+  const std::string Stream{"stream"};
+  const std::string MaxTokens{"max_tokens"};
+  const std::string MaxCompletionTokens{"max_completion_tokens"};
+  const std::string MaxOutputTokens{"max_output_tokens"};
+  const std::string Input{"input"};
+  const std::string Instructions{"instructions"};
+  const std::string System{"system"};
+  const std::string Contents{"contents"};
+  // Gemini accepts both spellings of its structured request fields; the
+  // official SDKs send the camel-case spelling.
+  const std::string SystemInstruction{"systemInstruction"};
+  const std::string SystemInstructionSnake{"system_instruction"};
+  const std::string GenerationConfig{"generationConfig"};
+  const std::string GenerationConfigSnake{"generation_config"};
+  const std::string MaxOutputTokensCamel{"maxOutputTokens"};
 };
 using JsonKeys = ConstSingleton<JsonKeyValues>;
 
