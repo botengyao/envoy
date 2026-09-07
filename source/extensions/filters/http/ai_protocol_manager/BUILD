@@ -111,6 +111,46 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "request_info_lib",
+    hdrs = ["request_info.h"],
+    deps = [
+        ":token_usage_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "request_protocol_classifier_lib",
+    srcs = ["request_protocol_classifier.cc"],
+    hdrs = ["request_protocol_classifier.h"],
+    deps = [
+        ":request_info_lib",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "request_info_extractor_lib",
+    srcs = ["request_info_extractor.cc"],
+    hdrs = ["request_info_extractor.h"],
+    deps = [
+        ":request_info_lib",
+        "//source/common/json/wuffs_json:wuffs_json_cursor_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
+    name = "request_info_proto_lib",
+    srcs = ["request_info_proto.cc"],
+    hdrs = ["request_info_proto.h"],
+    deps = [
+        ":request_info_lib",
+        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
     name = "api_protocol_adapters_lib",
     srcs = ["api_protocol_adapters.cc"],
     deps = [
@@ -173,12 +213,17 @@ envoy_cc_library(
         ":filter_chain_bridge_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
+        ":request_info_extractor_lib",
+        ":request_info_lib",
+        ":request_info_proto_lib",
+        ":request_protocol_classifier_lib",
         ":response_handler_lib",
         ":schema_lib",
         ":stats_lib",
         "//envoy/http:codes_interface",
         "//envoy/router:router_interface",
         "//envoy/stats:stats_interface",
+        "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
         "//source/common/common:utility_lib",
         "//source/common/http:headers_lib",

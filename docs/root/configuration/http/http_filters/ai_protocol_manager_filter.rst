@@ -6,9 +6,10 @@ AI Protocol Manager
 The AI Protocol Manager filter (alpha) manages AI API traffic on both
 directions of a stream:
 
-* On the **request (decode) path** it buffers a declared AI endpoint's payload
-  off the connection manager's hot path — parsing it as it arrives — so that
-  routing and admission decisions can be made on the fully received body.
+* On the **request (decode) path** it strictly parses a declared AI endpoint's
+  complete payload, or performs bounded, best-effort inspection on an
+  unconfigured JSON route. Request attributes can be published as typed
+  dynamic metadata before later decode filters receive the request headers.
 * On the **response (encode) path** it can extract normalized LLM **token
   usage** from provider responses — OpenAI (Chat Completions and Responses
   API), Anthropic (Messages API), and Gemini (``generateContent`` /
@@ -23,28 +24,32 @@ and :ref:`response_handling
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.response_handling>`.
 
 The filter acts only on requests it has a reason to inspect. A request on a
-route that is not a declared AI endpoint -- and, unless
+route that is not a declared AI endpoint -- unless
 :ref:`parse_unconfigured_routes
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>`
-is set, every request -- passes straight through: its headers are not held, its
-body is not offloaded, and no external buffer is created for it. A filter chain
-carrying this filter therefore costs ordinary pass-through for the traffic it
-does not serve.
+is set -- passes straight through: its headers are not held, its body is not
+buffered or offloaded, and no parser is created. A filter chain carrying this
+filter therefore costs ordinary pass-through for traffic it does not inspect.
 
-For a request it does inspect, as the body arrives the filter offloads it into an external buffer
-rather than pinning it in the connection manager's in-memory buffers. Once the
-stream ends, it streams the buffered bytes back into the filter chain so that
-the subsequent filters observe the request unchanged. The offload/replay
-round-trip is flow-controlled in both directions: ingest honors the buffer
-limit, and replay is paced against filter-chain back-pressure, so the resident
-footprint stays bounded regardless of payload size.
+The request path has two deliberately different modes:
 
-While such a body is being offloaded, the request headers are held at this filter
-and released to the subsequent filters only once replay begins, so they never act
-on the headers before the payload they depend on is available.
+* **Declared route, strict parsing.** As the body arrives, the filter offloads
+  it into an external buffer rather than pinning it in the connection manager's
+  in-memory buffers. Once the stream ends, it replays the buffered bytes so
+  subsequent filters observe the request unchanged. The request headers remain
+  held until replay starts. The offload/replay round-trip is flow-controlled in
+  both directions, and malformed or schema-invalid payloads are rejected.
+* **Unconfigured route, best-effort inspection.** When
+  ``parse_unconfigured_routes`` is enabled, an eligible ``application/json``
+  POST request is inspected incrementally while only a bounded prefix is retained
+  by the HTTP filter manager. Inspection stops at a complete root JSON value,
+  end of stream, a parse error, or the configured byte limit. The filter then
+  releases the headers and retained prefix and lets the rest of the body stream
+  through without further inspection. The original request bytes are never
+  modified, and no parse or limit error rejects an unconfigured request.
 
-On a route declared to be an AI endpoint, the body is parsed as it is offloaded,
-so that a payload which is not well-formed JSON is rejected here rather than
+On a declared AI route, the body is parsed as it is offloaded, so that a payload
+which is not well-formed JSON is rejected here rather than
 forwarded for the upstream to interpret differently. Parsing is incremental and shares the offload's byte
 stream, so an invalid payload fails as soon as the offending byte arrives rather
 than after the whole upload. Oversized string values are left in the external
@@ -62,10 +67,11 @@ schema validation failure triggers an immediate HTTP 400 response.
 
 .. note::
 
-  On the request path the body is offloaded to an in-memory store. Request
-  schema validation is supported for declared APIs with a defined schema
-  (currently OpenAI Chat Completions); schema transcoding is not implemented
-  yet.
+  Strict request bodies are offloaded to an in-memory store. Request schema
+  validation is supported for declared APIs with a defined schema (currently
+  OpenAI Chat Completions); schema transcoding is not implemented yet. Bounded
+  inspection on an unconfigured route does not select or apply a strict schema
+  validator.
 
 The filter is a dual filter: besides the downstream HTTP filter chain shown
 below, it can also be placed in a cluster's upstream HTTP filter chain via
@@ -76,13 +82,16 @@ selection (and therefore once per retry or hedged attempt).
 .. note::
 
   Two caveats apply to the upstream placement, and only to routes the filter
-  inspects. The filter holds the request headers until the payload has been
-  fully offloaded, and upstream filter
+  inspects. On a declared route the filter holds request headers until the
+  payload has been fully offloaded; on an unconfigured route it holds them
+  until bounded inspection terminates. Upstream filter
   chains have no per-upgrade-type chain selection (the
   :ref:`upgrade_configs <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.upgrade_configs>`
-  escape hatch is downstream-only), so the filter must not front upgrade or
-  CONNECT routes, or other requests whose body does not end promptly: such
-  streams would stall until the request times out. Additionally, local replies
+  escape hatch is downstream-only). Unconfigured inspection skips upgrades,
+  CONNECT, and ``Expect: 100-continue`` requests, but an application-defined
+  duplex POST can still stall if its body does not advance without a response.
+  Declared routes remain operator-controlled and should not use this filter for
+  duplex exchanges. Additionally, local replies
   raised from an upstream filter chain (such as this filter's external-buffer
   error reply) are delivered directly to the downstream client without
   consulting the router's retry or hedging logic.
@@ -128,11 +137,12 @@ falls back to the request API.
 
 The filter-level configuration decides what happens on every other route. By
 default those requests are passed through untouched -- not parsed, and not
-offloaded; setting
+buffered or offloaded. Setting
 :ref:`parse_unconfigured_routes
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>`
-offloads and parses them too, but never fails a request over it -- a payload that
-does not parse is forwarded unchanged.
+enables bounded best-effort inspection for eligible JSON requests. It never
+fails an unconfigured request: on malformed input or a resource limit, the
+retained prefix and all following bytes are forwarded unchanged.
 
 .. code-block:: yaml
 
@@ -142,6 +152,168 @@ does not parse is forwarded unchanged.
       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
       request_handling:
         parse_unconfigured_routes: true
+        max_unconfigured_request_body_bytes: 1048576
+        request_info: {}
+
+Bounded request inspection
+--------------------------
+
+Unconfigured-route inspection is intended for installations such as a dynamic
+forward proxy, where route configuration cannot declare in advance whether a
+request is an inference request or which AI wire API it uses. The filter first
+uses a configured fallback protocol when one is supplied; otherwise it detects
+only conservative authority/path or body signatures. An ambiguous JSON body is
+forwarded without guessing a protocol.
+
+The :ref:`max_unconfigured_request_body_bytes
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.max_unconfigured_request_body_bytes>`
+limit defaults to 1 MiB. The filter feeds at most the remaining prefix budget
+from each data frame to the parser. Once the root JSON value closes, the HTTP
+stream ends, parsing fails, or the limit is reached, inspection becomes inert
+and the request continues immediately; it does not wait for end of stream and
+does not retain the remainder of a large body. The bounded prefix is held in
+the HTTP filter manager rather than copied into a complete-body DOM or external
+buffer. The currently delivered data frame and parser bookkeeping are
+additional memory. In particular, duplicate-key tracking can retain every
+distinct object key and therefore exceed the raw prefix size after allocation
+overhead. The 1 MiB default is an inspection and filter-manager retained-prefix
+limit, not a hard ceiling on the stream's total or instantaneous memory use.
+If the HTTP filter manager has a smaller nonzero buffer limit, the effective
+inspection threshold is clamped to that limit. This ensures the request is
+released before watermark backpressure could prevent the parser from receiving
+the bytes needed to reach its configured threshold.
+
+Only POST requests with an ``application/json`` or ``+json`` content type and
+an absent or ``identity`` ``Content-Encoding`` are eligible on an unconfigured
+route; this filter does not decode compressed request bodies. Upgrades and
+requests carrying any ``Expect`` header (including ``100-continue``) are
+skipped, because a client may wait for an upstream response before sending the
+body that would release held headers. An application-defined duplex exchange
+can have the same lifecycle even over POST; do not enable unconfigured
+inspection on traffic where the peer requires a response before it finishes
+the request body.
+
+This early-release behavior is best-effort only. A field after the inspected
+prefix is not available, and stopping before the complete HTTP body means the
+filter cannot assert whole-body JSON validity or detect a duplicate key that
+appears later. Declared AI routes keep the strict full-document offload,
+validation, and rejection behavior described above; this limit does not apply
+to them.
+
+Protocol and attribute mapping
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The effective request :ref:`wire API
+<envoy_v3_api_enum_type.ai.v3.ApiProtocol>` is selected in this order: the
+per-route request declaration, :ref:`request_info.default_api_protocol
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestInfoPublication.default_api_protocol>`,
+conservative authority/path detection, then strongly identifying body fields.
+The published ``detection_source`` records which source selected it. A detected
+or configured protocol on an unconfigured route selects an attribute extractor
+only; it never turns best-effort inspection into strict validation.
+
+Path signatures include ``/chat/completions``, ``/responses``, ``/messages``,
+and Gemini's ``:generateContent`` / ``:streamGenerateContent`` operations.
+They select a protocol only when a known direct-provider authority
+(``api.openai.com``, ``api.anthropic.com``, or
+``generativelanguage.googleapis.com``) agrees with the path. An unknown gateway
+authority requires ``default_api_protocol`` or body evidence rather than
+turning a common operation suffix such as ``/messages`` into an inference
+indicator. Body detection is intentionally narrower: a string-valued top-level
+``anthropic_version`` identifies Anthropic, while a top-level
+``generationConfig`` / ``generation_config`` object identifies Gemini.
+Conflicting markers leave the protocol unspecified.
+
+The normalized mappings are:
+
+* **OpenAI Chat Completions**: ``model`` and ``stream``; output cap from
+  ``max_completion_tokens`` with ``max_tokens`` as the legacy fallback;
+  ``message_count`` from ``messages`` and ``tool_count`` from ``tools``.
+* **OpenAI Responses**: ``model`` and ``stream``; output cap from
+  ``max_output_tokens``; ``message_count`` when ``input`` is an array and
+  ``tool_count`` from ``tools``.
+* **Anthropic Messages (Claude)**: ``model``, ``stream``, and ``max_tokens``;
+  ``message_count`` from ``messages`` and ``tool_count`` from ``tools``.
+  ``Claude`` is a model family carried in ``model``; the wire protocol remains
+  ``ANTHROPIC_MESSAGES`` rather than a separate provider protocol. When that
+  protocol is selected for Amazon Bedrock, the
+  ``/model/{model}/invoke`` / ``invoke-with-response-stream`` target supplies
+  the model and streaming intent.
+* **Gemini GenerateContent**: ``model`` and streaming intent from
+  ``.../models/{model}:generateContent`` or
+  ``.../models/{model}:streamGenerateContent``; output cap from
+  ``generationConfig.maxOutputTokens`` (the corresponding snake-case aliases
+  are also accepted); ``message_count`` from ``contents`` and ``tool_count``
+  from ``tools``.
+
+Only the selected scalar values are retained. Body model capture is capped at
+256 decoded bytes; a model copied from the request target is capped at 256 raw
+target bytes. An array count is published only after that array closes, so an
+array interrupted by the byte limit or a parse error remains absent. Direct
+elements are counted without validating their individual shape, and a closed
+empty array is represented as an explicit zero.
+
+Request-info metadata
+~~~~~~~~~~~~~~~~~~~~~
+
+When :ref:`request_handling.request_info
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.request_info>`
+is present, the filter publishes an
+:ref:`envoy.data.ai.v3.RequestInfo <envoy_v3_api_msg_data.ai.v3.RequestInfo>`
+message as **typed dynamic metadata**, under ``envoy.ai.request_info`` by
+default. No untyped ``Struct`` mirror is emitted. Optional wrapper fields retain
+presence, so an extracted ``stream: false`` or zero cap is not confused with no
+usable extracted value. Best-effort extraction does not distinguish an omitted
+known field from one with an unsupported type. Request values are client-declared
+and unverified; consumers must not treat them as provider identity or settled
+usage.
+
+``extraction_status`` distinguishes a complete record, a partial record with
+some usable attributes, and failed payload extraction. A failed record can
+still retain protocol, model, or streaming attributes selected from the route,
+configuration, authority, or request target. ``stop_reason`` says whether
+inspection ended at HTTP end of stream, a closed root JSON value, the byte
+limit, or a parse error. ``inspected_bytes`` reports how many raw body bytes
+reached the parser. ``detection_source`` distinguishes route,
+configuration-default, authority/path, and body detection. Fields not observed
+within the inspected prefix stay absent; consumers should check the status and
+presence rather than substituting protocol defaults. This extractor does not
+currently estimate input tokens, so ``estimated_input_tokens`` and
+``estimation_method`` remain unset.
+
+The metadata is written before held request headers are released. A later
+decode filter therefore observes it on its first header callback. For
+:ref:`ext_proc <config_http_filters_ext_proc>`, list the AI Protocol Manager
+first and forward the typed namespace:
+
+.. code-block:: yaml
+
+  http_filters:
+  - name: envoy.filters.http.ai_protocol_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+      request_handling:
+        parse_unconfigured_routes: true
+        max_unconfigured_request_body_bytes: 1048576
+        request_info: {}
+  - name: envoy.filters.http.ext_proc
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+      processing_mode:
+        request_header_mode: SEND
+        request_body_mode: NONE
+      metadata_options:
+        forwarding_namespaces:
+          typed:
+          - envoy.ai.request_info
+
+Decode filters run in list order. If ext_proc is listed first, its
+``request_headers`` message is sent before the metadata exists and cannot be
+retroactively enriched. In an upstream HTTP filter chain, place an upstream
+ext_proc after the AI Protocol Manager for the same reason. A downstream
+ext_proc has already processed request headers before an upstream AI Protocol
+Manager runs; it cannot receive upstream-produced request info in its initial
+``request_headers`` message.
 
 Response token-usage extraction
 -------------------------------
@@ -347,14 +519,16 @@ Upstream (cluster) installation
 The filter is also registered as an upstream HTTP filter for deployments where
 handling must live on the cluster — for example a dynamic-forward-proxy egress
 cluster whose destination is only known per request. The upstream installation
-is the full filter: the request-path offload/replay runs there too, once per
-retry or hedged attempt, with the caveats described under the request payload
-offload section above. Response token-usage extraction behaves identically in
-either chain.
+is the full filter: strict request offload/replay or bounded
+unconfigured-route inspection runs there too, once per retry or hedged attempt,
+with the caveats described above. Response token-usage extraction behaves
+identically in either chain.
 
 Typed dynamic metadata written from the upstream installation lands on the
-downstream stream's metadata and is visible to downstream typed-metadata
-consumers exactly as in a downstream installation.
+downstream stream's metadata. Consumers still observe it only on callbacks that
+run after publication; in particular, a downstream ext_proc request-header
+callback runs before an upstream AI Protocol Manager and cannot see upstream
+request-info metadata in that message.
 
 .. note::
 
@@ -396,6 +570,12 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   :header: Name, Type, Description
   :widths: 1, 1, 2
 
+  request_info_published, Counter, Request-info typed metadata was written (including ``PARTIAL`` and ``FAILED`` records).
+  request_info_partial, Counter, A published request-info record was flagged ``extraction_status: PARTIAL``.
+  request_info_failed, Counter, A request-info record was published with ``extraction_status: FAILED``.
+  request_info_missing, Counter, Request inspection completed without a request-info record to publish.
+  request_info_protocol_detected, Counter, The request wire protocol was detected from authority/path or body rather than declared by route or default configuration.
+  request_inspection_limit_reached, Counter, Unconfigured-route request inspection stopped at its effective byte limit (the configured cap or a lower HTTP filter-manager buffer limit).
   token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).
   token_usage_partial, Counter, A published record was flagged ``extraction_status: PARTIAL``.
   token_usage_failed, Counter, A status-only record was published (``extraction_status: FAILED``; no counts recovered).

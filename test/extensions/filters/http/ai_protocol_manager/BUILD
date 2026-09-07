@@ -91,6 +91,40 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "request_info_extractor_test",
+    srcs = ["request_info_extractor_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:request_info_extractor_lib",
+        "//test/test_common:status_utility_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "request_protocol_classifier_test",
+    srcs = ["request_protocol_classifier_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:request_protocol_classifier_lib",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "request_info_proto_test",
+    srcs = ["request_info_proto_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:request_info_proto_lib",
+        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "response_handler_test",
     srcs = ["response_handler_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

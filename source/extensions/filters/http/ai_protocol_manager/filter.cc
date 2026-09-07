@@ -1,17 +1,22 @@
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
 
+#include <algorithm>
 #include <memory>
 
+#include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/assert.h"
 #include "source/common/common/utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
+#include "source/extensions/filters/http/ai_protocol_manager/request_info_proto.h"
+#include "source/extensions/filters/http/ai_protocol_manager/request_protocol_classifier.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 
 #include "absl/strings/match.h"
@@ -25,8 +30,10 @@ namespace AiProtocolManager {
 namespace {
 
 constexpr absl::string_view DefaultTokenUsageNamespace{"envoy.ai.token_usage"};
+constexpr absl::string_view DefaultRequestInfoNamespace{"envoy.ai.request_info"};
 constexpr absl::string_view SseContentType{"text/event-stream"};
 constexpr absl::string_view JsonContentType{"application/json"};
+constexpr uint32_t DefaultMaxUnconfiguredRequestBodyBytes = 1024 * 1024;
 // Sized so that ordinary OpenAI Responses API terminal lifecycle events --
 // which embed the complete response object, generated output included -- are
 // extracted by default; see the proto for the rationale.
@@ -53,7 +60,7 @@ bool isJsonContentType(absl::string_view content_type) {
 
 // Extraction requires an unencoded body: every entry and comma-separated
 // coding of the (repeatable) Content-Encoding header must be `identity`.
-bool contentEncodingIsIdentity(const Http::ResponseHeaderMap& headers) {
+bool contentEncodingIsIdentity(const Http::HeaderMap& headers) {
   const auto entries = headers.get(Http::CustomHeaders::get().ContentEncoding);
   for (size_t i = 0; i < entries.size(); ++i) {
     // keep_empty_string=true rejects malformed values like `identity,,`.
@@ -116,6 +123,15 @@ FilterConfig::FilterConfig(
           ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, "ai_protocol_manager."))}),
       request_handling_enabled_(proto.has_request_handling()),
       parse_unconfigured_routes_(proto.request_handling().parse_unconfigured_routes()),
+      request_info_enabled_(proto.request_handling().has_request_info()),
+      request_info_namespace_(proto.request_handling().request_info().metadata_namespace().empty()
+                                  ? std::string(DefaultRequestInfoNamespace)
+                                  : proto.request_handling().request_info().metadata_namespace()),
+      request_info_default_protocol_(
+          protocolFromProto(proto.request_handling().request_info().default_api_protocol())),
+      max_unconfigured_request_body_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+          proto.request_handling(), max_unconfigured_request_body_bytes,
+          DefaultMaxUnconfiguredRequestBodyBytes)),
       token_usage_enabled_(proto.response_handling().has_token_usage()),
       include_unconfigured_routes_(
           proto.response_handling().token_usage().include_unconfigured_routes()),
@@ -156,13 +172,6 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // A headers-only request carries no payload to inspect, so there is nothing to
-  // hold the chain for: let the headers flow. (Pausing here would also deadlock,
-  // since no body would ever arrive to drive the replay that releases them.)
-  if (end_stream) {
-    return Http::FilterHeadersStatus::Continue;
-  }
-
   // Copy what the route declared; see the note on route_has_request_ for why the
   // config is not held by pointer.
   if (const RouteConfig* route_config =
@@ -176,16 +185,29 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     }
   }
 
-  // A declared AI endpoint is parsed strictly. Any other route is parsed only
-  // if the filter opted into parsing unconfigured routes -- and only for JSON
-  // payloads: full-duplex protocols (gRPC streaming, upgrades) must not have
-  // their headers held to end of request, since the client may not finish the
-  // request until it sees a response the held upstream cannot produce.
-  // TODO(penguingao): on a best-effort parse failure, release the held headers
-  // and buffered body immediately and pass the remainder through unbuffered,
-  // rather than buffering to end-of-stream.
-  if (!isAiEndpoint() &&
-      (!config_->parseUnconfiguredRoutes() || !isJsonContentType(headers.getContentTypeValue()))) {
+  request_authority_ = std::string(headers.getHostValue());
+  request_path_ = std::string(headers.getPathValue());
+  const bool best_effort_eligible =
+      !isAiEndpoint() && config_->parseUnconfiguredRoutes() &&
+      headers.getMethodValue() == Http::Headers::get().MethodValues.Post &&
+      !Http::Utility::isUpgrade(headers) && headers.Expect() == nullptr &&
+      isJsonContentType(headers.getContentTypeValue()) && contentEncodingIsIdentity(headers);
+
+  // A headers-only request has no payload to hold. It can still publish a
+  // route- or target-derived inference indicator before later filters see the
+  // headers.
+  if (end_stream) {
+    if (config_->requestInfoEnabled() && (isAiEndpoint() || best_effort_eligible)) {
+      finalizeRequestInfo(ExtractionStatus::Complete, StopReason::EndStream);
+    }
+    return Http::FilterHeadersStatus::Continue;
+  }
+
+  // A declared AI endpoint remains on the strict, full-document path. An
+  // unconfigured route uses a separate bounded SAX extractor: no external
+  // buffer is created, and parsing or resource errors release the request
+  // rather than reject it.
+  if (!isAiEndpoint() && !best_effort_eligible) {
     // Nothing will look at this payload, so stay out of the way: offloading it
     // would cost a store round-trip and withhold the headers meanwhile, for
     // nothing. Decided once here; decode_manager_ being null carries it.
@@ -193,7 +215,25 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
+  if (!isAiEndpoint()) {
+    request_handling_mode_ = RequestHandlingMode::BestEffortInspecting;
+    request_info_extractor_ = std::make_unique<RequestInfoExtractor>();
+    request_info_inspection_limit_ = config_->maxUnconfiguredRequestBodyBytes();
+    const uint64_t filter_manager_limit = decoder_callbacks_->bufferLimit();
+    if (filter_manager_limit > 0) {
+      request_info_inspection_limit_ =
+          std::min(request_info_inspection_limit_, filter_manager_limit);
+    }
+    ENVOY_LOG(trace,
+              "ai_protocol_manager: holding headers for bounded best-effort request inspection");
+    return Http::FilterHeadersStatus::StopIteration;
+  }
+
+  request_handling_mode_ = RequestHandlingMode::Strict;
   request_parser_ = std::make_unique<JsonWithExtBufParser>(JsonWithExtBufParser::Config{});
+  if (config_->requestInfoEnabled()) {
+    request_info_extractor_ = std::make_unique<RequestInfoExtractor>();
+  }
   // Built here, not at setDecoderFilterCallbacks(), so a pass-through stream pays
   // for none of it: constructing it subscribes to upstream watermarks and claims
   // a schedulable callback.
@@ -228,36 +268,187 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
   }
 
   if (!status.ok()) {
-    if (isAiEndpoint()) {
-      rejectInvalidPayload(status);
-      return false;
-    }
-    // Best effort: the payload is forwarded as it stands, just without a
-    // document for later filters to work from.
-    ENVOY_LOG(debug, "ai_protocol_manager: forwarding unparsed payload: {}", status.message());
-    request_parser_.reset();
-    return true;
+    rejectInvalidPayload(status);
+    return false;
   }
 
   if (end_stream) {
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
 
-    if (isAiEndpoint()) {
-      // TODO(penguingao): Support validating payload schema on the fly as the Wuffs parser
-      // streams and parses chunks, rejecting invalid fields early before end_stream.
-      if (const PayloadSchema* payload_schema =
-              AdapterRegistry::get(route_request_protocol_).schema();
-          payload_schema != nullptr) {
-        const absl::Status validation_status = payload_schema->validateRequest(request_json_);
-        if (!validation_status.ok()) {
-          rejectInvalidPayload(validation_status);
-          return false;
-        }
+    // TODO(penguingao): Support validating payload schema on the fly as the Wuffs parser
+    // streams and parses chunks, rejecting invalid fields early before end_stream.
+    if (const PayloadSchema* payload_schema =
+            AdapterRegistry::get(route_request_protocol_).schema();
+        payload_schema != nullptr) {
+      const absl::Status validation_status = payload_schema->validateRequest(request_json_);
+      if (!validation_status.ok()) {
+        rejectInvalidPayload(validation_status);
+        return false;
       }
     }
   }
   return true;
+}
+
+Http::FilterDataStatus AiProtocolManagerFilter::decodeBestEffortData(const Buffer::Instance& data,
+                                                                     bool end_stream) {
+  ASSERT(request_handling_mode_ == RequestHandlingMode::BestEffortInspecting);
+  ASSERT(request_info_extractor_ != nullptr);
+
+  const uint64_t limit = request_info_inspection_limit_;
+  ASSERT(limit > 0);
+  ASSERT(request_info_inspected_bytes_ <= limit);
+  if (end_stream && data.length() == 0 && request_info_inspected_bytes_ == 0) {
+    finalizeRequestInfo(ExtractionStatus::Complete, StopReason::EndStream);
+    request_info_extractor_.reset();
+    request_handling_mode_ = RequestHandlingMode::BestEffortReleased;
+    return Http::FilterDataStatus::Continue;
+  }
+  uint64_t remaining = limit - request_info_inspected_bytes_;
+  const bool whole_frame_fits = data.length() <= remaining;
+  absl::Status status = absl::OkStatus();
+  bool parser_saw_end_stream = false;
+
+  const Buffer::RawSliceVector slices = data.getRawSlices();
+  for (size_t i = 0; i < slices.size() && status.ok() && remaining > 0 &&
+                     (!request_info_extractor_->rootClosed() || (end_stream && whole_frame_fits));
+       ++i) {
+    const size_t length = static_cast<size_t>(std::min<uint64_t>(slices[i].len_, remaining));
+    if (length == 0) {
+      continue;
+    }
+    const bool final_slice = i + 1 == slices.size();
+    parser_saw_end_stream = end_stream && whole_frame_fits && final_slice;
+    status = request_info_extractor_->feed(
+        absl::string_view(static_cast<const char*>(slices[i].mem_), length), parser_saw_end_stream);
+    request_info_inspected_bytes_ += length;
+    remaining -= length;
+  }
+  if (status.ok() && end_stream && slices.empty()) {
+    parser_saw_end_stream = true;
+    status = request_info_extractor_->feed("", /*closed=*/true);
+  }
+
+  // On a nonterminal frame, root closure is the deliberate early-release
+  // boundary. Bytes after the root in that same frame are outside the
+  // best-effort inspection contract, just like bytes arriving in a later
+  // frame, so root closure wins over a post-root cursor error. At HTTP end of
+  // stream the complete inspected frame is authoritative and trailing garbage
+  // remains a parse error.
+  if (request_info_extractor_->rootClosed() && !end_stream) {
+    finalizeRequestInfo(ExtractionStatus::Partial, StopReason::RootClosed);
+  } else if (!status.ok()) {
+    ENVOY_LOG(debug, "ai_protocol_manager: releasing best-effort request after parse error: {}",
+              status.message());
+    finalizeRequestInfo(ExtractionStatus::Failed, StopReason::ParseError);
+  } else if (request_info_extractor_->rootClosed()) {
+    const bool complete = parser_saw_end_stream;
+    finalizeRequestInfo(complete ? ExtractionStatus::Complete : ExtractionStatus::Partial,
+                        complete ? StopReason::EndStream : StopReason::RootClosed);
+  } else if (request_info_inspected_bytes_ == limit) {
+    config_->stats().request_inspection_limit_reached_.inc();
+    finalizeRequestInfo(ExtractionStatus::Partial, StopReason::ByteLimit);
+  } else {
+    return Http::FilterDataStatus::StopIterationAndWatermark;
+  }
+
+  request_info_extractor_.reset();
+  request_handling_mode_ = RequestHandlingMode::BestEffortReleased;
+  // Returning Continue from a filter stopped on headers releases the held
+  // headers, the HTTP filter manager's buffered prefix, and this frame in
+  // order. Later frames pass through without inspection.
+  return Http::FilterDataStatus::Continue;
+}
+
+void AiProtocolManagerFilter::observeStrictRequestInfo(const Buffer::Instance& data,
+                                                       bool end_stream) {
+  if (request_info_extractor_ == nullptr || request_info_parse_failed_ ||
+      request_info_extractor_->rootClosed()) {
+    return;
+  }
+
+  absl::Status status = absl::OkStatus();
+  const Buffer::RawSliceVector slices = data.getRawSlices();
+  for (size_t i = 0; i < slices.size() && status.ok() && !request_info_extractor_->rootClosed();
+       ++i) {
+    const bool final_slice = i + 1 == slices.size();
+    status = request_info_extractor_->feed(
+        absl::string_view(static_cast<const char*>(slices[i].mem_), slices[i].len_),
+        end_stream && final_slice);
+    request_info_inspected_bytes_ += slices[i].len_;
+  }
+  if (status.ok() && end_stream && slices.empty()) {
+    status = request_info_extractor_->feed("", /*closed=*/true);
+  }
+  if (!status.ok()) {
+    request_info_parse_failed_ = true;
+    request_info_extractor_.reset();
+  }
+}
+
+void AiProtocolManagerFilter::finalizeRequestInfo(ExtractionStatus status, StopReason reason) {
+  if (!config_->requestInfoEnabled() || request_info_finalized_) {
+    return;
+  }
+  request_info_finalized_ = true;
+
+  const ApiProtocol body_protocol =
+      status != ExtractionStatus::Failed && request_info_extractor_ != nullptr
+          ? request_info_extractor_->bodyDetectedProtocol()
+          : ApiProtocol::Unspecified;
+  const RequestProtocolClassification classification =
+      selectRequestProtocol(route_request_protocol_, config_->requestInfoDefaultProtocol(),
+                            request_authority_, request_path_, body_protocol);
+
+  if (!classification.matched() && !route_has_request_) {
+    config_->stats().request_info_missing_.inc();
+    return;
+  }
+
+  RequestInfo info;
+  if ((classification.matched() || route_has_request_) && status != ExtractionStatus::Failed &&
+      request_info_extractor_ != nullptr) {
+    info = request_info_extractor_->finalizeForProtocol(classification.api_protocol);
+  }
+  info.api_protocol = classification.api_protocol;
+  info.detection_source =
+      classification.matched() ? classification.detection_source : DetectionSource::Route;
+  if (classification.model.has_value()) {
+    info.model = classification.model;
+  }
+  if (classification.streaming.has_value()) {
+    info.streaming = classification.streaming;
+  }
+  const bool has_usable_attribute = classification.matched() || info.model.has_value() ||
+                                    info.streaming.has_value() ||
+                                    info.max_output_tokens.has_value() ||
+                                    info.message_count.has_value() || info.tool_count.has_value();
+  if (status == ExtractionStatus::Partial && !has_usable_attribute) {
+    status = ExtractionStatus::Failed;
+  }
+  info.extraction_status = status;
+  info.stop_reason = reason;
+  info.inspected_bytes = request_info_inspected_bytes_;
+
+  if (classification.matched() &&
+      (classification.detection_source == DetectionSource::AuthorityPath ||
+       classification.detection_source == DetectionSource::Body)) {
+    config_->stats().request_info_protocol_detected_.inc();
+  }
+
+  Protobuf::Any typed_any;
+  MessageUtil::packFrom(typed_any, requestInfoToProto(info));
+  decoder_callbacks_->streamInfo().setDynamicTypedMetadata(config_->requestInfoNamespace(),
+                                                           typed_any);
+  config_->stats().request_info_published_.inc();
+  if (status == ExtractionStatus::Partial) {
+    config_->stats().request_info_partial_.inc();
+  } else if (status == ExtractionStatus::Failed) {
+    config_->stats().request_info_failed_.inc();
+  }
+  ENVOY_LOG(trace, "ai_protocol_manager: request info published to namespace {}",
+            config_->requestInfoNamespace());
 }
 
 void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
@@ -270,10 +461,15 @@ void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
 
 Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& data,
                                                            bool end_stream) {
-  if (decode_manager_ == nullptr) {
-    // decodeHeaders() decided this stream is none of our business.
+  if (request_handling_mode_ == RequestHandlingMode::BestEffortInspecting) {
+    return decodeBestEffortData(data, end_stream);
+  }
+  if (request_handling_mode_ == RequestHandlingMode::PassThrough ||
+      request_handling_mode_ == RequestHandlingMode::BestEffortReleased) {
     return Http::FilterDataStatus::Continue;
   }
+  ASSERT(request_handling_mode_ == RequestHandlingMode::Strict);
+  ASSERT(decode_manager_ != nullptr);
   if (payload_rejected_) {
     // Already terminated by the local reply; drop whatever is still in flight.
     return Http::FilterDataStatus::StopIterationNoBuffer;
@@ -287,9 +483,18 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     // manager has been given nothing, since every frame reaches both.
     if (end_stream && data.length() == 0 && decode_manager_->empty()) {
       request_parser_.reset();
-    } else if (!feedParser(data, end_stream)) {
-      return Http::FilterDataStatus::StopIterationNoBuffer;
+    } else {
+      observeStrictRequestInfo(data, end_stream);
+      if (!feedParser(data, end_stream)) {
+        return Http::FilterDataStatus::StopIterationNoBuffer;
+      }
     }
+  }
+
+  if (end_stream) {
+    finalizeRequestInfo(
+        request_info_parse_failed_ ? ExtractionStatus::Failed : ExtractionStatus::Complete,
+        request_info_parse_failed_ ? StopReason::ParseError : StopReason::EndStream);
   }
 
   decode_manager_->onData(data);
@@ -310,25 +515,46 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 }
 
 Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::RequestTrailerMap&) {
-  if (decode_manager_ == nullptr) {
+  if (request_handling_mode_ == RequestHandlingMode::BestEffortInspecting) {
+    if (request_info_inspected_bytes_ == 0) {
+      finalizeRequestInfo(ExtractionStatus::Complete, StopReason::EndStream);
+    } else {
+      const absl::Status status = request_info_extractor_->feed("", /*closed=*/true);
+      finalizeRequestInfo(status.ok() ? ExtractionStatus::Complete : ExtractionStatus::Failed,
+                          status.ok() ? StopReason::EndStream : StopReason::ParseError);
+    }
+    request_info_extractor_.reset();
+    request_handling_mode_ = RequestHandlingMode::BestEffortReleased;
     return Http::FilterTrailersStatus::Continue;
   }
+  if (request_handling_mode_ == RequestHandlingMode::PassThrough ||
+      request_handling_mode_ == RequestHandlingMode::BestEffortReleased) {
+    return Http::FilterTrailersStatus::Continue;
+  }
+  ASSERT(request_handling_mode_ == RequestHandlingMode::Strict);
+  ASSERT(decode_manager_ != nullptr);
   if (payload_rejected_) {
     return Http::FilterTrailersStatus::StopIteration;
   }
   // A trailer-only request (no body) has nothing to replay; let the trailers flow.
   if (decode_manager_->empty()) {
+    finalizeRequestInfo(ExtractionStatus::Complete, StopReason::EndStream);
     return Http::FilterTrailersStatus::Continue;
   }
 
+  Buffer::OwnedImpl empty;
+  observeStrictRequestInfo(empty, /*end_stream=*/true);
   // No data frame carried end_stream, so the document is still open. Closing it
   // here is what catches a truncated payload.
   if (request_parser_ != nullptr) {
-    Buffer::OwnedImpl empty;
     if (!feedParser(empty, /*end_stream=*/true)) {
       return Http::FilterTrailersStatus::StopIteration;
     }
   }
+
+  finalizeRequestInfo(request_info_parse_failed_ ? ExtractionStatus::Failed
+                                                 : ExtractionStatus::Complete,
+                      request_info_parse_failed_ ? StopReason::ParseError : StopReason::EndStream);
 
   // The body ended without end_stream on a data frame; the trailers carry it.
   decode_manager_->endStream();

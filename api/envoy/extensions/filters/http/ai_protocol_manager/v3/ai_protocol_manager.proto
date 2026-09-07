@@ -53,14 +53,66 @@ message AiProtocolManager {
 // well-formed JSON is rejected with a 400 rather than forwarded for the
 // upstream to interpret differently.
 message RequestHandling {
-  // Attempt best-effort JSON parsing on routes without a per-route
-  // configuration.
+  // Attempt best-effort JSON parsing on routes without a per-route request
+  // declaration.
   //
   // Defaults to ``false``: unconfigured routes are not buffered or parsed.
-  // When ``true``, such routes are parsed too, but never failed over it — a
-  // route that declared no AI wire contract has nothing to hold its payload
-  // to, so a body that fails to parse is forwarded unchanged.
+  // When ``true``, eligible unencoded JSON POST requests with an
+  // ``application/json`` or ``+json`` content type are inspected up to
+  // :ref:`max_unconfigured_request_body_bytes
+  // <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.max_unconfigured_request_body_bytes>`.
+  // Such requests are never failed over parsing or limit errors — a route
+  // that declared no AI wire contract has nothing to hold its payload to, so
+  // the held prefix and the rest of the body are forwarded unchanged. Upgrade
+  // requests and requests carrying any ``Expect`` header (including
+  // ``Expect: 100-continue``) are not inspected, because holding their headers
+  // can deadlock a duplex exchange.
+  // A non-identity ``Content-Encoding`` is also skipped because this filter
+  // does not decode request bodies.
   bool parse_unconfigured_routes = 1;
+
+  // Extract and publish canonical request attributes as typed dynamic
+  // metadata. When unset, request parsing and validation do not publish a
+  // record.
+  RequestInfoPublication request_info = 2;
+
+  // Maximum raw body prefix inspected on an unconfigured route. Once this
+  // many bytes have been inspected, the request continues without waiting for
+  // end of stream. When request-info publication is enabled and the request can
+  // be classified, its partial record reports this limit. This bounds the
+  // prefix retained by the HTTP filter manager; the currently delivered data
+  // frame and parser bookkeeping are additional transient memory. If the
+  // HTTP filter manager's buffer limit is nonzero and lower than this value,
+  // inspection stops at that lower limit so watermark backpressure cannot
+  // stall the request before publication.
+  //
+  // Defaults to 1MiB. This limit does not apply to a route carrying a per-route
+  // request declaration (even one whose protocol is unspecified): declared
+  // requests retain their existing strict full-document validation behavior.
+  google.protobuf.UInt32Value max_unconfigured_request_body_bytes = 3
+      [(validate.rules).uint32 = {lte: 10485760 gte: 1}];
+}
+
+// Configuration for publishing :ref:`envoy.data.ai.v3.RequestInfo
+// <envoy_v3_api_msg_data.ai.v3.RequestInfo>` from an AI request.
+//
+// The record is written while request headers are held. A later decode filter,
+// such as ext_proc, therefore observes it in its first request-headers
+// callback. On unconfigured routes publication requires
+// :ref:`parse_unconfigured_routes
+// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>`.
+message RequestInfoPublication {
+  // Namespace for the emitted typed dynamic metadata.
+  // Defaults to ``envoy.ai.request_info``.
+  string metadata_namespace = 1;
+
+  // Fallback wire API when the route does not declare one.
+  //
+  // ``API_PROTOCOL_UNSPECIFIED`` enables conservative detection from the
+  // request target and strongly identifying payload fields. This fallback
+  // selects only the attribute extractor; it never selects a strict request
+  // validator for an unconfigured route.
+  type.ai.v3.ApiProtocol default_api_protocol = 2 [(validate.rules).enum = {defined_only: true}];
 }
 
 // Response-side processing configuration. Individual response features are

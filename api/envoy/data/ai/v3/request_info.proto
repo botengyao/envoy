@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package envoy.data.ai.v3;
+
+import "envoy/type/ai/v3/api_protocol.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.data.ai.v3";
+option java_outer_classname = "RequestInfoProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/data/ai/v3;aiv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI request info]
+
+// What an AI request declares about the work it is asking for, extracted from
+// the payload by an AI payload processor and published as typed dynamic
+// metadata before the payload is forwarded.
+//
+// This is the request-side counterpart of :ref:`TokenUsage
+// <envoy_v3_api_msg_data.ai.v3.TokenUsage>`. It allows admission and policy
+// consumers to use normalized request attributes without parsing each AI wire
+// protocol independently.
+//
+// Except where documented otherwise, fields reflect untrusted values declared
+// by the client. Optional scalar wrappers preserve an extracted scalar default
+// (for example ``stream: false``) as present. Absence means no usable value was
+// extracted; best-effort producers need not distinguish an omitted field from
+// one with an unsupported type, and partial inspection may not have reached it.
+// [#next-free-field: 13]
+message RequestInfo {
+  // How ``estimated_input_tokens`` was calculated. The estimate is advisory for
+  // admission, never an accounting figure. Consumers should settle against
+  // provider-reported usage when it becomes available.
+  enum EstimationMethod {
+    ESTIMATION_METHOD_UNSPECIFIED = 0;
+
+    // The byte length of the payload's prompt-bearing text, divided by a fixed
+    // bytes-per-token ratio, plus a fixed per-message framing allowance.
+    TEXT_LENGTH_HEURISTIC = 1;
+  }
+
+  // Quality of the extracted record.
+  enum ExtractionStatus {
+    EXTRACTION_STATUS_UNSPECIFIED = 0;
+
+    // Inspection reached a clean end of input without an extraction failure.
+    // This includes a request with no payload to parse.
+    COMPLETE = 1;
+
+    // At least one usable attribute was extracted, but parsing stopped before
+    // the complete input could be inspected.
+    PARTIAL = 2;
+
+    // Payload extraction failed. Protocol and target attributes selected from
+    // route, configuration, authority, or path evidence may still be present,
+    // together with status, stop reason, and inspected byte count.
+    FAILED = 3;
+  }
+
+  // Why request inspection stopped.
+  enum StopReason {
+    STOP_REASON_UNSPECIFIED = 0;
+
+    // The HTTP request reached end of stream.
+    END_STREAM = 1;
+
+    // The parser completed the root JSON value before HTTP end of stream.
+    ROOT_CLOSED = 2;
+
+    // The effective request inspection byte limit was reached. This is the
+    // configured cap or a lower HTTP filter-manager buffer limit.
+    BYTE_LIMIT = 3;
+
+    // The inspected prefix was malformed or could not be parsed.
+    PARSE_ERROR = 4;
+  }
+
+  // Source that selected ``api_protocol``.
+  enum DetectionSource {
+    DETECTION_SOURCE_UNSPECIFIED = 0;
+
+    // The matched route declared the request as an AI endpoint. The route can
+    // leave the wire protocol unspecified while still providing this source.
+    ROUTE = 1;
+
+    // The filter configuration supplied the fallback request wire protocol.
+    CONFIG_DEFAULT = 2;
+
+    // The request authority or path identified the request wire protocol.
+    AUTHORITY_PATH = 3;
+
+    // The inspected request body identified the request wire protocol.
+    BODY = 4;
+  }
+
+  // The wire API the request follows. This names an API contract, not a
+  // provider identity.
+  type.ai.v3.ApiProtocol api_protocol = 1;
+
+  // The model named by the request, either in the payload or in the request
+  // path for wire APIs that address the model there. Presence preserves an
+  // explicitly supplied empty model; absence means no usable model was
+  // extracted.
+  google.protobuf.StringValue model = 2;
+
+  // Whether the client explicitly requested an incrementally streamed
+  // response. Absence means no usable streaming preference was extracted.
+  google.protobuf.BoolValue streaming = 3;
+
+  // The usable output cap extracted from the request. Absence does not imply a
+  // provider default: the field may be absent, unusable, or outside a partially
+  // inspected prefix.
+  google.protobuf.UInt64Value requested_max_output_tokens = 4;
+
+  // Estimated input tokens, by ``estimation_method``. Unset when no estimate
+  // could be formed. The AI Protocol Manager's bounded request extractor does
+  // not currently estimate input tokens and leaves both fields unset.
+  google.protobuf.UInt64Value estimated_input_tokens = 5;
+
+  // How ``estimated_input_tokens`` was produced.
+  EstimationMethod estimation_method = 6;
+
+  // Number of direct elements in the protocol's fully observed conversation
+  // array. Elements are counted without validating their individual shape.
+  // Presence distinguishes a closed empty array from no usable observed array.
+  google.protobuf.UInt32Value message_count = 7;
+
+  // Number of direct elements in the fully observed tool or function array.
+  // Elements are counted without validating their individual shape. Presence
+  // distinguishes a closed empty array from no usable observed array.
+  google.protobuf.UInt32Value tool_count = 8;
+
+  // Quality of the extracted record.
+  ExtractionStatus extraction_status = 9;
+
+  // Why request inspection stopped.
+  StopReason stop_reason = 10;
+
+  // Source that selected ``api_protocol``.
+  DetectionSource detection_source = 11;
+
+  // Number of raw request-body bytes inspected. This counts parser input, not
+  // the total HTTP request-body size.
+  uint64 inspected_bytes = 12;
+}

@@ -2,7 +2,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/http/codes.h"
@@ -69,18 +72,33 @@ public:
           local_reply_details_ = std::string(details);
           ++local_reply_calls_;
         }));
+    ON_CALL(callbacks_.stream_info_, setDynamicTypedMetadata(testing::_, testing::_))
+        .WillByDefault(Invoke([this](const std::string& ns, const Protobuf::Any& value) {
+          typed_metadata_writes_.emplace_back(ns, value);
+        }));
   }
 
   // Run at trace so debug/trace-log argument expressions execute too.
   LogLevelSetter log_level_setter_{spdlog::level::trace};
 
   // A test wanting a different filter-level config calls this again first.
-  void createFilter(bool parse_unconfigured_routes = false) {
+  void createFilter(bool parse_unconfigured_routes = false, bool publish_request_info = false,
+                    std::optional<uint32_t> max_unconfigured_body_bytes = std::nullopt,
+                    envoy::type::ai::v3::ApiProtocol default_protocol =
+                        envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED) {
     if (filter_ != nullptr) {
       filter_->onDestroy();
     }
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
     proto.mutable_request_handling()->set_parse_unconfigured_routes(parse_unconfigured_routes);
+    if (publish_request_info) {
+      proto.mutable_request_handling()->mutable_request_info()->set_default_api_protocol(
+          default_protocol);
+    }
+    if (max_unconfigured_body_bytes.has_value()) {
+      proto.mutable_request_handling()->mutable_max_unconfigured_request_body_bytes()->set_value(
+          max_unconfigured_body_bytes.value());
+    }
     filter_ = std::make_unique<AiProtocolManagerFilter>(
         factory_, std::make_shared<const FilterConfig>(proto, *stats_store_.rootScope()));
     filter_->setDecoderFilterCallbacks(callbacks_);
@@ -90,17 +108,24 @@ public:
   // builds the BufferManager, which claims a SchedulableCallback, so the mock is
   // created here and only here -- a pass-through stream must not create one, or
   // its expectation goes unsatisfied.
-  Http::FilterHeadersStatus decodeHeadersEngaging() {
-    replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+  Http::FilterHeadersStatus decodeHeadersEngaging(bool uses_external_buffer = true) {
+    if (uses_external_buffer) {
+      replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+    }
     Http::TestRequestHeaderMapImpl headers = requestHeaders();
     return filter_->decodeHeaders(headers, /*end_stream=*/false);
   }
 
-  // Engages the filter where the payload is not what the test is about:
-  // parse_unconfigured_routes offloads and replays whether or not the body
-  // parses.
+  // Engages the strict external-buffer path where the payload is not what the
+  // test is about. An unspecified route protocol skips schema validation while
+  // retaining full-document JSON parsing and replay.
   void engageIgnoringPayload() {
-    createFilter(/*parse_unconfigured_routes=*/true);
+    createFilter();
+    PerRouteProto proto;
+    proto.mutable_request();
+    route_config_ = std::make_unique<RouteConfig>(proto);
+    ON_CALL(callbacks_, mostSpecificPerFilterConfig())
+        .WillByDefault(testing::Return(route_config_.get()));
     ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   }
 
@@ -116,8 +141,10 @@ public:
 
   static Http::TestRequestHeaderMapImpl requestHeaders() {
     // Best-effort parsing gates on a JSON content type.
-    return Http::TestRequestHeaderMapImpl{
-        {":method", "POST"}, {":path", "/chat/completions"}, {"content-type", "application/json"}};
+    return Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                          {":path", "/chat/completions"},
+                                          {":authority", "api.openai.com"},
+                                          {"content-type", "application/json"}};
   }
 
   // The manager the filter owns requires onDestroy() before destruction (see
@@ -133,6 +160,24 @@ public:
       posted_.pop_front();
       cb();
     }
+  }
+
+  uint64_t counterValue(const std::string& name) {
+    const auto counter = TestUtility::findCounter(stats_store_, "ai_protocol_manager." + name);
+    return counter != nullptr ? counter->value() : 0;
+  }
+
+  std::optional<envoy::data::ai::v3::RequestInfo>
+  singleRequestInfo(absl::string_view expected_namespace = "envoy.ai.request_info") {
+    if (typed_metadata_writes_.size() != 1 ||
+        typed_metadata_writes_[0].first != expected_namespace) {
+      return std::nullopt;
+    }
+    envoy::data::ai::v3::RequestInfo info;
+    if (!typed_metadata_writes_[0].second.UnpackTo(&info)) {
+      return std::nullopt;
+    }
+    return info;
   }
 
   std::deque<Event::PostCb> posted_;
@@ -155,6 +200,7 @@ public:
   int local_reply_calls_{0};
   std::optional<Http::Code> local_reply_code_;
   std::string local_reply_details_;
+  std::vector<std::pair<std::string, Protobuf::Any>> typed_metadata_writes_;
 };
 
 // With a payload to inspect, iteration pauses so the rest of the chain does not
@@ -169,6 +215,21 @@ TEST_F(AiProtocolManagerFilterTest, HoldsHeadersWhenBodyFollows) {
 TEST_F(AiProtocolManagerFilterTest, PassesHeadersOnlyRequest) {
   Http::TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/healthz"}};
   EXPECT_EQ(filter_->decodeHeaders(headers, true), Http::FilterHeadersStatus::Continue);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesRouteInfoForHeadersOnlyRequest) {
+  createFilter(/*parse_unconfigured_routes=*/false, /*publish_request_info=*/true);
+  setRouteConfig();
+  Http::TestRequestHeaderMapImpl headers = requestHeaders();
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/true),
+            Http::FilterHeadersStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->inspected_bytes(), 0);
 }
 
 // Headers held during decodeHeaders() are released when replay begins: the body
@@ -232,11 +293,27 @@ TEST_F(AiProtocolManagerFilterTest, EmptyBody) {
   EXPECT_EQ(injected_.length(), 0);
 }
 
+TEST_F(AiProtocolManagerFilterTest, EmptyTerminalDataMatchesHeadersOnlyRequestInfo) {
+  createFilter(/*parse_unconfigured_routes=*/false, /*publish_request_info=*/true);
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl empty;
+  EXPECT_EQ(filter_->decodeData(empty, /*end_stream=*/true),
+            Http::FilterDataStatus::StopIterationNoBuffer);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->inspected_bytes(), 0);
+}
+
 // A payload larger than the replay chunk size is streamed back in multiple
 // bounded frames and reassembles to the original bytes.
 TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
   engageIgnoringPayload();
-  const std::string big(200 * 1024, 'x'); // > ReadChunkSize (64KiB)
+  const std::string big = "\"" + std::string(200 * 1024, 'x') + "\"";
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
@@ -250,7 +327,7 @@ TEST_F(AiProtocolManagerFilterTest, LargePayloadReplayedInChunks) {
 // Destroying the filter mid-flight cancels pending callbacks; no replay occurs.
 TEST_F(AiProtocolManagerFilterTest, DestroyBeforeReplay) {
   engageIgnoringPayload();
-  Buffer::OwnedImpl body("payload");
+  Buffer::OwnedImpl body(R"("payload")");
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   filter_->onDestroy();
   drain();
@@ -269,7 +346,7 @@ TEST_F(AiProtocolManagerFilterTest, RegistersUpstreamWatermarkCallbacks) {
 // no data is injected until the back-pressure is released.
 TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
   engageIgnoringPayload();
-  const std::string big(200 * 1024, 'x'); // > ReadChunkSize, multiple chunks.
+  const std::string big = "\"" + std::string(200 * 1024, 'x') + "\"";
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
 
@@ -299,7 +376,7 @@ TEST_F(AiProtocolManagerFilterTest, ReplayPausesUnderUpstreamBackPressure) {
 // synchronous read loop, and replay resumes when it clears.
 TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
   engageIgnoringPayload();
-  const std::string big(200 * 1024, 'x'); // 4 chunks of 64KiB + remainder.
+  const std::string big = "\"" + std::string(200 * 1024, 'x') + "\"";
   // Upstream backs up right after the first replayed chunk; the loop must then
   // stop until it is released.
   raise_watermark_at_inject_ = 1;
@@ -328,7 +405,7 @@ TEST_F(AiProtocolManagerFilterTest, ReplayResumesMidStream) {
 // after a matching number of low-watermark callbacks.
 TEST_F(AiProtocolManagerFilterTest, NestedWatermarksRequireBalancedRelease) {
   engageIgnoringPayload();
-  const std::string big(200 * 1024, 'x');
+  const std::string big = "\"" + std::string(200 * 1024, 'x') + "\"";
   Buffer::OwnedImpl body(big);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
 
@@ -387,6 +464,21 @@ TEST_F(AiProtocolManagerFilterTest, TrailersWithoutBody) {
 
   EXPECT_EQ(inject_calls_, 0);
   EXPECT_EQ(continue_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, TrailerOnlyMatchesHeadersOnlyRequestInfo) {
+  createFilter(/*parse_unconfigured_routes=*/false, /*publish_request_info=*/true);
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Http::TestRequestTrailerMapImpl trailers{{"x-trailer", "1"}};
+  EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->inspected_bytes(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,60 +1486,452 @@ TEST_F(AiProtocolManagerFilterTest, PassesThroughMalformedPayloadOnUndeclaredRou
 // untouched.
 TEST_F(AiProtocolManagerFilterTest, BestEffortParsingAcceptsValidPayload) {
   createFilter(/*parse_unconfigured_routes=*/true);
-  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl body(R"({"model":"gpt-4"})");
-  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  drain();
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::Continue);
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model":"gpt-4"})");
+  EXPECT_EQ(body.toString(), R"({"model":"gpt-4"})");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, BestEffortParsingHoldsOnlyWhileUndecided) {
+  createFilter(/*parse_unconfigured_routes=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl prefix(R"({"model":"gpt-4o",")");
+  EXPECT_EQ(filter_->decodeData(prefix, /*end_stream=*/false),
+            Http::FilterDataStatus::StopIterationAndWatermark);
+  Buffer::OwnedImpl suffix(R"(stream":true})");
+  EXPECT_EQ(filter_->decodeData(suffix, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  EXPECT_EQ(prefix.toString(), R"({"model":"gpt-4o",")");
+  EXPECT_EQ(suffix.toString(), R"(stream":true})");
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, BestEffortSkipsEncodedRequestBody) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {"content-type", "application/json"},
+                                         {"content-encoding", "gzip"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::Continue);
+
+  Buffer::OwnedImpl body("compressed bytes");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, BestEffortSkipsNonPostRequest) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "GET"}, {":path", "/v1/messages"}, {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::Continue);
+
+  Buffer::OwnedImpl body(R"({"model":"claude-sonnet-4"})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, BestEffortSkipsExpectContinueRequest) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {"content-type", "application/json"},
+                                         {"expect", "100-continue"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::Continue);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
+}
+
+TEST_F(AiProtocolManagerFilterTest, BestEffortSkipsUpgradeRequest) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {"content-type", "application/json"},
+                                         {"connection", "upgrade"},
+                                         {"upgrade", "websocket"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::Continue);
+  EXPECT_TRUE(typed_metadata_writes_.empty());
 }
 
 // Best effort means exactly that: a payload that does not parse is forwarded
 // unchanged rather than rejected.
 TEST_F(AiProtocolManagerFilterTest, BestEffortParsingForwardsMalformedPayload) {
   createFilter(/*parse_unconfigured_routes=*/true);
-  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl body(R"({"model" "gpt-4"})");
-  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  drain();
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::Continue);
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model" "gpt-4"})");
-  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(body.toString(), R"({"model" "gpt-4"})");
+  EXPECT_EQ(inject_calls_, 0);
 }
 
-// A payload abandoned mid-upload is still offloaded and replayed in full.
+// A parse failure releases held headers immediately; later frames pass through
+// without further parsing or external buffering.
 TEST_F(AiProtocolManagerFilterTest, BestEffortParsingForwardsRestOfAbandonedPayload) {
   createFilter(/*parse_unconfigured_routes=*/true);
-  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl chunk1(R"({"model" "gpt-4",)");
-  EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::StopIterationNoBuffer);
+  EXPECT_EQ(filter_->decodeData(chunk1, false), Http::FilterDataStatus::Continue);
   Buffer::OwnedImpl chunk2(R"("stream":true})");
-  EXPECT_EQ(filter_->decodeData(chunk2, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  drain();
+  EXPECT_EQ(filter_->decodeData(chunk2, true), Http::FilterDataStatus::Continue);
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(injected_.toString(), R"({"model" "gpt-4","stream":true})");
+  EXPECT_EQ(chunk1.toString(), R"({"model" "gpt-4",)");
+  EXPECT_EQ(chunk2.toString(), R"("stream":true})");
+  EXPECT_EQ(inject_calls_, 0);
 }
 
 // Best effort also tolerates an empty body, where a declared endpoint rejects it.
 TEST_F(AiProtocolManagerFilterTest, BestEffortParsingForwardsEmptyBody) {
-  createFilter(/*parse_unconfigured_routes=*/true);
-  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl empty;
-  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  ASSERT_TRUE(replay_cb_->enabled());
-  replay_cb_->invokeCallback();
-  drain();
+  EXPECT_EQ(filter_->decodeData(empty, true), Http::FilterDataStatus::Continue);
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_TRUE(injected_end_stream_);
-  EXPECT_EQ(injected_.length(), 0);
+  EXPECT_EQ(inject_calls_, 0);
+  EXPECT_EQ(empty.length(), 0);
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->inspected_bytes(), 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesAnthropicRequestInfoAtEndStream) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {":authority", "api.anthropic.com"},
+                                         {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  const std::string payload =
+      R"({"model":"claude-sonnet-4","stream":false,"max_tokens":321,"messages":[{"role":"user","content":"hi"}],"tools":[]})";
+  Buffer::OwnedImpl body(payload);
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  ASSERT_TRUE(info->has_model());
+  EXPECT_EQ(info->model().value(), "claude-sonnet-4");
+  ASSERT_TRUE(info->has_streaming());
+  EXPECT_FALSE(info->streaming().value());
+  ASSERT_TRUE(info->has_requested_max_output_tokens());
+  EXPECT_EQ(info->requested_max_output_tokens().value(), 321);
+  ASSERT_TRUE(info->has_message_count());
+  EXPECT_EQ(info->message_count().value(), 1);
+  ASSERT_TRUE(info->has_tool_count());
+  EXPECT_EQ(info->tool_count().value(), 0);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->detection_source(), envoy::data::ai::v3::RequestInfo::AUTHORITY_PATH);
+  EXPECT_EQ(info->inspected_bytes(), payload.size());
+  EXPECT_EQ(body.toString(), payload);
+  EXPECT_EQ(inject_calls_, 0);
+  EXPECT_EQ(counterValue("request_info_published"), 1);
+  EXPECT_EQ(counterValue("request_info_protocol_detected"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterTest, ReleasesWhenJsonRootClosesBeforeEndStream) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"gpt-4o","stream":true})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::PARTIAL);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::ROOT_CLOSED);
+  ASSERT_TRUE(info->has_model());
+  EXPECT_EQ(info->model().value(), "gpt-4o");
+
+  Buffer::OwnedImpl trailing_whitespace(" \n");
+  EXPECT_EQ(filter_->decodeData(trailing_whitespace, /*end_stream=*/true),
+            Http::FilterDataStatus::Continue);
+  EXPECT_EQ(typed_metadata_writes_.size(), 1);
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, TerminalRootAndWhitespaceAcrossSlicesIsComplete) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  const std::string json = R"({"model":"gpt-4o"})";
+  const std::string whitespace = " \n";
+  Buffer::BufferFragmentImpl json_fragment(json.data(), json.size(), nullptr);
+  Buffer::BufferFragmentImpl whitespace_fragment(whitespace.data(), whitespace.size(), nullptr);
+  Buffer::OwnedImpl body;
+  body.addBufferFragment(json_fragment);
+  body.addBufferFragment(whitespace_fragment);
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+  EXPECT_EQ(info->inspected_bytes(), json.size() + whitespace.size());
+}
+
+TEST_F(AiProtocolManagerFilterTest, TerminalGarbageAcrossSlicesIsParseError) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  const std::string json = R"({"model":"gpt-4o"})";
+  const std::string garbage = "x";
+  Buffer::BufferFragmentImpl json_fragment(json.data(), json.size(), nullptr);
+  Buffer::BufferFragmentImpl garbage_fragment(garbage.data(), garbage.size(), nullptr);
+  Buffer::OwnedImpl body;
+  body.addBufferFragment(json_fragment);
+  body.addBufferFragment(garbage_fragment);
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::FAILED);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::PARSE_ERROR);
+  EXPECT_EQ(info->inspected_bytes(), json.size() + garbage.size());
+}
+
+TEST_F(AiProtocolManagerFilterTest, NonterminalRootCloseWinsOverTrailingBytesInOneSlice) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body("{}x");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::PARTIAL);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::ROOT_CLOSED);
+}
+
+TEST_F(AiProtocolManagerFilterTest, NonterminalRootCloseWinsAcrossSlices) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  EXPECT_EQ(decodeHeadersEngaging(/*uses_external_buffer=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  const std::string json = "{}";
+  const std::string trailing = "x";
+  Buffer::BufferFragmentImpl json_fragment(json.data(), json.size(), nullptr);
+  Buffer::BufferFragmentImpl trailing_fragment(trailing.data(), trailing.size(), nullptr);
+  Buffer::OwnedImpl body;
+  body.addBufferFragment(json_fragment);
+  body.addBufferFragment(trailing_fragment);
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::PARTIAL);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::ROOT_CLOSED);
+}
+
+TEST_F(AiProtocolManagerFilterTest, ReleasesAtConfiguredInspectionLimit) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true,
+               /*max_unconfigured_body_bytes=*/16);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {":authority", "api.anthropic.com"},
+                                         {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl first(R"({"model":"claude-sonnet-4","messages":[)");
+  EXPECT_EQ(filter_->decodeData(first, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::PARTIAL);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::BYTE_LIMIT);
+  EXPECT_EQ(info->inspected_bytes(), 16);
+  EXPECT_EQ(counterValue("request_inspection_limit_reached"), 1);
+
+  Buffer::OwnedImpl rest(R"({"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(rest, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+  EXPECT_EQ(typed_metadata_writes_.size(), 1);
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, ClampsInspectionToFilterManagerBufferLimit) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true,
+               /*max_unconfigured_body_bytes=*/64);
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(8));
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {":authority", "api.anthropic.com"},
+                                         {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"claude-sonnet-4","messages":[]})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/false), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::PARTIAL);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::BYTE_LIMIT);
+  EXPECT_EQ(info->inspected_bytes(), 8);
+  EXPECT_EQ(counterValue("request_inspection_limit_reached"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesFailedInfoAndForwardsMalformedBody) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/messages"},
+                                         {":authority", "api.anthropic.com"},
+                                         {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model" "claude-sonnet-4"})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::FAILED);
+  EXPECT_EQ(info->stop_reason(), envoy::data::ai::v3::RequestInfo::PARSE_ERROR);
+  EXPECT_FALSE(info->has_model());
+  EXPECT_EQ(body.toString(), R"({"model" "claude-sonnet-4"})");
+  EXPECT_EQ(counterValue("request_info_failed"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesGeminiPathAndBodyAttributes) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "POST"},
+      {":path", "/v1beta/models/gemini-2.5-pro:streamGenerateContent"},
+      {":authority", "generativelanguage.googleapis.com"},
+      {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"contents":[{"role":"user","parts":[{"text":"hello"}]}],"generationConfig":{"maxOutputTokens":99}})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  ASSERT_TRUE(info->has_model());
+  EXPECT_EQ(info->model().value(), "gemini-2.5-pro");
+  ASSERT_TRUE(info->has_streaming());
+  EXPECT_TRUE(info->streaming().value());
+  ASSERT_TRUE(info->has_requested_max_output_tokens());
+  EXPECT_EQ(info->requested_max_output_tokens().value(), 99);
+  ASSERT_TRUE(info->has_message_count());
+  EXPECT_EQ(info->message_count().value(), 1);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesBedrockClaudeAttributesAfterBodyDetection) {
+  createFilter(/*parse_unconfigured_routes=*/true, /*publish_request_info=*/true);
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "POST"},
+      {":path", "/model/anthropic.claude-sonnet-4-20250514-v1:0/invoke-with-response-stream"},
+      {":authority", "bedrock-runtime.us-east-1.amazonaws.com"},
+      {"content-type", "application/json"}};
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"anthropic_version":"bedrock-2023-05-31","max_tokens":128,"messages":[]})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true), Http::FilterDataStatus::Continue);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(info->detection_source(), envoy::data::ai::v3::RequestInfo::BODY);
+  ASSERT_TRUE(info->has_model());
+  EXPECT_EQ(info->model().value(), "anthropic.claude-sonnet-4-20250514-v1:0");
+  ASSERT_TRUE(info->has_streaming());
+  EXPECT_TRUE(info->streaming().value());
+  ASSERT_TRUE(info->has_requested_max_output_tokens());
+  EXPECT_EQ(info->requested_max_output_tokens().value(), 128);
+  ASSERT_TRUE(info->has_message_count());
+  EXPECT_EQ(info->message_count().value(), 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, PublishesStrictRouteInfoBeforeReplay) {
+  createFilter(/*parse_unconfigured_routes=*/false, /*publish_request_info=*/true);
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"model":"gpt-4o","max_completion_tokens":42,"messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true),
+            Http::FilterDataStatus::StopIterationNoBuffer);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(info->detection_source(), envoy::data::ai::v3::RequestInfo::ROUTE);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  ASSERT_TRUE(info->has_requested_max_output_tokens());
+  EXPECT_EQ(info->requested_max_output_tokens().value(), 42);
+  EXPECT_EQ(inject_calls_, 0);
+
+  drain();
+  EXPECT_GT(inject_calls_, 0);
+}
+
+TEST_F(AiProtocolManagerFilterTest, UnspecifiedStrictRouteRetainsGenericAttributes) {
+  createFilter(/*parse_unconfigured_routes=*/false, /*publish_request_info=*/true);
+  PerRouteProto proto;
+  proto.mutable_request();
+  route_config_ = std::make_unique<RouteConfig>(proto);
+  ON_CALL(callbacks_, mostSpecificPerFilterConfig())
+      .WillByDefault(testing::Return(route_config_.get()));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/custom/inference"},
+                                         {":authority", "gateway.example"},
+                                         {"content-type", "application/json"}};
+  replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+  EXPECT_EQ(filter_->decodeHeaders(headers, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"custom-model","stream":false,"tools":[]})");
+  EXPECT_EQ(filter_->decodeData(body, /*end_stream=*/true),
+            Http::FilterDataStatus::StopIterationNoBuffer);
+
+  const auto info = singleRequestInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->api_protocol(), envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  EXPECT_EQ(info->detection_source(), envoy::data::ai::v3::RequestInfo::ROUTE);
+  EXPECT_EQ(info->extraction_status(), envoy::data::ai::v3::RequestInfo::COMPLETE);
+  ASSERT_TRUE(info->has_model());
+  EXPECT_EQ(info->model().value(), "custom-model");
+  ASSERT_TRUE(info->has_streaming());
+  EXPECT_FALSE(info->streaming().value());
+  ASSERT_TRUE(info->has_tool_count());
+  EXPECT_EQ(info->tool_count().value(), 0);
 }
 
 // A declared endpoint is strict regardless of the filter-level

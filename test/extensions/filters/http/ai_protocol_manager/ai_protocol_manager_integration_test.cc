@@ -1,5 +1,6 @@
 #include <string>
 
+#include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/filters/http/ext_proc/v3/ext_proc.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
@@ -13,21 +14,19 @@
 namespace Envoy {
 namespace {
 
-// End-to-end coverage for the AI Protocol Manager filter. The filter offloads
-// the request body into an external buffer as it arrives and replays it back
-// into the filter chain once the stream ends (see filter.h). These tests drive
-// real requests through a configured Envoy and assert that the upstream still
-// observes the headers, the complete body (across a range of sizes), and any
-// trailers unchanged -- i.e. the offload/replay round-trip is transparent.
+// End-to-end coverage for AI Protocol Manager request handling. Most scenarios
+// use bounded best-effort inspection on an unconfigured route and assert that
+// headers, body frames, and trailers reach the upstream unchanged. The local
+// reply scenario declares the route as an AI endpoint and exercises the strict
+// external-buffer replay path separately.
 //
 // The filter is a dual filter: each scenario runs once with the filter in the
 // downstream HTTP filter chain and once in the upstream (cluster) filter chain.
 class AiProtocolManagerIntegrationTest : public HttpProtocolIntegrationTest {
 protected:
-  // The filter only offloads a payload it has reason to inspect. These scenarios
-  // are about the round-trip, not parsing, and their bodies are not JSON -- so
-  // they parse unconfigured routes best-effort, which engages on every route
-  // and tolerates that.
+  // The ordinary passthrough scenarios intentionally send non-JSON bodies on
+  // unconfigured routes. Bounded best-effort inspection releases them on the
+  // first parse error without rejecting or rewriting any bytes.
   void prependFilter(bool downstream = true, bool parse_unconfigured_routes = true) {
     config_helper_.prependFilter(fmt::format(R"EOF(
 name: envoy.filters.http.ai_protocol_manager
@@ -66,8 +65,8 @@ INSTANTIATE_TEST_SUITE_P(Protocols, AiProtocolManagerIntegrationTest,
                          testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
                          HttpProtocolIntegrationTest::protocolTestParamsToString);
 
-// Headers-only request: the filter must let the headers flow immediately (there
-// is no payload to offload), and the round-trip must complete normally.
+// Headers-only request: there is no payload to inspect, so the headers flow
+// immediately and the round-trip completes normally.
 void AiProtocolManagerIntegrationTest::runHeaderOnly() {
   initialize();
 
@@ -95,9 +94,9 @@ TEST_P(AiProtocolManagerIntegrationTest, UpstreamHeaderOnly) {
   runHeaderOnly();
 }
 
-// Header + body: the offloaded body must be replayed in full to the upstream.
-// Parameterized over a range of sizes to exercise empty, sub-chunk, and
-// multi-chunk payloads through the offload/replay path.
+// Header + body: bounded best-effort inspection must fail open and leave the
+// body intact. Parameterized over a range of sizes to exercise empty,
+// sub-chunk, and multi-chunk payloads.
 void AiProtocolManagerIntegrationTest::runHeaderAndBody() {
   initialize();
 
@@ -131,8 +130,9 @@ TEST_P(AiProtocolManagerIntegrationTest, UpstreamHeaderAndBody) {
   runHeaderAndBody();
 }
 
-// Header + body sent as several explicit frames before end_stream. Verifies the
-// filter reassembles a body delivered across multiple decodeData() calls.
+// Header + body sent as several explicit frames before end_stream. The first
+// malformed prefix releases best-effort inspection, and every frame must still
+// arrive upstream in order.
 void AiProtocolManagerIntegrationTest::runHeaderAndBodyMultipleFrames() {
   initialize();
 
@@ -166,8 +166,8 @@ TEST_P(AiProtocolManagerIntegrationTest, UpstreamHeaderAndBodyMultipleFrames) {
 }
 
 // Header + body + trailers: the stream is terminated by trailers rather than an
-// end_stream data frame. The filter must replay the buffered body and then
-// release the trailers, so the upstream observes both intact.
+// end_stream data frame. Best-effort inspection must release the body and
+// trailers unchanged.
 void AiProtocolManagerIntegrationTest::runHeaderAndBodyAndTrailers() {
   // HTTP/1.1 codecs only parse/emit trailers when explicitly enabled, on both
   // the downstream (to read client trailers) and upstream (to forward them).
@@ -244,7 +244,25 @@ typed_config:
   max_request_bytes: 1024
 )EOF",
                                downstream);
-  prependFilter(downstream);
+
+  // Declaring the route selects strict full-document parsing and the external
+  // BufferManager. Keep parse_unconfigured_routes disabled so this test cannot
+  // accidentally fall back to the bounded best-effort path.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        Protobuf::Any per_route_config;
+        TestUtility::loadFromYaml(R"EOF(
+"@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+request:
+  api_protocol: OPENAI_CHAT_COMPLETIONS
+)EOF",
+                                  per_route_config);
+        auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+        route->mutable_typed_per_filter_config()->insert(
+            {"envoy.filters.http.ai_protocol_manager", per_route_config});
+      });
+  prependFilter(downstream, /*parse_unconfigured_routes=*/false);
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -252,7 +270,9 @@ typed_config:
   // so the buffer filter trips the 413 on the first replayed chunk while later
   // chunks are still pending. That forces the manager to detach mid-range with reads
   // outstanding -- the path that must stop rather than read from the released buffer.
-  const std::string body(256u * 1024u, 'a');
+  const std::string content(256u * 1024u, 'a');
+  const std::string body = fmt::format(
+      R"EOF({{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}})EOF", content);
   auto response = codec_client_->makeRequestWithBody(requestHeaders(), body);
 
   ASSERT_TRUE(response->waitForEndStream());
@@ -278,9 +298,11 @@ typed_config:
   // small body stays under the buffer filter's limit, so it replays and reaches
   // the upstream normally.
   codec_client_ = makeHttpConnection(lookupPort("http"));
-  auto ok_response = codec_client_->makeRequestWithBody(requestHeaders(), "small");
+  const std::string small_body =
+      R"EOF({"model":"gpt-4o","messages":[{"role":"user","content":"small"}]})EOF";
+  auto ok_response = codec_client_->makeRequestWithBody(requestHeaders(), small_body);
   waitForNextUpstreamRequest();
-  EXPECT_EQ("small", upstream_request_->body().toString());
+  EXPECT_EQ(small_body, upstream_request_->body().toString());
   upstream_request_->encodeHeaders(default_response_headers_, true);
   ASSERT_TRUE(ok_response->waitForEndStream());
   EXPECT_EQ("200", ok_response->headers().getStatusValue());
@@ -329,7 +351,8 @@ TEST_P(AiProtocolManagerIntegrationTest, UpstreamLocalReplyDuringReplayTearsDown
   runLocalReplyDuringReplay(/*downstream=*/false);
 }
 
-// Trailers immediately after headers, with no body in between.
+// Trailers immediately after headers, with no body in between. Best-effort
+// inspection releases on the trailer callback and preserves the trailers.
 void AiProtocolManagerIntegrationTest::runHeaderAndTrailersNoBody() {
   config_helper_.addConfigModifier(setEnableDownstreamTrailersHttp1());
   config_helper_.addConfigModifier(setEnableUpstreamTrailersHttp1());
@@ -702,12 +725,11 @@ typed_config:
   EXPECT_EQ(found, 1);
 }
 
-// The documented ext_proc consumer path: usage metadata written on the
-// terminal encode callback must be inside the `metadata_context` of the
-// external processor's end-of-stream response_body message. Covers both the
-// downstream installation (ext_proc listed before this filter so it runs
-// *after* it on the encode path) and the upstream installation (all upstream
-// encoder filters run before every downstream filter).
+// The documented ext_proc consumer paths. Response usage metadata written on
+// the terminal encode callback must be inside the `metadata_context` of the
+// external processor's end-of-stream response_body message. Request info
+// written while request headers are held must be visible to a following
+// ext_proc filter in its first request_headers message.
 class AiProtocolManagerExtProcIntegrationTest
     : public testing::TestWithParam<Network::Address::IpVersion>,
       public HttpIntegrationTest {
@@ -812,6 +834,74 @@ typed_config:
     initialize();
   }
 
+  void initializeRequestInfoWithExtProc() {
+    test_processor_.start(
+        GetParam(),
+        [this](grpc::ServerReaderWriter<envoy::service::ext_proc::v3::ProcessingResponse,
+                                        envoy::service::ext_proc::v3::ProcessingRequest>* stream) {
+          envoy::service::ext_proc::v3::ProcessingRequest request;
+          while (stream->Read(&request)) {
+            if (!request.has_request_headers() || request_info_seen_.HasBeenNotified()) {
+              continue;
+            }
+            const auto& typed_metadata = request.metadata_context().typed_filter_metadata();
+            const auto typed_entry = typed_metadata.find("envoy.ai.request_info");
+            if (typed_entry != typed_metadata.end()) {
+              ASSERT_TRUE(typed_entry->second.UnpackTo(&captured_request_info_));
+              request_info_seen_.Notify();
+            }
+          }
+        });
+
+    envoy::extensions::filters::http::ext_proc::v3::ExternalProcessor ext_proc;
+    ext_proc.mutable_grpc_service()->mutable_envoy_grpc()->set_cluster_name("ext_proc_server");
+    ext_proc.set_observability_mode(true);
+    ext_proc.mutable_processing_mode()->set_request_header_mode(
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SEND);
+    ext_proc.mutable_processing_mode()->set_request_body_mode(
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::NONE);
+    ext_proc.mutable_processing_mode()->set_response_header_mode(
+        envoy::extensions::filters::http::ext_proc::v3::ProcessingMode::SKIP);
+    ext_proc.mutable_metadata_options()->mutable_forwarding_namespaces()->add_typed(
+        "envoy.ai.request_info");
+
+    envoy::config::listener::v3::Filter ext_proc_filter;
+    ext_proc_filter.set_name("envoy.filters.http.ext_proc");
+    std::ignore = ext_proc_filter.mutable_typed_config()->PackFrom(ext_proc);
+    config_helper_.prependFilter(MessageUtil::getJsonStringFromMessageOrError(ext_proc_filter));
+
+    config_helper_.addConfigModifier([this](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      auto* processor_cluster = bootstrap.mutable_static_resources()->add_clusters();
+      processor_cluster->set_name("ext_proc_server");
+      processor_cluster->mutable_load_assignment()->set_cluster_name("ext_proc_server");
+      auto* address = processor_cluster->mutable_load_assignment()
+                          ->add_endpoints()
+                          ->add_lb_endpoints()
+                          ->mutable_endpoint()
+                          ->mutable_address()
+                          ->mutable_socket_address();
+      address->set_address(Network::Test::getLoopbackAddressString(GetParam()));
+      address->set_port_value(test_processor_.port());
+      ConfigHelper::setHttp2(*processor_cluster);
+    });
+
+    // Install ext_proc first. The AI Protocol Manager is prepended here, so the
+    // final decode order is AI Protocol Manager, ext_proc, router. Once bounded
+    // request inspection releases the held headers, ext_proc snapshots the
+    // request metadata in its request_headers message.
+    config_helper_.prependFilter(R"EOF(
+name: envoy.filters.http.ai_protocol_manager
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling:
+    parse_unconfigured_routes: true
+    request_info:
+      default_api_protocol: ANTHROPIC_MESSAGES
+)EOF");
+
+    initialize();
+  }
+
   void runJsonUsageRequest(bool end_with_trailers = false) {
     codec_client_ = makeHttpConnection(lookupPort("http"));
     auto response = codec_client_->makeRequestWithBody(
@@ -850,9 +940,55 @@ typed_config:
     EXPECT_EQ(captured_typed_usage_.extraction_status(), envoy::data::ai::v3::TokenUsage::COMPLETE);
   }
 
+  void runAnthropicRequestAndExpectRequestInfo() {
+    const std::string first = R"EOF({"model":"claude-sonnet-4-5","stream":true,)EOF";
+    const std::string second =
+        R"EOF("max_tokens":321,"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}],"tools":[{"name":"lookup"}]})EOF";
+    const std::string body = first + second;
+    codec_client_ = makeHttpConnection(lookupPort("http"));
+    auto encoder_decoder = codec_client_->startRequest(
+        Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                       {":path", "/v1/messages"},
+                                       {":scheme", "http"},
+                                       {":authority", "sni.lyft.com"},
+                                       {"content-type", "application/json"}});
+    request_encoder_ = &encoder_decoder.first;
+    auto response = std::move(encoder_decoder.second);
+
+    // The first valid but incomplete frame leaves headers held and exercises
+    // StopIterationAndWatermark. The terminal frame finalizes metadata, then
+    // releases headers and the buffered prefix through the real filter manager.
+    codec_client_->sendData(*request_encoder_, first, /*end_stream=*/false);
+    EXPECT_FALSE(request_info_seen_.HasBeenNotified());
+    codec_client_->sendData(*request_encoder_, second, /*end_stream=*/true);
+
+    waitForNextUpstreamRequest();
+    EXPECT_TRUE(upstream_request_->complete());
+    EXPECT_EQ(body, upstream_request_->body().toString());
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    ASSERT_TRUE(response->waitForEndStream());
+    ASSERT_TRUE(response->complete());
+
+    ASSERT_TRUE(request_info_seen_.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    EXPECT_EQ(captured_request_info_.api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+    EXPECT_EQ(captured_request_info_.model().value(), "claude-sonnet-4-5");
+    EXPECT_TRUE(captured_request_info_.streaming().value());
+    EXPECT_EQ(captured_request_info_.requested_max_output_tokens().value(), 321);
+    EXPECT_EQ(captured_request_info_.message_count().value(), 2);
+    EXPECT_EQ(captured_request_info_.tool_count().value(), 1);
+    EXPECT_EQ(captured_request_info_.extraction_status(),
+              envoy::data::ai::v3::RequestInfo::COMPLETE);
+    EXPECT_EQ(captured_request_info_.stop_reason(), envoy::data::ai::v3::RequestInfo::END_STREAM);
+    EXPECT_EQ(captured_request_info_.detection_source(),
+              envoy::data::ai::v3::RequestInfo::CONFIG_DEFAULT);
+    EXPECT_EQ(captured_request_info_.inspected_bytes(), body.size());
+  }
+
   Extensions::HttpFilters::ExternalProcessing::TestProcessor test_processor_;
   absl::Notification metadata_seen_;
+  absl::Notification request_info_seen_;
   envoy::data::ai::v3::TokenUsage captured_typed_usage_;
+  envoy::data::ai::v3::RequestInfo captured_request_info_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, AiProtocolManagerExtProcIntegrationTest,
@@ -884,6 +1020,11 @@ TEST_P(AiProtocolManagerExtProcIntegrationTest, UpstreamTrailerEndedResponseForw
   initializeWithExtProc(/*upstream_filter=*/true, /*trailer_mode=*/true);
   runJsonUsageRequest(/*end_with_trailers=*/true);
   expectUsageMetadataAtProcessor();
+}
+
+TEST_P(AiProtocolManagerExtProcIntegrationTest, RequestInfoForwardedInRequestHeaders) {
+  initializeRequestInfoWithExtProc();
+  runAnthropicRequestAndExpectRequestInfo();
 }
 
 } // namespace

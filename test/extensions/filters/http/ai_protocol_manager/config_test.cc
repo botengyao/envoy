@@ -92,10 +92,29 @@ TEST(AiProtocolManagerConfigTest, RejectsOversizedEventCap) {
                EnvoyException);
 }
 
+TEST(AiProtocolManagerConfigTest, RejectsOversizedUnconfiguredRequestCap) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  proto_config.mutable_request_handling()->mutable_max_unconfigured_request_body_bytes()->set_value(
+      20 * 1024 * 1024);
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+
+  AiProtocolManagerFilterConfigFactory factory;
+  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
+               EnvoyException);
+}
+
 // An explicit zero cap is rejected: there is no way to disable the bound.
 TEST(AiProtocolManagerConfigTest, RejectsZeroCaps) {
   NiceMock<Server::Configuration::MockFactoryContext> context;
   AiProtocolManagerFilterConfigFactory factory;
+  {
+    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+    proto_config.mutable_request_handling()
+        ->mutable_max_unconfigured_request_body_bytes()
+        ->set_value(0);
+    EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
+                 EnvoyException);
+  }
   {
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
     proto_config.mutable_response_handling()

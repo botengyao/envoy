@@ -14,6 +14,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
+#include "source/extensions/filters/http/ai_protocol_manager/request_info.h"
+#include "source/extensions/filters/http/ai_protocol_manager/request_info_extractor.h"
 #include "source/extensions/filters/http/ai_protocol_manager/response_handler.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stats.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
@@ -77,6 +79,10 @@ public:
 
   bool requestHandlingEnabled() const { return request_handling_enabled_; }
   bool parseUnconfiguredRoutes() const { return parse_unconfigured_routes_; }
+  bool requestInfoEnabled() const { return request_info_enabled_; }
+  const std::string& requestInfoNamespace() const { return request_info_namespace_; }
+  ApiProtocol requestInfoDefaultProtocol() const { return request_info_default_protocol_; }
+  uint32_t maxUnconfiguredRequestBodyBytes() const { return max_unconfigured_request_body_bytes_; }
   bool tokenUsageEnabled() const { return token_usage_enabled_; }
   bool includeUnconfiguredRoutes() const { return include_unconfigured_routes_; }
   ApiProtocol defaultApiProtocol() const { return default_api_protocol_; }
@@ -92,6 +98,10 @@ private:
   mutable AiProtocolManagerStats stats_;
   const bool request_handling_enabled_ = false;
   const bool parse_unconfigured_routes_ = false;
+  const bool request_info_enabled_ = false;
+  const std::string request_info_namespace_;
+  const ApiProtocol request_info_default_protocol_ = ApiProtocol::Unspecified;
+  const uint32_t max_unconfigured_request_body_bytes_ = 0;
   const bool token_usage_enabled_ = false;
   const bool include_unconfigured_routes_ = false;
   const ApiProtocol default_api_protocol_ = ApiProtocol::Unspecified;
@@ -139,16 +149,24 @@ private:
 // routing, admission and policy act on a payload the proxy understands rather
 // than on opaque bytes.
 //
-// As the body arrives the filter offloads it into an ExternalBuffer -- keeping
-// a large payload out of the connection manager's buffers -- and parses and
-// validates the JSON in a streaming fashion alongside. The chain is held
-// meanwhile: decodeHeaders() stops iteration when a body follows, and the
-// headers stay pinned here while decodeData() keeps offloading. Only once the
-// payload is validated does the filter replay the buffered body back into the
-// chain; the first injectDecodedDataToFilterChain() call releases the held
-// headers ahead of it, so subsequent filters see the headers immediately
-// followed by the payload. An invalid payload is rejected rather than
-// forwarded.
+// A declared route retains the strict request path. As the body arrives the
+// filter offloads it into an ExternalBuffer -- keeping a large payload out of
+// the connection manager's buffers -- and parses and validates the JSON in a
+// streaming fashion alongside. The chain is held meanwhile: decodeHeaders()
+// stops iteration when a body follows, and the headers stay pinned here while
+// decodeData() keeps offloading. Only once the payload is validated does the
+// filter replay the buffered body back into the chain; the first
+// injectDecodedDataToFilterChain() call releases the held headers ahead of it.
+// An invalid declared payload is rejected rather than forwarded.
+
+// An unconfigured route opted into best-effort inspection takes a bounded path
+// until the external-buffer interface is available to request filters. A
+// selective Wuffs cursor observes at most the configured prefix while the HTTP
+// filter manager holds that prefix. Root closure, a parse error, or the byte
+// limit finalizes any request attributes and returns Continue immediately;
+// held headers and bytes are then delivered in order and the rest of the body
+// streams through untouched. No prompt-bearing string or complete body is
+// copied into filter-owned memory on this path.
 //
 // None of that happens for a stream the filter has no reason to inspect:
 // decodeHeaders() returns Continue and the offload path is never entered.
@@ -170,10 +188,9 @@ private:
 // A route carrying a per-route request declaration is a declared AI endpoint,
 // and its payload is the filter's to manage: parsed strictly, with a malformed
 // one rejected so Envoy and the backend cannot read the same body differently.
-// A route without one is parsed only if the filter opted into
-// parse_unconfigured_routes -- offered for compatibility with chains that want
-// a parsed body on ordinary routes, never a reason to fail a request -- and is
-// otherwise untouched.
+// A route without one is inspected only if the filter opted into
+// parse_unconfigured_routes; a malformed or oversized unconfigured request is
+// always forwarded and is otherwise untouched.
 //
 // A declared wire API with a registered payload schema is validated at end of
 // payload (schema/schema_registry.h); normalization comes later.
@@ -208,10 +225,26 @@ public:
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap& trailers) override;
 
 private:
-  // Feeds one body frame to the parser in place. Returns false only if the
-  // payload was rejected, in which case the caller must not offload or replay
-  // it; a best-effort parse that fails abandons parsing and returns true.
+  enum class RequestHandlingMode { PassThrough, Strict, BestEffortInspecting, BestEffortReleased };
+
+  // Feeds one strict-request body frame to the full-document parser in place.
+  // Returns false only if the payload was rejected, in which case the caller
+  // must not offload or replay it.
   bool feedParser(const Buffer::Instance& data, bool end_stream);
+
+  // Feeds at most the configured prefix budget to the selective request-info
+  // extractor and releases a best-effort request as soon as inspection reaches
+  // a terminal condition.
+  Http::FilterDataStatus decodeBestEffortData(const Buffer::Instance& data, bool end_stream);
+
+  // Observes one strict-request frame for request-info publication. Validation
+  // remains owned by request_parser_; this selective side parser never changes
+  // strict request acceptance.
+  void observeStrictRequestInfo(const Buffer::Instance& data, bool end_stream);
+
+  // Resolves the wire protocol, converts the internal record, and publishes it
+  // before held request headers continue down the decode chain.
+  void finalizeRequestInfo(ExtractionStatus status, StopReason reason);
 
   // Terminates the stream with a 400 for a payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
@@ -227,9 +260,21 @@ private:
   ExternalBufferFactory& buffer_factory_;
   FilterConfigSharedPtr config_;
 
-  // Non-null exactly when decodeHeaders() decided to inspect this stream, so it
-  // doubles as the engaged flag. Outlives request_parser_, which is released as
-  // soon as parsing is done with.
+  RequestHandlingMode request_handling_mode_{RequestHandlingMode::PassThrough};
+
+  // Copied while decodeHeaders() owns the map; request protocol classification
+  // may use them after later filters have not yet received the held headers.
+  std::string request_authority_;
+  std::string request_path_;
+  uint64_t request_info_inspection_limit_{0};
+  uint64_t request_info_inspected_bytes_{0};
+  std::unique_ptr<RequestInfoExtractor> request_info_extractor_;
+  bool request_info_parse_failed_{false};
+  bool request_info_finalized_{false};
+
+  // Non-null only for strict declared requests. Best-effort unconfigured
+  // requests use the HTTP filter manager's bounded prefix buffering directly
+  // and never create an ExternalBuffer.
   BufferManagerPtr decode_manager_;
 
   // Copied out of the route configuration rather than held by pointer: the route
