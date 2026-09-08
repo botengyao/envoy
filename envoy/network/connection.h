@@ -420,6 +420,8 @@ public:
   /**
    * Instructs the connection to start using secure transport.
    * Note: Not all underlying transport sockets support such operation.
+   * Any data left in the connection's read buffer is handed to the secure transport, so the
+   * caller must have consumed all clear-text data first.
    * @return boolean telling if underlying transport socket was able to
              start secure transport.
    */

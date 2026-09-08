@@ -3385,6 +3385,80 @@ public:
   StreamInfo::StreamInfoImpl stream_info_;
 };
 
+// Data read past the end of the clear-text negotiation is handed to the secure transport.
+TEST_F(MockTransportConnectionImplTest, StartSecureTransportHandsOffReadBuffer) {
+  initializeConnection();
+  auto read_filter = std::make_shared<NiceMock<MockReadFilter>>();
+  connection_->addReadFilter(read_filter);
+
+  EXPECT_CALL(*transport_socket_, doRead(_)).WillOnce(Invoke([](Buffer::Instance& buffer) {
+    buffer.add("client hello");
+    return IoResult{PostIoAction::KeepOpen, 12, false};
+  }));
+  EXPECT_CALL(*read_filter, onData(_, false)).WillOnce(Invoke([](Buffer::Instance& data, bool) {
+    EXPECT_EQ("client hello", data.toString());
+    return FilterStatus::StopIteration;
+  }));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Read));
+
+  EXPECT_CALL(*transport_socket_, startSecureTransport()).WillOnce(Return(true));
+  EXPECT_CALL(*transport_socket_, injectReadData(_)).WillOnce(Invoke([](Buffer::Instance& data) {
+    EXPECT_EQ("client hello", data.toString());
+    data.drain(data.length());
+    return true;
+  }));
+  EXPECT_TRUE(connection_->startSecureTransport());
+
+  // Only newly read data reaches the filter chain from now on.
+  EXPECT_CALL(*transport_socket_, doRead(_)).WillOnce(Invoke([](Buffer::Instance& buffer) {
+    buffer.add("x");
+    return IoResult{PostIoAction::KeepOpen, 1, false};
+  }));
+  EXPECT_CALL(*read_filter, onData(_, false)).WillOnce(Invoke([](Buffer::Instance& data, bool) {
+    EXPECT_EQ("x", data.toString());
+    return FilterStatus::StopIteration;
+  }));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Read));
+}
+
+TEST_F(MockTransportConnectionImplTest, StartSecureTransportWithEmptyReadBuffer) {
+  initializeConnection();
+  EXPECT_CALL(*transport_socket_, startSecureTransport()).WillOnce(Return(true));
+  EXPECT_CALL(*transport_socket_, injectReadData(_)).Times(0);
+  EXPECT_TRUE(connection_->startSecureTransport());
+}
+
+TEST_F(MockTransportConnectionImplTest, StartSecureTransportUnsupported) {
+  initializeConnection();
+  connection_->addReadFilter(std::make_shared<Network::FakeReadFilter>());
+  EXPECT_CALL(*transport_socket_, doRead(_)).WillOnce(Invoke([](Buffer::Instance& buffer) {
+    buffer.add("client hello");
+    return IoResult{PostIoAction::KeepOpen, 12, false};
+  }));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Read));
+
+  EXPECT_CALL(*transport_socket_, startSecureTransport()).WillOnce(Return(false));
+  EXPECT_CALL(*transport_socket_, injectReadData(_)).Times(0);
+  EXPECT_FALSE(connection_->startSecureTransport());
+}
+
+TEST_F(MockTransportConnectionImplTest, StartSecureTransportHandoffDisabled) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.secure_transport_read_buffer_handoff", "false"}});
+  initializeConnection();
+  connection_->addReadFilter(std::make_shared<Network::FakeReadFilter>());
+  EXPECT_CALL(*transport_socket_, doRead(_)).WillOnce(Invoke([](Buffer::Instance& buffer) {
+    buffer.add("client hello");
+    return IoResult{PostIoAction::KeepOpen, 12, false};
+  }));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Read));
+
+  EXPECT_CALL(*transport_socket_, startSecureTransport()).WillOnce(Return(true));
+  EXPECT_CALL(*transport_socket_, injectReadData(_)).Times(0);
+  EXPECT_TRUE(connection_->startSecureTransport());
+}
+
 // The purpose of this case is to verify the destructor order of the object.
 // FilterManager relies on ConnectionSocketImpl, so the FilterManager can be
 // destructed after the ConnectionSocketImpl is destructed.

@@ -201,6 +201,17 @@ public:
   virtual bool startSecureTransport() PURE;
 
   /**
+   * Supplies data that was already read from the IO handle but that this transport socket has not
+   * seen, for example bytes a clear-text transport socket received before the connection switched
+   * to a secure transport (see startSecureTransport()). The transport socket consumes this data
+   * ahead of anything it subsequently reads from the IO handle.
+   * @param data supplies the data. It is drained if the transport socket takes it.
+   * @return bool whether the transport socket took the data. Transport sockets that do not support
+   *         this leave the buffer untouched.
+   */
+  virtual bool injectReadData(Buffer::Instance&) { return false; }
+
+  /**
    * Try to configure the connection's initial congestion window.
    * The operation is advisory - the connection may not support it, even if it's supported, it may
    * not do anything after the first few network round trips with the peer.

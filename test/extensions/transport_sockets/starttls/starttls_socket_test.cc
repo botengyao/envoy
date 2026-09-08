@@ -17,6 +17,7 @@ namespace TransportSockets {
 namespace StartTls {
 
 using testing::_;
+using testing::Return;
 
 class StartTlsTransportSocketMock : public Network::MockTransportSocket {
 public:
@@ -70,6 +71,10 @@ TEST(StartTlsTest, BasicSwitch) {
   EXPECT_CALL(*ssl_socket, doWrite(_, true)).Times(0);
   socket->doWrite(buf, true);
 
+  EXPECT_CALL(*raw_socket, injectReadData(_)).WillOnce(Return(false));
+  EXPECT_CALL(*ssl_socket, injectReadData(_)).Times(0);
+  EXPECT_FALSE(socket->injectReadData(buf));
+
   // Now switch to Tls. During the switch, the new socket should register for callbacks
   // and connect.
   EXPECT_CALL(*ssl_socket, ssl());
@@ -109,6 +114,9 @@ TEST(StartTlsTest, BasicSwitch) {
 
   EXPECT_CALL(*ssl_socket, doWrite(_, true));
   socket->doWrite(buf, true);
+
+  EXPECT_CALL(*ssl_socket, injectReadData(_)).WillOnce(Return(true));
+  EXPECT_TRUE(socket->injectReadData(buf));
 }
 
 TEST(StartTlsTest, CallbackProxy) {

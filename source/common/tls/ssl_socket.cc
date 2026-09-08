@@ -393,6 +393,13 @@ void SslSocket::onConnected() {
 
 Ssl::ConnectionInfoConstSharedPtr SslSocket::ssl() const { return info_; }
 
+bool SslSocket::injectReadData(Buffer::Instance& data) {
+  ASSERT(callbacks_ != nullptr);
+  BIO_io_handle_inject_read_data(SSL_get_rbio(rawSsl()), data);
+  callbacks_->setTransportSocketIsReadable();
+  return true;
+}
+
 void SslSocket::shutdownSsl() {
   ASSERT(info_->state() != Ssl::SocketState::HandshakeWaitingForConnectionData);
   if (info_->state() != Ssl::SocketState::ShutdownSent &&

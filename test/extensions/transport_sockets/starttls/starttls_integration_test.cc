@@ -15,6 +15,7 @@
 #include "test/integration/ssl_utility.h"
 #include "test/test_common/registry.h"
 
+#include "absl/strings/match.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
@@ -27,6 +28,14 @@ using testing::NiceMock;
 // If it receives a data which is not known keyword it means that transport socket has not been
 // successfully converted to use TLS and filter receives either encrypted data or TLS handshake
 // messages.
+//
+// Three more keywords model a client that starts its TLS handshake right after the switch
+// command, without waiting for a reply:
+// - "hold" from the client stops Envoy from reading the connection.
+// - "go" from upstream resumes reading, so that everything the client sent in the meantime is
+//   read in one go.
+// - "starttls" from the client switches the transport socket immediately. Whatever follows the
+//   command in the same read is the client's TLS handshake.
 class StartTlsSwitchFilter : public Network::Filter {
 public:
   // Network::ReadFilter
@@ -96,6 +105,17 @@ Network::FilterStatus StartTlsSwitchFilter::onCommand(Buffer::Instance& buf, boo
 // and sends to the client "usetls" message.
 //
 Network::FilterStatus StartTlsSwitchFilter::onData(Buffer::Instance& buf, bool) {
+  const std::string message = buf.toString();
+  if (message == "hold") {
+    read_callbacks_->connection().readDisable(true);
+    // Passed upstream so that the test can tell when reading has stopped.
+    return Network::FilterStatus::Continue;
+  }
+  if (absl::StartsWith(message, "starttls")) {
+    buf.drain(8);
+    read_callbacks_->connection().startSecureTransport();
+    return Network::FilterStatus::StopIteration;
+  }
   return onCommand(buf, true);
 }
 
@@ -104,6 +124,11 @@ Network::FilterStatus StartTlsSwitchFilter::onData(Buffer::Instance& buf, bool) 
 // with keyword "usetls" and adds a callback to be called when sending payload
 // to the client completes.
 Network::FilterStatus StartTlsSwitchFilter::onWrite(Buffer::Instance& buf, bool) {
+  if (buf.toString() == "go") {
+    buf.drain(buf.length());
+    read_callbacks_->connection().readDisable(false);
+    return Network::FilterStatus::StopIteration;
+  }
   return onCommand(buf, false);
 }
 
@@ -159,6 +184,7 @@ public:
   StartTlsIntegrationTest() : BaseIntegrationTest(GetParam(), ConfigHelper::startTlsConfig()) {}
   void initialize() override;
   void addStartTlsSwitchFilter(ConfigHelper& config_helper);
+  bool waitForClientConnected();
 
   // Contexts needed by raw buffer and tls transport sockets.
   std::unique_ptr<Ssl::ContextManager> tls_context_manager_;
@@ -233,6 +259,17 @@ void StartTlsIntegrationTest::initialize() {
   conn_->enableHalfClose(true);
   conn_->addConnectionCallbacks(connect_callbacks_);
   conn_->addReadFilter(payload_reader_);
+}
+
+bool StartTlsIntegrationTest::waitForClientConnected() {
+  const auto deadline = timeSystem().monotonicTime() + TestUtility::DefaultTimeout;
+  while (!connect_callbacks_.connected() && !connect_callbacks_.closed()) {
+    if (timeSystem().monotonicTime() > deadline) {
+      return false;
+    }
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+  return connect_callbacks_.connected();
 }
 
 // Method adds StartTlsSwitchFilter into the filter chain.
@@ -379,6 +416,56 @@ TEST_P(StartTlsIntegrationTest, SwitchToTlsFromUpstream) {
   }
   // Make sure the data makes it upstream.
   ASSERT_TRUE(fake_upstream_connection->waitForData(12));
+  conn_->close(Network::ConnectionCloseType::FlushWrite);
+}
+
+// The client sends the switch command and its TLS ClientHello back to back, so Envoy reads both
+// before the filter has switched the transport socket. The bytes read past the command must reach
+// the TLS transport socket for the handshake to complete.
+TEST_P(StartTlsIntegrationTest, SwitchToTlsWithCoalescedClientHello) {
+  initialize();
+
+  conn_->connect();
+
+  FakeRawConnectionPtr fake_upstream_connection;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_upstream_connection));
+
+  // Stop Envoy from reading so that what the client sends next queues up in the socket.
+  Buffer::OwnedImpl buffer;
+  buffer.add("hold");
+  conn_->write(buffer, false);
+  while (client_write_buffer_->bytesDrained() != 4) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+  ASSERT_TRUE(fake_upstream_connection->waitForData(4));
+
+  // Send the switch command and start the TLS handshake without waiting for a reply.
+  buffer.add("starttls");
+  conn_->write(buffer, false);
+  while (client_write_buffer_->bytesDrained() != 12) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+  conn_->setTransportSocket(tls_context_->createTransportSocket(
+      std::make_shared<Network::TransportSocketOptionsImpl>(
+          absl::string_view(""), std::vector<std::string>(), std::vector<std::string>{"envoyalpn"}),
+      nullptr));
+  connect_callbacks_.reset();
+  // Runs the write event scheduled by setTransportSocket(), which sends the ClientHello.
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  // Let Envoy read again. It gets "starttls" and the ClientHello in one read.
+  ASSERT_TRUE(fake_upstream_connection->write("go", false));
+  ASSERT_TRUE(waitForClientConnected());
+
+  // Send a message over the encrypted connection.
+  buffer.add("hola");
+  conn_->write(buffer, false);
+  while (client_write_buffer_->bytesDrained() != 16) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+  // Make sure the data makes it upstream.
+  ASSERT_TRUE(fake_upstream_connection->waitForData(8));
+
   conn_->close(Network::ConnectionCloseType::FlushWrite);
 }
 

@@ -7558,6 +7558,38 @@ TEST_P(SslSocketTest, TestTransportSocketCallback) {
   EXPECT_EQ(ssl_socket->transportSocketCallbacks(), &callbacks);
 }
 
+// Injected data is handed to the SSL layer ahead of the io_handle and schedules a read.
+TEST_P(SslSocketTest, InjectReadData) {
+  Network::MockIoHandle io_handle;
+  NiceMock<Network::MockTransportSocketCallbacks> callbacks;
+  ON_CALL(callbacks, ioHandle()).WillByDefault(ReturnRef(io_handle));
+
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+  ON_CALL(factory_context_.server_context_, localInfo()).WillByDefault(ReturnRef(local_info));
+
+  envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+  auto client_cfg = *ClientContextConfigImpl::create(tls_context, factory_context_);
+
+  ContextManagerImpl manager(factory_context_.serverFactoryContext());
+  auto client_ssl_socket_factory = *ClientSslSocketFactory::create(
+      std::move(client_cfg), manager, *factory_context_.store_.rootScope());
+
+  Network::TransportSocketPtr transport_socket =
+      client_ssl_socket_factory->createTransportSocket(nullptr, nullptr);
+  transport_socket->setTransportSocketCallbacks(callbacks);
+
+  EXPECT_CALL(callbacks, setTransportSocketIsReadable());
+  Buffer::OwnedImpl data("hello");
+  EXPECT_TRUE(transport_socket->injectReadData(data));
+  EXPECT_EQ(0, data.length());
+
+  char buf[16];
+  BIO* rbio = SSL_get_rbio(dynamic_cast<SslSocket*>(transport_socket.get())->rawSslForTest());
+  EXPECT_CALL(io_handle, readv(_, _, _)).Times(0);
+  EXPECT_EQ(5, BIO_read(rbio, buf, sizeof(buf)));
+  EXPECT_EQ("hello", std::string(buf, 5));
+}
+
 TEST_P(SslSocketTest, AsyncCertSelectionCallbackWhenNotBlocked) {
   // Make MockTransportSocketCallbacks.
   Network::MockIoHandle io_handle;

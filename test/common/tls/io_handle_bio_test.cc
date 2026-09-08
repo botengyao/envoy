@@ -1,3 +1,4 @@
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/network/io_socket_error_impl.h"
 #include "source/common/tls/io_handle_bio.h"
 
@@ -428,6 +429,58 @@ TEST_F(IoHandleBioTest, WriteRetryThenSuccess) {
   EXPECT_FALSE(BIO_should_retry(bio_));
 }
 
+TEST_F(IoHandleBioTest, InjectedDataIsReadBeforeIoHandle) {
+  Buffer::OwnedImpl data("hello");
+  BIO_io_handle_inject_read_data(bio_, data);
+  EXPECT_EQ(0, data.length());
+
+  char buf[16];
+  EXPECT_CALL(io_handle_, readv(_, _, _)).Times(0);
+  EXPECT_EQ(3, BIO_read(bio_, buf, 3));
+  EXPECT_EQ("hel", std::string(buf, 3));
+  EXPECT_EQ(2, BIO_read(bio_, buf, 16));
+  EXPECT_EQ("lo", std::string(buf, 2));
+  EXPECT_FALSE(BIO_should_retry(bio_));
+
+  // Once the injected data is consumed, reads go to the io_handle again.
+  EXPECT_CALL(io_handle_, readv(16, _, 1))
+      .WillOnce(Invoke([](uint64_t, Buffer::RawSlice* slices, uint64_t) {
+        memcpy(slices[0].mem_, "world", 5);
+        return makeSuccessResult(5);
+      }));
+  EXPECT_EQ(5, BIO_read(bio_, buf, 16));
+  EXPECT_EQ("world", std::string(buf, 5));
+}
+
+TEST_F(IoHandleBioTest, InjectedDataClearsRetryFlags) {
+  char buf[16];
+  EXPECT_CALL(io_handle_, readv(16, _, 1)).WillOnce(Return(testing::ByMove(makeAgainResult())));
+  EXPECT_EQ(-1, BIO_read(bio_, buf, 16));
+  EXPECT_TRUE(BIO_should_retry(bio_));
+
+  Buffer::OwnedImpl data("hi");
+  BIO_io_handle_inject_read_data(bio_, data);
+  EXPECT_EQ(2, BIO_read(bio_, buf, 16));
+  EXPECT_FALSE(BIO_should_retry(bio_));
+}
+
+TEST_F(IoHandleBioTest, InjectedDataAccumulates) {
+  Buffer::OwnedImpl first("ab");
+  Buffer::OwnedImpl second("cd");
+  BIO_io_handle_inject_read_data(bio_, first);
+  BIO_io_handle_inject_read_data(bio_, second);
+
+  char buf[16];
+  EXPECT_EQ(4, BIO_read(bio_, buf, 16));
+  EXPECT_EQ("abcd", std::string(buf, 4));
+}
+
+// Injected data that was never read is released with the BIO.
+TEST_F(IoHandleBioTest, FreeWithUnreadInjectedData) {
+  Buffer::OwnedImpl data("unread");
+  BIO_io_handle_inject_read_data(bio_, data);
+}
+
 // Test that two independent BIOs backed by different io_handles don't interfere.
 TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
   NiceMock<Network::MockIoHandle> handle1;
@@ -436,10 +489,6 @@ TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
   BIO* bio2 = BIO_new_io_handle(&handle2);
   ASSERT_NE(nullptr, bio1);
   ASSERT_NE(nullptr, bio2);
-
-  // Verify each BIO points to its own io_handle.
-  EXPECT_EQ(&handle1, BIO_get_data(bio1));
-  EXPECT_EQ(&handle2, BIO_get_data(bio2));
 
   char buf[16];
 

@@ -226,6 +226,7 @@ envoy_cc_test(
     rbe_pool = "linux_x64_small",
     deps = [
         ":ssl_test_utils",
+        "//source/common/buffer:buffer_lib",
         "//source/common/tls:ssl_socket_lib",
         "//test/mocks/network:io_handle_mocks",
     ],

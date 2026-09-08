@@ -114,7 +114,7 @@ public:
   StreamInfo::StreamInfo& streamInfo() override { return stream_info_; }
   const StreamInfo::StreamInfo& streamInfo() const override { return stream_info_; }
   absl::string_view transportFailureReason() const override;
-  bool startSecureTransport() override { return transport_socket_->startSecureTransport(); }
+  bool startSecureTransport() override;
   std::optional<std::chrono::milliseconds> lastRoundTripTime() const override;
   void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
                                         std::chrono::microseconds rtt) override;

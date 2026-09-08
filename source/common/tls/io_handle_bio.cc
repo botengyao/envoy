@@ -1,9 +1,12 @@
 #include "source/common/tls/io_handle_bio.h"
 
+#include <algorithm>
+
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/platform.h"
 #include "envoy/network/io_handle.h"
 
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/runtime/runtime_features.h"
 
 #include "openssl/bio.h"
@@ -16,15 +19,32 @@ namespace Tls {
 
 namespace {
 
+struct IoHandleBioData {
+  Envoy::Network::IoHandle* io_handle_;
+  Envoy::Buffer::OwnedImpl injected_read_data_;
+};
+
 // NOLINTNEXTLINE(readability-identifier-naming)
-inline Envoy::Network::IoHandle* bio_io_handle(BIO* bio) {
-  return reinterpret_cast<Envoy::Network::IoHandle*>(BIO_get_data(bio));
+inline IoHandleBioData* bio_data(BIO* bio) {
+  return reinterpret_cast<IoHandleBioData*>(BIO_get_data(bio));
 }
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline Envoy::Network::IoHandle* bio_io_handle(BIO* bio) { return bio_data(bio)->io_handle_; }
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 int io_handle_read(BIO* b, char* out, int outl) {
   if (out == nullptr) {
     return 0;
+  }
+
+  Envoy::Buffer::Instance& injected = bio_data(b)->injected_read_data_;
+  if (injected.length() > 0) {
+    const uint64_t len = std::min(static_cast<uint64_t>(outl), injected.length());
+    injected.copyOut(0, len, out);
+    injected.drain(len);
+    BIO_clear_retry_flags(b);
+    return static_cast<int>(len);
   }
 
   Envoy::Buffer::RawSlice slice;
@@ -94,6 +114,13 @@ long io_handle_ctrl(BIO*, int cmd, long, void*) {
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)
+int io_handle_destroy(BIO* b) {
+  delete bio_data(b);
+  BIO_set_data(b, nullptr);
+  return 1;
+}
+
+// NOLINTNEXTLINE(readability-identifier-naming)
 const BIO_METHOD* BIO_s_io_handle(void) {
   static const BIO_METHOD* method = [&] {
     BIO_METHOD* ret = BIO_meth_new(BIO_TYPE_SOCKET, "io_handle");
@@ -101,6 +128,7 @@ const BIO_METHOD* BIO_s_io_handle(void) {
     RELEASE_ASSERT(BIO_meth_set_read(ret, io_handle_read), "");
     RELEASE_ASSERT(BIO_meth_set_write(ret, io_handle_write), "");
     RELEASE_ASSERT(BIO_meth_set_ctrl(ret, io_handle_ctrl), "");
+    RELEASE_ASSERT(BIO_meth_set_destroy(ret, io_handle_destroy), "");
     return ret;
   }();
   return method;
@@ -116,10 +144,15 @@ BIO* BIO_new_io_handle(Envoy::Network::IoHandle* io_handle) {
   RELEASE_ASSERT(b != nullptr, "");
 
   // Initialize the BIO
-  BIO_set_data(b, io_handle);
+  BIO_set_data(b, new IoHandleBioData{io_handle, {}});
   BIO_set_init(b, 1);
 
   return b;
+}
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+void BIO_io_handle_inject_read_data(BIO* bio, Envoy::Buffer::Instance& data) {
+  bio_data(bio)->injected_read_data_.move(data);
 }
 
 } // namespace Tls

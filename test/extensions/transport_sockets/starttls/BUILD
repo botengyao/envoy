@@ -50,6 +50,7 @@ envoy_extension_cc_test(
         "//source/extensions/transport_sockets/starttls:config",
         "//test/integration:integration_lib",
         "//test/test_common:registry_lib",
+        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/extensions/transport_sockets/raw_buffer/v3:pkg_cc_proto",
     ],
 )

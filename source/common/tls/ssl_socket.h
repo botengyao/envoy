@@ -65,6 +65,7 @@ public:
   void onConnected() override;
   Ssl::ConnectionInfoConstSharedPtr ssl() const override;
   bool startSecureTransport() override { return false; }
+  bool injectReadData(Buffer::Instance& data) override;
   void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
   // Ssl::PrivateKeyConnectionCallbacks
   void onPrivateKeyMethodComplete() override;

@@ -995,6 +995,22 @@ bool ConnectionImpl::setSocketOption(Network::SocketOptionName name, absl::Span<
   return true;
 }
 
+bool ConnectionImpl::startSecureTransport() {
+  if (!transport_socket_->startSecureTransport()) {
+    return false;
+  }
+  // Anything the clear-text transport read past the end of the negotiation belongs to the secure
+  // transport, e.g. a TLS ClientHello coalesced with the last clear-text message.
+  if (read_buffer_->length() > 0 &&
+      Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.secure_transport_read_buffer_handoff")) {
+    ENVOY_CONN_LOG(trace, "handing {} buffered bytes to the secure transport", *this,
+                   read_buffer_->length());
+    transport_socket_->injectReadData(*read_buffer_);
+  }
+  return true;
+}
+
 absl::string_view ConnectionImpl::transportFailureReason() const {
   if (!failure_reason_.empty()) {
     return failure_reason_;

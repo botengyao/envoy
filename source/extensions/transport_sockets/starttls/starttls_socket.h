@@ -51,6 +51,10 @@ public:
   // Method to enable TLS.
   bool startSecureTransport() override;
 
+  bool injectReadData(Buffer::Instance& data) override {
+    return active_socket_->injectReadData(data);
+  }
+
   void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
                                         std::chrono::microseconds rtt) override {
     return active_socket_->configureInitialCongestionWindow(bandwidth_bits_per_sec, rtt);

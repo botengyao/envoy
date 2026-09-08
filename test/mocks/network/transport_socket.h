@@ -34,6 +34,7 @@ public:
   MOCK_METHOD(void, onConnected, ());
   MOCK_METHOD(Ssl::ConnectionInfoConstSharedPtr, ssl, (), (const));
   MOCK_METHOD(bool, startSecureTransport, ());
+  MOCK_METHOD(bool, injectReadData, (Buffer::Instance & data));
   MOCK_METHOD(void, configureInitialCongestionWindow,
               (uint64_t bandwidth_bits_per_sec, std::chrono::microseconds rtt));
 
