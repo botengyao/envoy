@@ -10,6 +10,7 @@
 #include "test/test_common/simulated_time_system.h"
 
 #include "absl/synchronization/notification.h"
+#include "nlohmann/json.hpp"
 
 namespace Envoy {
 namespace {
@@ -302,7 +303,8 @@ request:
       R"EOF({"model":"gpt-4o","messages":[{"role":"user","content":"small"}]})EOF";
   auto ok_response = codec_client_->makeRequestWithBody(requestHeaders(), small_body);
   waitForNextUpstreamRequest();
-  EXPECT_EQ(small_body, upstream_request_->body().toString());
+  EXPECT_EQ(nlohmann::json::parse(small_body),
+            nlohmann::json::parse(upstream_request_->body().toString()));
   upstream_request_->encodeHeaders(default_response_headers_, true);
   ASSERT_TRUE(ok_response->waitForEndStream());
   EXPECT_EQ("200", ok_response->headers().getStatusValue());

@@ -35,10 +35,12 @@ The request path has two deliberately different modes:
 
 * **Declared route, strict parsing.** As the body arrives, the filter offloads
   it into an external buffer rather than pinning it in the connection manager's
-  in-memory buffers. Once the stream ends, it replays the buffered bytes so
-  subsequent filters observe the request unchanged. The request headers remain
-  held until replay starts. The offload/replay round-trip is flow-controlled in
-  both directions, and malformed or schema-invalid payloads are rejected.
+  in-memory buffers. Once the stream ends, the payload filter manager serializes
+  the parsed document back into the request body and replays it. The JSON value
+  is preserved, but whitespace and object-key order may change; an existing
+  ``Content-Length`` is recalculated. The request headers remain held until
+  replay starts. The offload/replay round-trip is flow-controlled in both
+  directions, and malformed or schema-invalid payloads are rejected.
 * **Unconfigured route, best-effort inspection.** When
   ``parse_unconfigured_routes`` is enabled, an eligible ``application/json``
   POST request is inspected incrementally while only a bounded prefix is retained
@@ -54,7 +56,12 @@ forwarded for the upstream to interpret differently. Parsing is incremental and 
 stream, so an invalid payload fails as soon as the offending byte arrives rather
 than after the whole upload. Oversized string values are left in the external
 buffer and referenced by offset, so a large prompt does not reappear in
-per-stream memory.
+per-stream memory. What counts as oversized is
+:ref:`inline_string_threshold_bytes
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestParsingLimits.inline_string_threshold_bytes>`,
+1KiB by default -- large enough that ordinary metadata stays inline and small
+enough that conversation content does not. A declared API whose payload schema
+pins its own threshold uses that instead.
 
 Upon stream completion, the parsed document is validated against the payload
 schema of the route's declared :ref:`wire API
@@ -152,7 +159,8 @@ retained prefix and all following bytes are forwarded unchanged.
       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
       request_handling:
         parse_unconfigured_routes: true
-        max_unconfigured_request_body_bytes: 1048576
+        limits:
+          max_unconfigured_request_body_bytes: 1048576
         request_info: {}
 
 Bounded request inspection
@@ -166,7 +174,7 @@ only conservative authority/path or body signatures. An ambiguous JSON body is
 forwarded without guessing a protocol.
 
 The :ref:`max_unconfigured_request_body_bytes
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.max_unconfigured_request_body_bytes>`
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestParsingLimits.max_unconfigured_request_body_bytes>`
 limit defaults to 1 MiB. The filter feeds at most the remaining prefix budget
 from each data frame to the parser. Once the root JSON value closes, the HTTP
 stream ends, parsing fails, or the limit is reached, inspection becomes inert
@@ -294,7 +302,8 @@ first and forward the typed namespace:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
       request_handling:
         parse_unconfigured_routes: true
-        max_unconfigured_request_body_bytes: 1048576
+        limits:
+          max_unconfigured_request_body_bytes: 1048576
         request_info: {}
   - name: envoy.filters.http.ext_proc
     typed_config:
@@ -570,6 +579,12 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   :header: Name, Type, Description
   :widths: 1, 1, 2
 
+  request_parsed, Counter, "A held request payload was parsed successfully through end of stream, and passed its payload schema where the declared API has one."
+  request_parse_error, Counter, A declared AI endpoint's payload was not well-formed JSON and was rejected with a 400.
+  request_schema_invalid, Counter, "A declared AI endpoint's payload parsed but violated its API's payload schema, and was rejected with a 400."
+  request_passthrough, Counter, "A payload on an unconfigured route failed to parse under :ref:`parse_unconfigured_routes <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>` and was forwarded unchanged; never a request failure."
+  request_external_buffer_error, Counter, The external buffer failed irrecoverably on the request path and the stream was answered with a 500.
+  response_external_buffer_error, Counter, The external buffer failed irrecoverably on the response path and the stream was answered with a 500.
   request_info_published, Counter, Request-info typed metadata was written (including ``PARTIAL`` and ``FAILED`` records).
   request_info_partial, Counter, A published request-info record was flagged ``extraction_status: PARTIAL``.
   request_info_failed, Counter, A request-info record was published with ``extraction_status: FAILED``.

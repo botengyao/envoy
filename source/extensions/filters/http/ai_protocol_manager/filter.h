@@ -12,6 +12,7 @@
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/request_info.h"
@@ -83,6 +84,7 @@ public:
   const std::string& requestInfoNamespace() const { return request_info_namespace_; }
   ApiProtocol requestInfoDefaultProtocol() const { return request_info_default_protocol_; }
   uint32_t maxUnconfiguredRequestBodyBytes() const { return max_unconfigured_request_body_bytes_; }
+  uint32_t inlineStringThresholdBytes() const { return inline_string_threshold_bytes_; }
   bool tokenUsageEnabled() const { return token_usage_enabled_; }
   bool includeUnconfiguredRoutes() const { return include_unconfigured_routes_; }
   ApiProtocol defaultApiProtocol() const { return default_api_protocol_; }
@@ -102,6 +104,7 @@ private:
   const std::string request_info_namespace_;
   const ApiProtocol request_info_default_protocol_ = ApiProtocol::Unspecified;
   const uint32_t max_unconfigured_request_body_bytes_ = 0;
+  const uint32_t inline_string_threshold_bytes_ = 0;
   const bool token_usage_enabled_ = false;
   const bool include_unconfigured_routes_ = false;
   const ApiProtocol default_api_protocol_ = ApiProtocol::Unspecified;
@@ -190,7 +193,10 @@ private:
 // one rejected so Envoy and the backend cannot read the same body differently.
 // A route without one is inspected only if the filter opted into
 // parse_unconfigured_routes; a malformed or oversized unconfigured request is
-// always forwarded and is otherwise untouched.
+// always forwarded and is otherwise untouched. Because that opt-in covers
+// routes that never declared an AI endpoint, it inspects only requests that can
+// be held without stalling a full-duplex exchange; gRPC, Connect streaming,
+// upgrades, and CONNECT are skipped. A declared endpoint carries no such gate.
 //
 // A declared wire API with a registered payload schema is validated at end of
 // payload (schema/schema_registry.h); normalization comes later.
@@ -253,9 +259,17 @@ private:
   // what makes a parse failure fatal.
   bool isAiEndpoint() const { return route_has_request_; }
 
+  // The inline-string threshold for this stream: the route's payload schema
+  // when it pins one, otherwise the filter's configured default.
+  uint32_t inlineStringThresholdBytes() const;
+
   // Publish the accumulated token usage as dynamic metadata and account stats.
   // Called exactly once, at response end of stream (data or trailers).
   void finalizeResponseHandling();
+
+  // Finalizes the decode path when the full request body (and optional trailers) has been received.
+  // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
+  void finalizeDecode(bool has_trailers);
 
   ExternalBufferFactory& buffer_factory_;
   FilterConfigSharedPtr config_;
@@ -292,6 +306,12 @@ private:
 
   // Once set, later frames on the dying stream are dropped, not offloaded.
   bool payload_rejected_{false};
+
+  // Request headers for this stream. Held by pointer during decode path.
+  Http::RequestHeaderMap* request_headers_{nullptr};
+
+  // FilterManager orchestrating the AI filter chain.
+  std::unique_ptr<FilterManager> filter_manager_;
 
   // Encode-path (response token-usage) state.
   ResponseHandlerPtr response_handler_;

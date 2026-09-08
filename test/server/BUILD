@@ -9,7 +9,7 @@ load(
     "envoy_select_admin_functionality",
     "envoy_select_hot_restart",
 )
-load("//bazel:repositories.bzl", "PPC_SKIP_TARGETS", "WINDOWS_SKIP_TARGETS")
+load("//bazel:extension_configs.bzl", "PPC_SKIP_TARGETS", "WINDOWS_SKIP_TARGETS")
 load("//source/extensions:all_extensions.bzl", "envoy_all_extensions")
 
 licenses(["notice"])  # Apache 2
@@ -210,11 +210,16 @@ envoy_cc_test(
     rbe_pool = "linux_x64_small",
     deps = [
         ":utility_lib",
+        "//source/common/stats:allocator_lib",
         "//source/common/stats:stats_lib",
+        "//source/common/stats:tag_producer_lib",
+        "//source/common/stats:thread_local_store_lib",
         "//source/server:hot_restart_lib",
         "//source/server:hot_restarting_child",
         "//test/mocks/network:network_mocks",
         "//test/mocks/server:server_mocks",
+        "//test/test_common:test_runtime_lib",
+        "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
     ],
 )
 

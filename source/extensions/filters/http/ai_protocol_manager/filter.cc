@@ -10,11 +10,14 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/utility.h"
+#include "source/common/grpc/common.h"
+#include "source/common/http/header_utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
+#include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/request_info_proto.h"
 #include "source/extensions/filters/http/ai_protocol_manager/request_protocol_classifier.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
@@ -56,6 +59,23 @@ bool isJsonContentType(absl::string_view content_type) {
   const absl::string_view normalized = StringUtil::trim(StringUtil::cropRight(content_type, ";"));
   return absl::EqualsIgnoreCase(normalized, "application/json") ||
          absl::EndsWithIgnoreCase(normalized, "+json");
+}
+
+// Whether an unconfigured route's request can be held to end of stream.
+//
+// Holding the headers is only safe if the client finishes its request before it
+// wants a response. A full-duplex stream -- gRPC or Connect streaming, an
+// upgrade, CONNECT -- may instead wait on a response the held upstream cannot
+// produce, and stall until it times out.
+bool canHoldRequest(const Http::RequestHeaderMap& headers) {
+  if (Grpc::Common::isGrpcRequestHeaders(headers) ||
+      Grpc::Common::isConnectStreamingRequestHeaders(headers)) {
+    return false;
+  }
+  if (Http::Utility::isUpgrade(headers) || Http::HeaderUtility::isConnect(headers)) {
+    return false;
+  }
+  return isJsonContentType(headers.getContentTypeValue());
 }
 
 // Extraction requires an unencoded body: every entry and comma-separated
@@ -130,8 +150,11 @@ FilterConfig::FilterConfig(
       request_info_default_protocol_(
           protocolFromProto(proto.request_handling().request_info().default_api_protocol())),
       max_unconfigured_request_body_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
-          proto.request_handling(), max_unconfigured_request_body_bytes,
+          proto.request_handling().limits(), max_unconfigured_request_body_bytes,
           DefaultMaxUnconfiguredRequestBodyBytes)),
+      inline_string_threshold_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+          proto.request_handling().limits(), inline_string_threshold_bytes,
+          JsonWithExtBufParser::kDefaultInlineStringThresholdBytes)),
       token_usage_enabled_(proto.response_handling().has_token_usage()),
       include_unconfigured_routes_(
           proto.response_handling().token_usage().include_unconfigured_routes()),
@@ -151,6 +174,9 @@ FilterConfig::FilterConfig(
                                           max_parsed_sse_events, DefaultMaxParsedSseEvents)) {}
 
 void AiProtocolManagerFilter::onDestroy() {
+  if (filter_manager_ != nullptr) {
+    filter_manager_->cancel();
+  }
   if (decode_manager_ != nullptr) {
     // Detach the manager (releases the external buffer and unsubscribes from
     // watermarks) but do NOT free it here. onDestroy() can run synchronously while
@@ -166,6 +192,7 @@ void AiProtocolManagerFilter::onDestroy() {
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers,
                                                                  bool end_stream) {
+  request_headers_ = &headers;
   // Request-side processing is off entirely; per-route declarations still
   // matter to the encode path, which resolves them itself.
   if (!config_->requestHandlingEnabled()) {
@@ -190,8 +217,7 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   const bool best_effort_eligible =
       !isAiEndpoint() && config_->parseUnconfiguredRoutes() &&
       headers.getMethodValue() == Http::Headers::get().MethodValues.Post &&
-      !Http::Utility::isUpgrade(headers) && headers.Expect() == nullptr &&
-      isJsonContentType(headers.getContentTypeValue()) && contentEncodingIsIdentity(headers);
+      headers.Expect() == nullptr && canHoldRequest(headers) && contentEncodingIsIdentity(headers);
 
   // A headers-only request has no payload to hold. It can still publish a
   // route- or target-derived inference indicator before later filters see the
@@ -230,7 +256,9 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   }
 
   request_handling_mode_ = RequestHandlingMode::Strict;
-  request_parser_ = std::make_unique<JsonWithExtBufParser>(JsonWithExtBufParser::Config{});
+  JsonWithExtBufParser::Config parser_config;
+  parser_config.inline_string_threshold_bytes = inlineStringThresholdBytes();
+  request_parser_ = std::make_unique<JsonWithExtBufParser>(parser_config);
   if (config_->requestInfoEnabled()) {
     request_info_extractor_ = std::make_unique<RequestInfoExtractor>();
   }
@@ -238,7 +266,8 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // for none of it: constructing it subscribes to upstream watermarks and claims
   // a schedulable callback.
   decode_manager_ = std::make_unique<BufferManager>(
-      buffer_factory_, std::make_unique<DecoderFilterChainBridge>(*decoder_callbacks_));
+      buffer_factory_,
+      std::make_unique<DecoderFilterChainBridge>(*decoder_callbacks_, config_->stats()));
 
   // Pin the headers so routing and admission filters do not act on them before
   // the payload is offloaded. decodeData() still fires while iteration is stopped
@@ -246,6 +275,24 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // for an empty/trailer-only body, when the manager continues iteration).
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
+  // The filter's configured value is the default. A declared endpoint's payload
+  // schema may pin its own, because what has to stay inline for the payload to
+  // validate is a property of the wire API, not of the deployment.
+  if (isAiEndpoint()) {
+    if (const PayloadSchema* payload_schema =
+            AdapterRegistry::get(route_request_protocol_).schema();
+        payload_schema != nullptr) {
+      if (const std::optional<uint32_t> pinned =
+              payload_schema->requestInlineStringThresholdBytes();
+          pinned.has_value()) {
+        return *pinned;
+      }
+    }
+  }
+  return config_->inlineStringThresholdBytes();
 }
 
 bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_stream) {
@@ -268,6 +315,7 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
   }
 
   if (!status.ok()) {
+    config_->stats().request_parse_error_.inc();
     rejectInvalidPayload(status);
     return false;
   }
@@ -283,10 +331,12 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
         payload_schema != nullptr) {
       const absl::Status validation_status = payload_schema->validateRequest(request_json_);
       if (!validation_status.ok()) {
+        config_->stats().request_schema_invalid_.inc();
         rejectInvalidPayload(validation_status);
         return false;
       }
     }
+    config_->stats().request_parsed_.inc();
   }
   return true;
 }
@@ -339,11 +389,15 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeBestEffortData(const Buffe
   if (request_info_extractor_->rootClosed() && !end_stream) {
     finalizeRequestInfo(ExtractionStatus::Partial, StopReason::RootClosed);
   } else if (!status.ok()) {
+    config_->stats().request_passthrough_.inc();
     ENVOY_LOG(debug, "ai_protocol_manager: releasing best-effort request after parse error: {}",
               status.message());
     finalizeRequestInfo(ExtractionStatus::Failed, StopReason::ParseError);
   } else if (request_info_extractor_->rootClosed()) {
     const bool complete = parser_saw_end_stream;
+    if (complete) {
+      config_->stats().request_parsed_.inc();
+    }
     finalizeRequestInfo(complete ? ExtractionStatus::Complete : ExtractionStatus::Partial,
                         complete ? StopReason::EndStream : StopReason::RootClosed);
   } else if (request_info_inspected_bytes_ == limit) {
@@ -499,16 +553,7 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
 
   decode_manager_->onData(data);
   if (end_stream) {
-    // The full body has been offloaded. The filter owns replay and end-of-stream:
-    // a future change will assemble and inspect the request here (and may replay
-    // sub-ranges); for now replay the whole body, then emit the terminal frame.
-    decode_manager_->endStream();
-    decode_manager_->replay(0, decode_manager_->length(), [this]() {
-      // Terminate the stream with an empty end_stream data frame after the replayed
-      // body (also releases the held headers when the body was empty).
-      Buffer::OwnedImpl end_marker;
-      decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
-    });
+    finalizeDecode(/*has_trailers=*/false);
   }
   // Hold the chain here; the BufferManager replays the payload once told to.
   return Http::FilterDataStatus::StopIterationNoBuffer;
@@ -520,6 +565,11 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
       finalizeRequestInfo(ExtractionStatus::Complete, StopReason::EndStream);
     } else {
       const absl::Status status = request_info_extractor_->feed("", /*closed=*/true);
+      if (status.ok()) {
+        config_->stats().request_parsed_.inc();
+      } else {
+        config_->stats().request_passthrough_.inc();
+      }
       finalizeRequestInfo(status.ok() ? ExtractionStatus::Complete : ExtractionStatus::Failed,
                           status.ok() ? StopReason::EndStream : StopReason::ParseError);
     }
@@ -556,16 +606,58 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
                                                  : ExtractionStatus::Complete,
                       request_info_parse_failed_ ? StopReason::ParseError : StopReason::EndStream);
 
-  // The body ended without end_stream on a data frame; the trailers carry it.
-  decode_manager_->endStream();
-  decode_manager_->replay(0, decode_manager_->length(), [this]() {
-    // Body fully replayed; release the held trailers (they carry END_STREAM) so
-    // they follow the body in order.
-    decoder_callbacks_->continueDecoding();
-  });
+  finalizeDecode(/*has_trailers=*/true);
   // Hold the trailers behind the replayed body until the replay-done callback
   // above releases them.
   return Http::FilterTrailersStatus::StopIteration;
+}
+
+void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
+  decode_manager_->endStream();
+  auto on_complete = [this, has_trailers](absl::Status status) {
+    if (!status.ok()) {
+      ENVOY_LOG(error, "ai_protocol_manager: replay failed: {}", status.message());
+      if (!payload_rejected_) {
+        payload_rejected_ = true;
+        decoder_callbacks_->sendLocalReply(Http::Code::BadGateway, status.message(), nullptr,
+                                           std::nullopt, "ai_protocol_manager_replay_error");
+      }
+      return;
+    }
+    if (has_trailers) {
+      // Body fully replayed; release the held trailers (they carry END_STREAM) so
+      // they follow the body in order.
+      decoder_callbacks_->continueDecoding();
+    } else {
+      // Terminate the stream with an empty end_stream data frame after the replayed
+      // body (also releases the held headers when the body was empty).
+      Buffer::OwnedImpl end_marker;
+      decoder_callbacks_->injectDecodedDataToFilterChain(end_marker, /*end_stream=*/true);
+    }
+  };
+
+  if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
+    ASSERT(request_headers_ != nullptr);
+    std::vector<AiFilterPtr> filters;
+    // TODO(penguingao): Avoid always passing downstream StreamInfo when constructing
+    // FilterManager; when AI Protocol Manager is placed in an upstream filter chain, it should
+    // behave differently.
+    filter_manager_ = std::make_unique<FilterManager>(
+        std::move(filters), std::move(request_json_), decode_manager_.get(),
+        decoder_callbacks_->dispatcher(), decoder_callbacks_->streamInfo(), request_headers_,
+        [this](Http::Code code, std::string details) {
+          ENVOY_LOG(debug, "ai_protocol_manager: rejecting request via local reply: {} {}",
+                    static_cast<uint32_t>(code), details);
+          payload_rejected_ = true;
+          decoder_callbacks_->sendLocalReply(code, details, nullptr, std::nullopt,
+                                             "ai_protocol_manager_filter_rejected");
+        });
+    filter_manager_->start([on_complete = std::move(on_complete)](absl::Status status) {
+      on_complete(std::move(status));
+    });
+  } else {
+    decode_manager_->replay(0, decode_manager_->length(), std::move(on_complete));
+  }
 }
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseHeaderMap& headers,

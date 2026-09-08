@@ -60,21 +60,43 @@ message RequestHandling {
   // When ``true``, eligible unencoded JSON POST requests with an
   // ``application/json`` or ``+json`` content type are inspected up to
   // :ref:`max_unconfigured_request_body_bytes
-  // <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.max_unconfigured_request_body_bytes>`.
+  // <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestParsingLimits.max_unconfigured_request_body_bytes>`.
   // Such requests are never failed over parsing or limit errors — a route
   // that declared no AI wire contract has nothing to hold its payload to, so
   // the held prefix and the rest of the body are forwarded unchanged. Upgrade
-  // requests and requests carrying any ``Expect`` header (including
-  // ``Expect: 100-continue``) are not inspected, because holding their headers
-  // can deadlock a duplex exchange.
+  // requests, CONNECT, gRPC or Connect streaming requests, and requests
+  // carrying any ``Expect`` header (including ``Expect: 100-continue``) are
+  // not inspected, because holding their headers can deadlock a duplex
+  // exchange.
   // A non-identity ``Content-Encoding`` is also skipped because this filter
   // does not decode request bodies.
   bool parse_unconfigured_routes = 1;
 
+  // Request-path parsing limits. Defaults apply when unset.
+  RequestParsingLimits limits = 2;
+
   // Extract and publish canonical request attributes as typed dynamic
   // metadata. When unset, request parsing and validation do not publish a
   // record.
-  RequestInfoPublication request_info = 2;
+  RequestInfoPublication request_info = 3;
+}
+
+// Per-stream limits for request payload parsing.
+message RequestParsingLimits {
+  // Maximum size, in bytes, of a decoded string value kept inline in the
+  // parsed document; a larger value stays in the external buffer and is
+  // referenced by offset. Object keys are always inline.
+  //
+  // This is the deployment-wide default, applied when a declared API's payload
+  // schema does not pin its own threshold. Defaults to 1KiB, which keeps
+  // ordinary metadata (model names, roles, tool names) inline while
+  // conversation content goes to the buffer.
+  //
+  // Keep it above the longest ``model`` name in use. Values over the threshold
+  // are offloaded, and on a declared AI endpoint the payload schema requires
+  // ``model`` inline, so an offloaded one is rejected with a 400.
+  google.protobuf.UInt32Value inline_string_threshold_bytes = 1
+      [(validate.rules).uint32 = {lte: 1048576 gte: 64}];
 
   // Maximum raw body prefix inspected on an unconfigured route. Once this
   // many bytes have been inspected, the request continues without waiting for
@@ -89,7 +111,7 @@ message RequestHandling {
   // Defaults to 1MiB. This limit does not apply to a route carrying a per-route
   // request declaration (even one whose protocol is unspecified): declared
   // requests retain their existing strict full-document validation behavior.
-  google.protobuf.UInt32Value max_unconfigured_request_body_bytes = 3
+  google.protobuf.UInt32Value max_unconfigured_request_body_bytes = 2
       [(validate.rules).uint32 = {lte: 10485760 gte: 1}];
 }
 

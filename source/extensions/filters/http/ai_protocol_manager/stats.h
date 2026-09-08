@@ -11,6 +11,12 @@ namespace AiProtocolManager {
  * All stats for the AI Protocol Manager filter. @see stats_macros.h
  */
 #define ALL_AI_PROTOCOL_MANAGER_STATS(COUNTER)                                                     \
+  COUNTER(request_parsed)                                                                          \
+  COUNTER(request_parse_error)                                                                     \
+  COUNTER(request_schema_invalid)                                                                  \
+  COUNTER(request_passthrough)                                                                     \
+  COUNTER(request_external_buffer_error)                                                           \
+  COUNTER(response_external_buffer_error)                                                          \
   COUNTER(request_info_published)                                                                  \
   COUNTER(request_info_partial)                                                                    \
   COUNTER(request_info_failed)                                                                     \
