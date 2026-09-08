@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "envoy/extensions/transport_sockets/starttls/v3/starttls.pb.h"
 #include "envoy/extensions/transport_sockets/starttls/v3/starttls.pb.validate.h"
 #include "envoy/network/connection.h"
@@ -20,8 +22,10 @@ class StartTlsSocket : public Network::TransportSocket, Logger::Loggable<Logger:
 public:
   StartTlsSocket(Network::TransportSocketPtr raw_socket, // RawBufferSocket
                  Network::TransportSocketPtr tls_socket, // TlsSocket
-                 const Network::TransportSocketOptionsConstSharedPtr&)
-      : active_socket_(std::move(raw_socket)), tls_socket_(std::move(tls_socket)) {}
+                 const Network::TransportSocketOptionsConstSharedPtr&,
+                 std::optional<uint64_t> max_cleartext_read_bytes = std::nullopt)
+      : active_socket_(std::move(raw_socket)), tls_socket_(std::move(tls_socket)),
+        remaining_cleartext_bytes_(max_cleartext_read_bytes) {}
 
   void setTransportSocketCallbacks(Network::TransportSocketCallbacks& callbacks) override {
     callbacks_ = &callbacks;
@@ -40,9 +44,7 @@ public:
     return active_socket_->closeSocket(event, abort_reset);
   }
 
-  Network::IoResult doRead(Buffer::Instance& buffer) override {
-    return active_socket_->doRead(buffer);
-  }
+  Network::IoResult doRead(Buffer::Instance& buffer) override;
 
   Network::IoResult doWrite(Buffer::Instance& buffer, bool end_stream) override {
     return active_socket_->doWrite(buffer, end_stream);
@@ -102,6 +104,9 @@ private:
 
   CallbackProxy callbacks_{nullptr};
 
+  // Clear-text bytes still readable before a switch to TLS is required; absent when unbounded.
+  std::optional<uint64_t> remaining_cleartext_bytes_;
+
   bool using_tls_{false};
 };
 
@@ -136,9 +141,11 @@ public:
   ~StartTlsDownstreamSocketFactory() override = default;
 
   StartTlsDownstreamSocketFactory(Network::DownstreamTransportSocketFactoryPtr raw_socket_factory,
-                                  Network::DownstreamTransportSocketFactoryPtr tls_socket_factory)
+                                  Network::DownstreamTransportSocketFactoryPtr tls_socket_factory,
+                                  std::optional<uint64_t> max_cleartext_read_bytes = std::nullopt)
       : raw_socket_factory_(std::move(raw_socket_factory)),
-        tls_socket_factory_(std::move(tls_socket_factory)) {}
+        tls_socket_factory_(std::move(tls_socket_factory)),
+        max_cleartext_read_bytes_(max_cleartext_read_bytes) {}
 
   Network::TransportSocketPtr createDownstreamTransportSocket() const override;
   bool implementsSecureTransport() const override { return false; }
@@ -146,6 +153,7 @@ public:
 private:
   Network::DownstreamTransportSocketFactoryPtr raw_socket_factory_;
   Network::DownstreamTransportSocketFactoryPtr tls_socket_factory_;
+  const std::optional<uint64_t> max_cleartext_read_bytes_;
 };
 
 } // namespace StartTls

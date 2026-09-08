@@ -5,9 +5,12 @@
 #include "envoy/extensions/transport_sockets/starttls/v3/starttls.pb.validate.h"
 #include "envoy/network/connection.h"
 
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/network/io_socket_error_impl.h"
 #include "source/common/network/transport_socket_options_impl.h"
 #include "source/extensions/transport_sockets/starttls/starttls_socket.h"
 
+#include "test/mocks/network/io_handle.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/network/transport_socket.h"
 
@@ -17,6 +20,10 @@ namespace TransportSockets {
 namespace StartTls {
 
 using testing::_;
+using testing::Invoke;
+using testing::Optional;
+using testing::Return;
+using testing::ReturnRef;
 
 class StartTlsTransportSocketMock : public Network::MockTransportSocket {
 public:
@@ -187,6 +194,129 @@ TEST(StartTls, BasicFactoryTest) {
   std::vector<uint8_t> key;
   factory->hashKey(key, nullptr);
   EXPECT_EQ(0, key.size());
+}
+
+// Fixture for the downstream clear-text read boundary. The socket reads directly from the io
+// handle while the boundary is in force, so the raw socket only sees the other operations.
+class StartTlsCleartextBoundaryTest : public testing::Test {
+protected:
+  void initialize(std::optional<uint64_t> max_cleartext_read_bytes) {
+    ON_CALL(transport_callbacks_, ioHandle()).WillByDefault(ReturnRef(io_handle_));
+    socket_ = std::make_unique<StartTlsSocket>(
+        Network::TransportSocketPtr(raw_socket_), Network::TransportSocketPtr(tls_socket_),
+        std::make_shared<Network::TransportSocketOptionsImpl>(), max_cleartext_read_bytes);
+    socket_->setTransportSocketCallbacks(transport_callbacks_);
+  }
+
+  // Returns a read which appends `size` bytes and reports them as read.
+  static auto readOf(uint64_t size) {
+    return Invoke([size](Buffer::Instance& data, std::optional<uint64_t>) {
+      data.add(std::string(size, 'a'));
+      return Api::IoCallUint64Result(size, Api::IoError::none());
+    });
+  }
+
+  NiceMock<Network::MockIoHandle> io_handle_;
+  NiceMock<Network::MockTransportSocketCallbacks> transport_callbacks_;
+  NiceMock<Network::MockTransportSocket>* raw_socket_{new NiceMock<Network::MockTransportSocket>};
+  NiceMock<Network::MockTransportSocket>* tls_socket_{new NiceMock<Network::MockTransportSocket>};
+  std::unique_ptr<StartTlsSocket> socket_;
+  Buffer::OwnedImpl buffer_;
+};
+
+// Each read asks for the whole remaining budget, and the budget drops only by bytes actually read.
+// A partly used budget re-arms reading, since more clear-text may still be pending.
+TEST_F(StartTlsCleartextBoundaryTest, CapsReadsToRemainingBudget) {
+  initialize(36);
+  EXPECT_CALL(*raw_socket_, doRead(_)).Times(0);
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{36}))).WillOnce(readOf(20));
+  EXPECT_CALL(transport_callbacks_, setTransportSocketIsReadable());
+
+  const Network::IoResult result = socket_->doRead(buffer_);
+  EXPECT_EQ(Network::PostIoAction::KeepOpen, result.action_);
+  EXPECT_EQ(20, result.bytes_processed_);
+  EXPECT_FALSE(result.end_stream_read_);
+  EXPECT_EQ(20, buffer_.length());
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{16}))).WillOnce(readOf(16));
+  EXPECT_EQ(16, socket_->doRead(buffer_).bytes_processed_);
+}
+
+// The boundary is permanent: once exhausted no further clear-text bytes are read, and reading is
+// not re-armed, even though a network filter has drained the read buffer.
+TEST_F(StartTlsCleartextBoundaryTest, StopsReadingOnceBoundaryReached) {
+  initialize(36);
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{36}))).WillOnce(readOf(36));
+  EXPECT_CALL(transport_callbacks_, setTransportSocketIsReadable()).Times(0);
+  EXPECT_EQ(36, socket_->doRead(buffer_).bytes_processed_);
+  buffer_.drain(buffer_.length());
+
+  EXPECT_CALL(io_handle_, read(_, _)).Times(0);
+  const Network::IoResult result = socket_->doRead(buffer_);
+  EXPECT_EQ(Network::PostIoAction::KeepOpen, result.action_);
+  EXPECT_EQ(0, result.bytes_processed_);
+  EXPECT_FALSE(result.end_stream_read_);
+}
+
+TEST_F(StartTlsCleartextBoundaryTest, PropagatesEndStream) {
+  initialize(36);
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{36})))
+      .WillOnce(Return(testing::ByMove(Api::IoCallUint64Result(0, Api::IoError::none()))));
+  EXPECT_CALL(transport_callbacks_, setTransportSocketIsReadable()).Times(0);
+
+  const Network::IoResult result = socket_->doRead(buffer_);
+  EXPECT_EQ(Network::PostIoAction::KeepOpen, result.action_);
+  EXPECT_TRUE(result.end_stream_read_);
+}
+
+TEST_F(StartTlsCleartextBoundaryTest, KeepsConnectionOpenOnAgain) {
+  initialize(36);
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{36})))
+      .WillOnce(Return(testing::ByMove(
+          Api::IoCallUint64Result(0, Network::IoSocketError::getIoSocketEagainError()))));
+
+  const Network::IoResult result = socket_->doRead(buffer_);
+  EXPECT_EQ(Network::PostIoAction::KeepOpen, result.action_);
+  EXPECT_EQ(0, result.bytes_processed_);
+  EXPECT_FALSE(result.err_code_.has_value());
+}
+
+TEST_F(StartTlsCleartextBoundaryTest, ClosesOnReadError) {
+  initialize(36);
+
+  EXPECT_CALL(io_handle_, read(_, Optional(uint64_t{36})))
+      .WillOnce(Return(testing::ByMove(
+          Api::IoCallUint64Result(0, Network::IoSocketError::getIoSocketEbadfError()))));
+
+  const Network::IoResult result = socket_->doRead(buffer_);
+  EXPECT_EQ(Network::PostIoAction::Close, result.action_);
+  EXPECT_EQ(Api::IoError::IoErrorCode::BadFd, result.err_code_);
+}
+
+// Without the option the read path is the wrapped raw buffer socket, unchanged.
+TEST_F(StartTlsCleartextBoundaryTest, DelegatesToRawSocketWhenUnset) {
+  initialize(std::nullopt);
+
+  EXPECT_CALL(io_handle_, read(_, _)).Times(0);
+  EXPECT_CALL(*raw_socket_, doRead(_));
+  socket_->doRead(buffer_);
+}
+
+// Switching to TLS re-arms reading, so a ClientHello left in the kernel by the boundary is picked
+// up by the TLS socket.
+TEST_F(StartTlsCleartextBoundaryTest, SwitchToTlsRearmsReadAndTakesOverReads) {
+  initialize(36);
+
+  EXPECT_CALL(transport_callbacks_, setTransportSocketIsReadable());
+  socket_->startSecureTransport();
+
+  EXPECT_CALL(io_handle_, read(_, _)).Times(0);
+  EXPECT_CALL(*tls_socket_, doRead(_));
+  socket_->doRead(buffer_);
 }
 
 } // namespace StartTls

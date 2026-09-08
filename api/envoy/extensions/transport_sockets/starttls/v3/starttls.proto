@@ -5,6 +5,7 @@ package envoy.extensions.transport_sockets.starttls.v3;
 import "envoy/extensions/transport_sockets/raw_buffer/v3/raw_buffer.proto";
 import "envoy/extensions/transport_sockets/tls/v3/tls.proto";
 
+import "google/protobuf/wrappers.proto";
 import "udpa/annotations/status.proto";
 import "validate/validate.proto";
 
@@ -36,6 +37,20 @@ message StartTlsConfig {
   // Configuration for a downstream TLS socket.
   transport_sockets.tls.v3.DownstreamTlsContext tls_socket_config = 2
       [(validate.rules).message = {required: true}];
+
+  // Total number of clear-text bytes which may be read from the connection before a switch to TLS.
+  // This is a permanent boundary for the connection, not a per-read or buffer size limit: once the
+  // budget is exhausted no further clear-text bytes are read, and the connection makes no further
+  // read progress until a network filter calls ``startSecureTransport`` or closes the connection.
+  //
+  // Setting this stops the clear-text socket from reading past the end of the in-band negotiation
+  // when a peer coalesces the final clear-text message and the TLS ``ClientHello`` into a single
+  // packet, which would otherwise leave the ``ClientHello`` stranded in the clear-text read buffer.
+  // The value should therefore be the largest clear-text negotiation exchange the protocol allows.
+  //
+  // If unset, clear-text reads are unlimited.
+  google.protobuf.UInt64Value max_cleartext_read_buffer_size = 3
+      [(validate.rules).uint64 = {gt: 0}];
 }
 
 // Configuration for an upstream StartTls transport socket.

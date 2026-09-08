@@ -20,8 +20,11 @@ envoy_extension_cc_test(
     extension_names = ["envoy.transport_sockets.starttls"],
     rbe_pool = "linux_x64_small",
     deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/network:io_socket_error_lib",
         "//source/common/network:transport_socket_options_lib",
         "//source/extensions/transport_sockets/starttls:config",
+        "//test/mocks/network:io_handle_mocks",
         "//test/mocks/network:network_mocks",
         "@envoy_api//envoy/extensions/transport_sockets/starttls/v3:pkg_cc_proto",
     ],

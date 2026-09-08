@@ -26,8 +26,14 @@ DownstreamStartTlsSocketFactory::createTransportSocketFactory(
       outer_config.tls_socket_config(), context, server_names);
   RETURN_IF_NOT_OK_REF(factory_or_error.status());
 
+  const std::optional<uint64_t> max_cleartext_read_bytes =
+      outer_config.has_max_cleartext_read_buffer_size()
+          ? std::make_optional(outer_config.max_cleartext_read_buffer_size().value())
+          : std::nullopt;
+
   return std::make_unique<StartTlsDownstreamSocketFactory>(std::move(raw_or_error.value()),
-                                                           std::move(factory_or_error.value()));
+                                                           std::move(factory_or_error.value()),
+                                                           max_cleartext_read_bytes);
 }
 
 absl::StatusOr<Network::UpstreamTransportSocketFactoryPtr>
