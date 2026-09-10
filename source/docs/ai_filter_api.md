@@ -8,6 +8,10 @@ This describes a proposed replacement for the `AiFilter` interface in
 first filter written against them (`envoy.filters.ai.request_info`) are in flight. This proposal
 covers both, and says which side each change lands on.
 
+It is deliverable in two independent stages. The first is an adapter base class that removes the
+ceremony from filter code without touching `AiFilter` or `FilterManager`; the second replaces the
+producer/consumer chain with a sequential loop. See [An incremental path](#an-incremental-path).
+
 ## Goal
 
 Almost every AI filter that will be written against this chain does one of four things:
@@ -224,18 +228,18 @@ public:
 // Base for filters that never await; they implement a plain function instead.
 class SyncAiFilter : public AiFilter {
 public:
-  virtual absl::StatusOr<DecodeAction> decodeSync(AiRequest& request) PURE;
+  virtual absl::StatusOr<DecodeAction> onRequest(AiRequest& request) PURE;
 
 private:
   Coroutine::Task<absl::StatusOr<DecodeAction>> decode(AiRequest& request) final {
-    co_return decodeSync(request);
+    co_return onRequest(request);
   }
 };
 ```
 
 An adapter, rather than two interfaces the manager selects between, because it keeps exactly one
 call site and no branch in the manager while giving authors two minimal shapes to choose from. The
-choice is compiler-enforced: `decodeSync` is pure virtual and `decode` is `final`, so a
+choice is compiler-enforced: `onRequest` is pure virtual and `decode` is `final`, so a
 `SyncAiFilter` cannot be half-implemented.
 
 A `SyncAiFilter` still allocates one coroutine frame per call. If that ever shows up in a profile,
@@ -272,7 +276,7 @@ class ModelRewriteFilter : public SyncAiFilter {
 public:
   explicit ModelRewriteFilter(std::string model) : model_(std::move(model)) {}
 
-  absl::StatusOr<DecodeAction> decodeSync(AiRequest& request) override {
+  absl::StatusOr<DecodeAction> onRequest(AiRequest& request) override {
     request.json()["model"] = model_;
     return DecodeAction::continueChain();
   }
@@ -298,7 +302,7 @@ Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
 `request_info` becomes:
 
 ```cpp
-absl::StatusOr<DecodeAction> RequestInfoFilter::decodeSync(AiRequest& request) {
+absl::StatusOr<DecodeAction> RequestInfoFilter::onRequest(AiRequest& request) {
   publish(request);
   return DecodeAction::continueChain();
 }
@@ -312,7 +316,7 @@ with `publish()` extracting against `request.protocol()` rather than
 ```cpp
 class OpenAiToAnthropicFilter : public SyncAiFilter {
 public:
-  absl::StatusOr<DecodeAction> decodeSync(AiRequest& request) override {
+  absl::StatusOr<DecodeAction> onRequest(AiRequest& request) override {
     if (request.protocol() != ApiProtocol::OpenAiChatCompletions) {
       return DecodeAction::continueChain();
     }
@@ -370,7 +374,7 @@ the reply is the return value.
 ### Skipping the filter
 
 ```cpp
-absl::StatusOr<DecodeAction> decodeSync(AiRequest& request) override {
+absl::StatusOr<DecodeAction> onRequest(AiRequest& request) override {
   if (request.protocol() != ApiProtocol::OpenAiChatCompletions) {
     return DecodeAction::continueChain();
   }
@@ -439,18 +443,138 @@ Measured on `request_info`, which has one line of real work.
 | | Parameters | `std::move` | `co_await` / `co_return` | `ASSIGN_OR_CO_RETURN` |
 | --- | --- | --- | --- | --- |
 | Today | 3, one unused | 3 | 3 | 1 |
+| Adapter only, manager unchanged | 1 | 0 | 0 | 0 |
 | Proposed, async filter | 1 | 0 | 1 | 0 |
 | Proposed, sync filter | 1 | 0 | 0 | 0 |
 
-## Migration
+## An incremental path
 
-* `ai_filter.h`: `DecodeAction`, `AiFilter`, `SyncAiFilter`; delete `AiRequestReceiver`,
-  `AiRequestPropagator` and `LocalReplier`.
-* `ai_request.h`: `json()`, `protocol()`, `transcode()`, `transcoded()`.
+The ergonomics and the manager rewrite are separable. `DecodeAction` plus an adapter base class
+delivers the entire ceremony reduction without touching `AiFilter` or `FilterManager` at all, which
+means it can land and be reviewed on its own.
+
+### The adapter
+
+This is the same `SyncAiFilter` as above, with its private `decode()` written against today's
+three-callable interface instead of the proposed one:
+
+```cpp
+// Base for filters with the receive-act-propagate shape. The adapter owns the protocol; the
+// filter only decides.
+class SyncAiFilter : public AiFilter {
+public:
+  virtual absl::StatusOr<DecodeAction> onRequest(AiRequest& request) PURE;
+
+private:
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier reply_locally) final {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
+    ASSIGN_OR_CO_RETURN(DecodeAction action, onRequest(*request));
+    if (action.isLocalReply()) {
+      std::move(reply_locally)(action.code(), std::string(action.details()));
+      co_return absl::OkStatus();
+    }
+    co_return co_await std::move(propagate_request)(std::move(request));
+  }
+};
+```
+
+`AwaitingAiFilter` is the same body with `onRequest` returning
+`Coroutine::Task<absl::StatusOr<DecodeAction>>` and one `co_await` added.
+
+Every `std::move`, `co_await`, `co_return` and `ASSIGN_OR_CO_RETURN` the chain protocol requires now
+exists once, in one file, reviewed once. A filter is a plain function again:
+
+```cpp
+absl::StatusOr<DecodeAction> RequestInfoFilter::onRequest(AiRequest& request) {
+  publish(request.json());
+  return DecodeAction::continueChain();
+}
+```
+
+The adapter is correct against the manager as it stands. `DetachedHandle::cancel()` fires the
+pending leaf's cancel callback, and a running frame has no pending leaf, so invoking
+`reply_locally` and then returning does not destroy the frame underneath itself. `triggerLocalReply`
+sets `terminated_` before `onFilterCompletion` runs, so a filter that replies without propagating is
+not misread as the "consumed the request but did not propagate" error. `TestLocalReplyFilter` and
+`TestImmediateLocalReplyFilter` already cover that path.
+
+### The names match on purpose
+
+`SyncAiFilter::onRequest(AiRequest&) -> absl::StatusOr<DecodeAction>` is deliberately identical to
+the interface proposed above. Under the adapter, `decode()` runs the receive/propagate protocol;
+after the manager rewrite it collapses to `co_return onRequest(request);`. Synchronous filters and
+the tests written against them do not change at all.
+
+Awaiting filters are not quite free: at stage 2 they drop `AwaitingAiFilter` and implement
+`AiFilter::decode(AiRequest&)` directly, which is a base-class and method-name change on an
+otherwise identical body. There are no awaiting filters yet, so the cost of that is currently zero.
+
+So this is a stepping stone, not a fork in the road. Stage 1 is not thrown away by stage 2, and
+choosing stage 1 does not commit to stage 2.
+
+### What the adapter does not fix
+
+Worth stating plainly, because the adapter is tempting enough to stop at:
+
+* **Cost is unchanged.** Still `N + 1` `AsyncQueue`s, four allocations per stage, `N + 1` coroutine
+  frames, and three `absl::AnyInvocable`s per filter. The adapter hides the plumbing; it does not
+  remove it.
+* **Problem 4 gets quieter, not fixed.** `propagate_request`'s accidental semantics move inside the
+  adapter, where nobody reads them. That is arguably worse than leaving them in view: surprising
+  behavior stops being in front of the person who has to reason about it.
+* **Transcoding stays blocked.** `AiRequest` carries no protocol regardless of which interface sits
+  on top of it, so a transcoder still cannot tell downstream filters that the dialect changed.
+
+The adapter buys ergonomics. The manager rewrite buys cost and correctness. They are worth having
+in that order, not instead of each other.
+
+### Why not a macro
+
+Packaging the same three lines as `AI_CO_RETURN_PROPAGATE(propagate_request, request)` would follow
+the existing `ASSIGN_OR_CO_RETURN` naming convention, so it is not unthinkable. But it hides a
+`co_return` behind a name, it cannot remove the unused third parameter from the signature, and it
+cannot enforce that a filter propagates exactly once. The adapter gets all three for the same
+effort, and a base class is the more conventional tool for "this protocol is boilerplate".
+
+## Delivery
+
+### Stage 1: `DecodeAction` and the adapter
+
+* `ai_filter.h`: add `DecodeAction`, `SyncAiFilter`, `AwaitingAiFilter`. `AiFilter`,
+  `AiRequestReceiver`, `AiRequestPropagator` and `LocalReplier` are untouched.
+* `ai_request.h`: add `json()`.
+* Tests: adapter coverage for continue, local reply and error. The existing twelve fakes stay as
+  they are; they exercise the raw `AiFilter` contract, which still exists.
+
+Nothing in this stage presumes the second.
+
+### Stage 2: the manager
+
+* `ai_filter.h`: `AiFilter::decode(AiRequest&)`; `SyncAiFilter::decode` collapses to
+  `co_return onRequest(request);`; delete `AiRequestReceiver`, `AiRequestPropagator` and
+  `LocalReplier`.
+* `ai_request.h`: `protocol()`, `transcode()`, `transcoded()`.
 * `filter_manager.cc`: replace the eager launch, the handoff queues and the completion bookkeeping
   with `runChain()`. Net reduction of roughly 120 lines.
-* Test fakes: twelve in `filter_manager_test.cc`.
+* Test fakes: twelve in `filter_manager_test.cc`. Filters already written against `SyncAiFilter`
+  need no change.
 
 On the in-flight side: drop `request_protocol` from `AiFilterContext`, and land `request_info` as a
 `SyncAiFilter` extracting against `request.protocol()`. No proto or configuration change either
 way.
+
+### Worth doing regardless
+
+* `AiRequest::json()`, which deletes `->request_index().json()` from every filter and every test.
+  One accessor, no interface change, useful whichever way the rest goes.
+* A test filter factory. The twelve fakes in `filter_manager_test.cc` are the same shape declared
+  twelve times:
+
+  ```cpp
+  AiFilterPtr makeAiFilter(absl::AnyInvocable<absl::StatusOr<DecodeAction>(AiRequest&)> fn);
+  ```
+
+  Each collapses to a lambda, and the test file stops being a migration cost every time the
+  interface moves.
