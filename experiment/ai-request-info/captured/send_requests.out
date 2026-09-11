@@ -1,0 +1,16 @@
+1 openai chat completions          POST /v1/chat/completions                                       -> 200
+2 openai chat completions (sse)    POST /v1/chat/completions                                       -> 200
+3 openai responses                 POST /v1/responses                                              -> 200
+4 anthropic messages               POST /v1/messages                                               -> 200
+5 gemini generateContent           POST /v1beta/models/gemini-2.5-flash:generateContent            -> 200
+6 gemini streamGenerateContent     POST /v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse -> 200
+7 anthropic, unusable values       POST /v1/messages                                               -> 200
+8 undeclared route                 POST /v1/embeddings                                             -> 200
+9 malformed json                   POST /v1/chat/completions                                       -> 400
+
+# counters
+ai_protocol_manager.request_info.partial: 1
+ai_protocol_manager.request_info.published: 7
+ai_protocol_manager.request_parse_error: 1
+ai_protocol_manager.request_parsed: 7
+ai_protocol_manager.token_usage_found: 7
