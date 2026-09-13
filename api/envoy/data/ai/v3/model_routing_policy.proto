@@ -23,26 +23,29 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // :ref:`model resolver filter <config_http_filters_model_resolver>` turns it into a plan that the
 // request's upstream attempts follow.
 message ModelRoutingPolicy {
-  // Failure classes after which a request may move on to its next target.
+  // Failure classes after which a request may move on to its next target. Each maps to a router
+  // :ref:`retry condition <config_http_filters_router_x-envoy-retry-on>`.
   enum FallbackCondition {
     FALLBACK_CONDITION_UNSPECIFIED = 0;
 
-    // The connection or TLS handshake to the target failed.
+    // ``connect-failure``: the connection or TLS handshake to the target failed, or timed out.
     CONNECT_FAILURE = 1;
 
-    // The target reset the stream.
+    // ``reset``: the target reset the stream or the connection failed, including a per-try
+    // timeout.
     RESET = 2;
 
-    // The target responded with 429.
+    // ``retriable-status-codes`` with 429.
     RATE_LIMITED = 3;
 
-    // The target responded with a 5xx status.
+    // ``5xx``: a 5xx response, a reset, a connection failure or a per-try timeout.
     SERVER_ERROR = 4;
 
-    // The target responded with 503 or 529.
+    // ``retriable-status-codes`` with 503 and 529.
     OVERLOADED = 5;
 
-    // The target responded with 502, 503 or 504, or the attempt timed out.
+    // ``gateway-error``: a 502, 503 or 504 response, a reset, a connection failure or a per-try
+    // timeout.
     GATEWAY_ERROR = 6;
   }
 
@@ -56,10 +59,11 @@ message ModelRoutingPolicy {
 
   // Conditions that allow moving on to the next target. When empty, the resolver's defaults apply.
   repeated FallbackCondition fallback_on = 2
-      [(validate.rules).repeated = {items {enum {defined_only: true}}}];
+      [(validate.rules).repeated = {items {enum {defined_only: true not_in: 0}}}];
 
-  // Time allowed for each attempt until response headers arrive. The resolver caps it.
-  google.protobuf.Duration per_try_timeout = 3;
+  // Time allowed for each attempt until response headers arrive. The resolver caps it, and ignores
+  // it unless its configuration sets an upper bound.
+  google.protobuf.Duration per_try_timeout = 3 [(validate.rules).duration = {gt {}}];
 
   // Opaque identifier of the decision, exposed to access logs.
   string decision_id = 4 [(validate.rules).string = {max_len: 128}];

@@ -5,11 +5,12 @@
 #include "envoy/http/codes.h"
 
 #include "source/common/common/macros.h"
+#include "source/common/common/utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/secret/secret_provider_impl.h"
-#include "source/extensions/common/dynamic_forward_proxy/dns_cache_manager_impl.h"
 
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 
@@ -110,6 +111,24 @@ void addRetryCondition(ModelRoutingPolicy::FallbackCondition condition,
   }
 }
 
+// The upstream AI protocol manager can only rewrite the model of an uncompressed JSON body.
+bool rewritableBody(const Envoy::Http::RequestHeaderMap& headers) {
+  const absl::string_view content_type =
+      StringUtil::trim(StringUtil::cropRight(headers.getContentTypeValue(), ";"));
+  if (!absl::EqualsIgnoreCase(content_type, "application/json") &&
+      !absl::EndsWithIgnoreCase(content_type, "+json")) {
+    return false;
+  }
+  const auto encodings = headers.get(Envoy::Http::CustomHeaders::get().ContentEncoding);
+  for (size_t i = 0; i < encodings.size(); ++i) {
+    if (!absl::EqualsIgnoreCase(StringUtil::trim(encodings[i]->value().getStringView()),
+                                "identity")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class NoopLoadDnsCacheEntryCallbacks : public DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks {
 public:
   void onLoadDnsCacheComplete(const DfpCommon::DnsHostInfoSharedPtr&) override {}
@@ -128,7 +147,7 @@ FilterConfig::FilterConfig(const ModelResolverProto& proto, const std::string& s
                             : proto.policy_metadata_namespace()),
       client_api_protocol_(proto.client_api_protocol()),
       max_retries_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto, max_retries, DefaultMaxRetries)),
-      reject_without_policy_(proto.reject_without_policy()),
+      continue_without_policy_(proto.continue_without_policy()),
       prewarm_fallback_targets_(proto.prewarm_fallback_targets()),
       stats_{ALL_MODEL_RESOLVER_STATS(
           POOL_COUNTER_PREFIX(scope, absl::StrCat(stats_prefix, "model_resolver.")))} {}
@@ -136,7 +155,8 @@ FilterConfig::FilterConfig(const ModelResolverProto& proto, const std::string& s
 absl::StatusOr<FilterConfigConstSharedPtr>
 FilterConfig::create(const ModelResolverProto& proto, const std::string& stats_prefix,
                      Stats::Scope& scope, Server::Configuration::ServerFactoryContext& context,
-                     Init::Manager& init_manager) {
+                     Init::Manager& init_manager,
+                     DfpCommon::DnsCacheManagerFactory& dns_cache_manager_factory) {
   std::shared_ptr<FilterConfig> config(new FilterConfig(proto, stats_prefix, scope));
 
   for (const int condition : proto.default_fallback_on()) {
@@ -160,6 +180,11 @@ FilterConfig::create(const ModelResolverProto& proto, const std::string& stats_p
   std::vector<AiCommon::ModelTarget> targets;
   targets.reserve(proto.targets().size());
   for (const auto& [id, target_proto] : proto.targets()) {
+    if (!DfpCommon::DynamicHostCandidates::validHost(target_proto.host())) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("model_resolver: target '", id,
+                       "' host must be a DNS name or an IP address without a port"));
+    }
     AiCommon::ModelTarget target;
     target.id = id;
     target.host = target_proto.host();
@@ -180,7 +205,7 @@ FilterConfig::create(const ModelResolverProto& proto, const std::string& stats_p
   config->registry_ = std::make_shared<const AiCommon::ModelTargetRegistry>(std::move(targets));
 
   if (proto.has_dns_cache_config()) {
-    config->dns_cache_manager_ = DfpCommon::DnsCacheManagerFactoryImpl(context).get();
+    config->dns_cache_manager_ = dns_cache_manager_factory.get();
     auto cache = config->dns_cache_manager_->getCache(proto.dns_cache_config());
     RETURN_IF_NOT_OK_REF(cache.status());
     config->dns_cache_ = std::move(cache.value());
@@ -189,11 +214,18 @@ FilterConfig::create(const ModelResolverProto& proto, const std::string& stats_p
 }
 
 Envoy::Http::FilterHeadersStatus
-ModelResolverFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool) {
+ModelResolverFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool end_stream) {
   ModelRoutingPolicy policy;
-  const PolicyStatus status = readPolicy(policy);
-  if (status != PolicyStatus::Ok) {
-    return onUnusablePolicy(status);
+  switch (readPolicy(policy)) {
+  case PolicyStatus::Missing:
+    return onUnusablePolicy(config_->stats().no_policy_, "model_resolver_no_policy");
+  case PolicyStatus::Invalid:
+    return onUnusablePolicy(config_->stats().invalid_policy_, "model_resolver_invalid_policy");
+  case PolicyStatus::Ok:
+    break;
+  }
+  if (!end_stream && !rewritableBody(headers)) {
+    return onUnusablePolicy(config_->stats().unsupported_body_, "model_resolver_unsupported_body");
   }
 
   std::vector<const AiCommon::ModelTarget*> targets;
@@ -211,12 +243,11 @@ ModelResolverFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool)
     targets.push_back(target);
   }
   if (targets.empty()) {
-    return onUnusablePolicy(PolicyStatus::Invalid);
+    return onUnusablePolicy(config_->stats().invalid_policy_, "model_resolver_invalid_policy");
   }
 
   const size_t plan_size = targets.size();
   auto plan = std::make_shared<AiCommon::ModelRoutePlan>(config_->registry(), std::move(targets),
-                                                         std::string(headers.getPathValue()),
                                                          policy.decision_id());
   StreamInfo::FilterState& filter_state = *decoder_callbacks_->streamInfo().filterState();
   filter_state.setData(AiCommon::ModelRoutePlan::key(), plan,
@@ -241,9 +272,14 @@ ModelResolverFilter::readPolicy(ModelRoutingPolicy& policy) const {
   } else if (const auto untyped = metadata.filter_metadata().find(config_->policyNamespace());
              untyped != metadata.filter_metadata().end()) {
     const auto json = MessageUtil::getJsonStringFromMessage(untyped->second);
+    if (!json.ok()) {
+      return PolicyStatus::Invalid;
+    }
     bool has_unknown_field = false;
-    if (!json.ok() ||
-        !MessageUtil::loadFromJsonNoThrow(json.value(), policy, has_unknown_field).ok()) {
+    const absl::Status status =
+        MessageUtil::loadFromJsonNoThrow(json.value(), policy, has_unknown_field);
+    // Unknown fields are accepted, as they are in typed metadata.
+    if (!status.ok() && !has_unknown_field) {
       return PolicyStatus::Invalid;
     }
   } else {
@@ -252,15 +288,14 @@ ModelResolverFilter::readPolicy(ModelRoutingPolicy& policy) const {
   return validPolicy(policy) ? PolicyStatus::Ok : PolicyStatus::Invalid;
 }
 
-Envoy::Http::FilterHeadersStatus ModelResolverFilter::onUnusablePolicy(PolicyStatus status) {
-  const bool missing = status == PolicyStatus::Missing;
-  (missing ? config_->stats().no_policy_ : config_->stats().invalid_policy_).inc();
-  if (!config_->rejectWithoutPolicy()) {
+Envoy::Http::FilterHeadersStatus ModelResolverFilter::onUnusablePolicy(Stats::Counter& counter,
+                                                                       absl::string_view details) {
+  counter.inc();
+  if (config_->continueWithoutPolicy()) {
     return Envoy::Http::FilterHeadersStatus::Continue;
   }
-  decoder_callbacks_->sendLocalReply(
-      Envoy::Http::Code::ServiceUnavailable, "", nullptr, std::nullopt,
-      missing ? "model_resolver_no_policy" : "model_resolver_invalid_policy");
+  decoder_callbacks_->sendLocalReply(Envoy::Http::Code::ServiceUnavailable, "", nullptr,
+                                     std::nullopt, details);
   return Envoy::Http::FilterHeadersStatus::StopIteration;
 }
 
@@ -274,14 +309,20 @@ void ModelResolverFilter::setRetryHeaders(Envoy::Http::RequestHeaderMap& headers
                                           const ModelRoutingPolicy& policy,
                                           size_t plan_size) const {
   const auto& header_names = Envoy::Http::Headers::get();
+  // Attempts share one request header map, so overlapping hedged attempts would overwrite each
+  // other's target and credential.
+  headers.setCopy(header_names.EnvoyHedgeOnPerTryTimeout, "false");
   if (policy.has_per_try_timeout() && config_->maxPerTryTimeout().has_value()) {
     if (auto timeout = DurationUtil::durationToMillisecondsNoThrow(policy.per_try_timeout());
-        timeout.ok()) {
+        timeout.ok() && timeout.value() > 0) {
       const uint64_t capped =
           std::min<uint64_t>(timeout.value(), config_->maxPerTryTimeout()->count());
       headers.setCopy(header_names.EnvoyUpstreamRequestPerTryTimeoutMs, std::to_string(capped));
     }
   }
+  // Also set for a single target, since a route retry would find no candidate left.
+  headers.setCopy(header_names.EnvoyMaxRetries,
+                  std::to_string(std::min<uint64_t>(plan_size - 1, config_->maxRetries())));
   if (plan_size < 2) {
     return;
   }
@@ -305,8 +346,6 @@ void ModelResolverFilter::setRetryHeaders(Envoy::Http::RequestHeaderMap& headers
   if (!status_codes.empty()) {
     headers.setCopy(header_names.EnvoyRetriableStatusCodes, absl::StrJoin(status_codes, ","));
   }
-  headers.setCopy(header_names.EnvoyMaxRetries,
-                  std::to_string(std::min<uint64_t>(plan_size - 1, config_->maxRetries())));
 }
 
 void ModelResolverFilter::prewarm(const AiCommon::ModelRoutePlan& plan) const {

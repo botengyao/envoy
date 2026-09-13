@@ -4,6 +4,7 @@
 #include "envoy/extensions/clusters/dynamic_forward_proxy/v3/cluster.pb.h"
 #include "envoy/extensions/clusters/dynamic_forward_proxy/v3/cluster.pb.validate.h"
 
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/common/singleton/manager_impl.h"
 #include "source/common/upstream/cluster_factory_impl.h"
@@ -1081,6 +1082,112 @@ TEST(ObjectFactory, DynamicPort) {
   ASSERT_NE(nullptr, object);
   EXPECT_EQ(port, object->serializeAsString());
   ASSERT_EQ(nullptr, factory->createFromBytes("blah"));
+}
+
+TEST(ObjectFactory, DynamicHostCandidates) {
+  const std::string name = "envoy.upstream.dynamic_host_candidates";
+  auto* factory =
+      Registry::FactoryRegistry<StreamInfo::FilterState::ObjectFactory>::getFactory(name);
+  ASSERT_NE(nullptr, factory);
+  EXPECT_EQ(name, factory->name());
+  const std::string candidates = "a.example.com,b.example.com:8443";
+  auto object = factory->createFromBytes(candidates);
+  ASSERT_NE(nullptr, object);
+  EXPECT_EQ(candidates, object->serializeAsString());
+  EXPECT_EQ(nullptr, factory->createFromBytes("a.example.com,,b.example.com"));
+}
+
+TEST_F(ClusterTest, HostCandidatesKeepCandidateOnDnsCacheOverflow) {
+  initialize(default_yaml_config_, false);
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_()).WillOnce(Return(nullptr));
+
+  const auto response = lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1));
+  EXPECT_EQ(nullptr, response.host);
+  EXPECT_EQ("dns_cache_pending_requests_overflow", response.details);
+  EXPECT_EQ(0U, hostCandidates().selectionForAttempt(1));
+}
+
+TEST_F(ClusterTest, HostCandidatesIgnoredInSubClusterMode) {
+  initialize(sub_cluster_yaml_config_, false);
+  downstream_headers_.setHost("host1:80");
+  EXPECT_EQ(nullptr, lb_->chooseHost(setHostCandidatesAndReturnContext("host2", 1)).host);
+  EXPECT_EQ(std::nullopt, hostCandidates().selectionForAttempt(1));
+}
+
+TEST_F(ClusterTest, TlsIdentityFromHost) {
+  const std::string yaml_config = R"EOF(
+name: name
+connect_timeout: 0.25s
+cluster_type:
+  name: dynamic_forward_proxy
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+    tls_identity_from_host: true
+    dns_cache_config:
+      name: foo
+      dns_lookup_family: AUTO
+)EOF";
+  initialize(yaml_config, false);
+  makeTestHost("api.example.com:443", "1.2.3.4");
+  makeTestHost("10.0.0.1:443", "10.0.0.1");
+  makeTestHost("[::1]:443", "::1");
+  EXPECT_CALL(*this, onMemberUpdateCb(SizeIs(1), SizeIs(0))).Times(3);
+  for (const auto& host : {"api.example.com:443", "10.0.0.1:443", "[::1]:443"}) {
+    EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate(host, host_map_[host]));
+  }
+
+  absl::flat_hash_map<std::string, const TlsIdentityLogicalHost*> hosts;
+  for (const auto& host : cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()) {
+    hosts[host->hostname()] = dynamic_cast<const TlsIdentityLogicalHost*>(host.get());
+  }
+  ASSERT_NE(nullptr, hosts["api.example.com:443"]);
+  EXPECT_EQ("api.example.com", hosts["api.example.com:443"]->serverName().value());
+  EXPECT_EQ(std::vector<std::string>{"api.example.com"},
+            hosts["api.example.com:443"]->verifySanList());
+  // IP literals are verified against the address and send no SNI.
+  ASSERT_NE(nullptr, hosts["10.0.0.1:443"]);
+  EXPECT_FALSE(hosts["10.0.0.1:443"]->serverName().has_value());
+  EXPECT_EQ(std::vector<std::string>{"10.0.0.1"}, hosts["10.0.0.1:443"]->verifySanList());
+  ASSERT_NE(nullptr, hosts["[::1]:443"]);
+  EXPECT_FALSE(hosts["[::1]:443"]->serverName().has_value());
+  EXPECT_EQ(std::vector<std::string>{"::1"}, hosts["[::1]:443"]->verifySanList());
+}
+
+TEST(HostTlsIdentityTransportSocketOptionsTest, ReplacesOnlyTheTlsIdentity) {
+  auto inner = std::make_shared<Network::TransportSocketOptionsImpl>(
+      "request.example.com", std::vector<std::string>{"request.example.com"},
+      std::vector<std::string>{"h2"}, std::vector<std::string>{"http/1.1"});
+  HostTlsIdentityTransportSocketOptions options("api.example.com", {"api.example.com"}, inner);
+  EXPECT_EQ("api.example.com", options.serverNameOverride().value());
+  EXPECT_EQ(std::vector<std::string>{"api.example.com"},
+            options.verifySubjectAltNameListOverride());
+  EXPECT_EQ(std::vector<std::string>{"h2"}, options.applicationProtocolListOverride());
+  EXPECT_EQ(std::vector<std::string>{"http/1.1"}, options.applicationProtocolFallback());
+  EXPECT_FALSE(options.proxyProtocolOptions().has_value());
+  EXPECT_FALSE(options.http11ProxyInfo().has_value());
+  EXPECT_TRUE(options.downstreamSharedFilterStateObjects().empty());
+
+  HostTlsIdentityTransportSocketOptions without_request_options(std::nullopt, {"10.0.0.1"},
+                                                                nullptr);
+  EXPECT_FALSE(without_request_options.serverNameOverride().has_value());
+  EXPECT_TRUE(without_request_options.applicationProtocolListOverride().empty());
+}
+
+TEST_F(ClusterFactoryTest, TlsIdentityFromHostWithSubClusters) {
+  const std::string yaml_config = R"EOF(
+name: name
+connect_timeout: 0.25s
+cluster_type:
+  name: dynamic_forward_proxy
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+    tls_identity_from_host: true
+    sub_clusters_config:
+      max_sub_clusters: 1024
+)EOF";
+
+  EXPECT_THROW_WITH_MESSAGE(createCluster(yaml_config), EnvoyException,
+                            "tls_identity_from_host is not supported with sub_clusters_config");
 }
 
 } // namespace DynamicForwardProxy

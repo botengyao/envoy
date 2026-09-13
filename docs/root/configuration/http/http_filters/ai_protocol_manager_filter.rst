@@ -415,6 +415,16 @@ instance, but only the attempt whose response the router selects streams to a
 clean end of stream through its encoder chain — and non-2xx attempts never
 engage extraction — so only the winning attempt publishes metadata.
 
+Model route plans: when ``request_handling`` is set and the request carries a
+plan from the :ref:`model resolver <config_http_filters_model_resolver>`, the
+upstream installation rewrites each attempt for the plan target the attempt
+connected to. It sets ``:path`` and ``:authority``, removes the credential
+headers of every target, adds the target's credential, and writes the target
+model to the JSON body's ``model`` field. The body of such a request is parsed
+strictly. The credential headers are removed again when the response starts.
+The attempt's target is recorded in the ``envoy.ai.model_attempt`` filter state
+of the upstream request, for router upstream logs.
+
 Statistics
 ----------
 
@@ -444,3 +454,4 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   sse_event_too_large, Counter, Pending or complete SSE event data exceeded ``max_sse_event_size``; that entire event was skipped.
   unsupported_content_encoding, Counter, The response carried a non-identity ``content-encoding``; extraction skipped.
   usage_trailers_synthesized, Counter, Empty response trailers were synthesized at end of stream to carry token usage to a downstream consumer.
+  model_target_applied, Counter, An upstream attempt was rewritten for its model route plan target.

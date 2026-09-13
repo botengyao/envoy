@@ -54,9 +54,10 @@ message ModelResolver {
   // Upper bound on a policy's ``per_try_timeout``. A policy's value is ignored when this is unset.
   google.protobuf.Duration max_per_try_timeout = 6 [(validate.rules).duration = {gt {}}];
 
-  // If true, a request without a usable policy gets a 503 response. Otherwise it continues
-  // without a plan.
-  bool reject_without_policy = 7;
+  // If true, a request without a usable policy, or with a body other than uncompressed JSON,
+  // continues without a plan. By default it gets a 503 response, because on a dynamic forward proxy
+  // route a request without a plan goes to the host the client names.
+  bool continue_without_policy = 7;
 
   // The DNS cache of the dynamic forward proxy cluster that serves the targets. When set with
   // ``prewarm_fallback_targets``, the hosts of fallback targets are resolved in the background
@@ -65,14 +66,15 @@ message ModelResolver {
   common.dynamic_forward_proxy.v3.DnsCacheConfig dns_cache_config = 8;
 
   // Number of fallback targets, after the first plan entry, whose hosts are resolved in the
-  // background. Targets without a port are resolved on port 443.
+  // background. Targets without a port are resolved on port 443, which matches the default port of
+  // a TLS cluster only.
   uint32 prewarm_fallback_targets = 9 [(validate.rules).uint32 = {lte: 16}];
 }
 
 // [#next-free-field: 7]
 message ModelTarget {
-  // DNS name or IP address of the target, used by the dynamic forward proxy cluster and as the
-  // request authority.
+  // DNS name, IPv4 address or bracketed IPv6 address of the target, without a port. It is used by
+  // the dynamic forward proxy cluster and as the request authority.
   string host = 1
       [(validate.rules).string = {min_len: 1 well_known_regex: HTTP_HEADER_VALUE strict: false}];
 

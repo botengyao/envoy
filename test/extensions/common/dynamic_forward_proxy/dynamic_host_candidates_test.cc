@@ -29,6 +29,21 @@ TEST(DynamicHostCandidatesTest, RejectsMalformedLists) {
   EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("a.example.com,,b.example.com"));
   EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("a.example.com:0"));
   EXPECT_EQ(nullptr, DynamicHostCandidates::fromString(":443"));
+  EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("a.example.com:abc"));
+  EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("2001:db8::1"));
+  EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("fe80::abcd"));
+  EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("::1"));
+  EXPECT_EQ(nullptr, DynamicHostCandidates::fromString("[::1"));
+}
+
+TEST(DynamicHostCandidatesTest, ValidHosts) {
+  EXPECT_TRUE(DynamicHostCandidates::validHost("api.example.com"));
+  EXPECT_TRUE(DynamicHostCandidates::validHost("10.0.0.1"));
+  EXPECT_TRUE(DynamicHostCandidates::validHost("[2001:db8::1]"));
+  EXPECT_FALSE(DynamicHostCandidates::validHost(""));
+  EXPECT_FALSE(DynamicHostCandidates::validHost("api.example.com:443"));
+  EXPECT_FALSE(DynamicHostCandidates::validHost("2001:db8::1"));
+  EXPECT_FALSE(DynamicHostCandidates::validHost("[::1]:443"));
 }
 
 TEST(DynamicHostCandidatesTest, EachAttemptConsumesTheNextCandidate) {
@@ -43,6 +58,13 @@ TEST(DynamicHostCandidatesTest, EachAttemptConsumesTheNextCandidate) {
   EXPECT_EQ(std::nullopt, candidates.selectionForAttempt(0));
 }
 
+TEST(DynamicHostCandidatesTest, AttemptsThatBypassTheClusterConsumeNothing) {
+  DynamicHostCandidates candidates({{"a", 0}, {"b", 0}});
+  EXPECT_EQ(0U, candidates.selectForAttempt(2));
+  EXPECT_EQ(std::nullopt, candidates.selectionForAttempt(1));
+  EXPECT_EQ(1U, candidates.selectForAttempt(3));
+}
+
 TEST(DynamicHostCandidatesTest, AttemptsSkippingTheSameHost) {
   DynamicHostCandidates candidates({{"a", 0}, {"b", 0}, {"a", 0}, {"c", 0}});
   EXPECT_EQ(0U, candidates.selectForAttempt(1));
@@ -53,6 +75,14 @@ TEST(DynamicHostCandidatesTest, AttemptsSkippingTheSameHost) {
   EXPECT_EQ(std::nullopt, candidates.selectForAttempt(3));
   EXPECT_EQ(std::nullopt, candidates.skipForAttempt(3));
   EXPECT_EQ(std::nullopt, candidates.skipForAttempt(7));
+}
+
+TEST(DynamicHostCandidatesTest, SkipPassesCandidatesOfLaterAttempts) {
+  DynamicHostCandidates candidates({{"a", 0}, {"b", 0}, {"c", 0}});
+  EXPECT_EQ(0U, candidates.selectForAttempt(1));
+  EXPECT_EQ(1U, candidates.selectForAttempt(2));
+  EXPECT_EQ(2U, candidates.skipForAttempt(1));
+  EXPECT_EQ(std::nullopt, candidates.selectForAttempt(3));
 }
 
 TEST(DynamicHostCandidatesTest, RetryingTheSameHostUsesARepeatedEntry) {
@@ -66,9 +96,16 @@ TEST(DynamicHostCandidatesTest, Fields) {
   DynamicHostCandidates candidates({{"a", 443}, {"b", 0}});
   EXPECT_EQ("", absl::get<absl::string_view>(candidates.getField("selected")));
   EXPECT_EQ(0, absl::get<int64_t>(candidates.getField("attempts")));
-  candidates.selectForAttempt(2);
+  EXPECT_EQ(std::nullopt, candidates.latestSelection());
+
+  EXPECT_EQ(0U, candidates.selectForAttempt(2));
+  EXPECT_EQ("a:443", absl::get<absl::string_view>(candidates.getField("selected")));
+  EXPECT_EQ(1, absl::get<int64_t>(candidates.getField("attempts")));
+
+  EXPECT_EQ(1U, candidates.skipForAttempt(2));
   EXPECT_EQ("b", absl::get<absl::string_view>(candidates.getField("selected")));
-  EXPECT_EQ(2, absl::get<int64_t>(candidates.getField("attempts")));
+  EXPECT_EQ(1U, candidates.latestSelection());
+
   EXPECT_EQ(std::nullopt, candidates.skipForAttempt(2));
   EXPECT_EQ("", absl::get<absl::string_view>(candidates.getField("selected")));
   EXPECT_TRUE(absl::holds_alternative<absl::monostate>(candidates.getField("unknown")));

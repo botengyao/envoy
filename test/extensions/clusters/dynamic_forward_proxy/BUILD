@@ -18,6 +18,7 @@ envoy_extension_cc_test(
     extension_names = ["envoy.filters.http.dynamic_forward_proxy"],
     rbe_pool = "linux_x64_small",
     deps = [
+        "//source/common/network:transport_socket_options_lib",
         "//source/common/router:string_accessor_lib",
         "//source/extensions/clusters/dynamic_forward_proxy:cluster",
         "//source/extensions/load_balancing_policies/cluster_provided:config",

@@ -92,6 +92,7 @@ envoy_cc_library(
         "//envoy/stream_info:filter_state_interface",
         "//source/common/common:macros",
         "//source/common/http:utility_lib",
+        "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@abseil-cpp//absl/strings",
     ],

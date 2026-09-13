@@ -81,18 +81,24 @@ public:
   static const std::string& key();
 
   ModelRoutePlan(ModelTargetRegistrySharedPtr registry, std::vector<const ModelTarget*> targets,
-                 std::string canonical_path, std::string decision_id);
+                 std::string decision_id);
 
   const ModelTarget& target(uint32_t index) const { return *targets_[index]; }
   const ModelTargetRegistry& registry() const { return *registry_; }
-  const std::string& canonicalPath() const { return canonical_path_; }
+  const std::optional<std::string>& canonicalPath() const { return canonical_path_; }
   const std::string& decisionId() const { return decision_id_; }
 
   /**
-   * Rewrites the request headers for the target at the index. The result only depends on the
+   * Rewrites the request headers for the target at the index. The first call records the request
+   * path, after any route rewrite, as the canonical path. The result then only depends on the
    * canonical request and the target, so it is safe on a header map earlier attempts modified.
    */
-  void applyToHeaders(uint32_t index, Http::RequestHeaderMap& headers) const;
+  void applyToHeaders(uint32_t index, Http::RequestHeaderMap& headers);
+
+  /**
+   * Removes the credential headers of every target.
+   */
+  void removeCredentials(Http::RequestHeaderMap& headers) const;
 
   // StreamInfo::FilterState::Object
   std::optional<std::string> serializeAsString() const override;
@@ -101,8 +107,8 @@ public:
 private:
   const ModelTargetRegistrySharedPtr registry_;
   const std::vector<const ModelTarget*> targets_;
-  const std::string canonical_path_;
   const std::string decision_id_;
+  std::optional<std::string> canonical_path_;
 };
 
 /**

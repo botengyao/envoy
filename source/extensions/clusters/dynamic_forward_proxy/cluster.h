@@ -21,6 +21,72 @@ namespace DynamicForwardProxy {
 class ClusterFactory;
 class ClusterTest;
 
+// Presents a host's DNS name as SNI and as the SAN to verify, and keeps every other
+// request-derived transport socket option.
+class HostTlsIdentityTransportSocketOptions : public Network::TransportSocketOptions {
+public:
+  HostTlsIdentityTransportSocketOptions(
+      const std::optional<std::string>& server_name,
+      const std::vector<std::string>& verify_san_list,
+      Network::TransportSocketOptionsConstSharedPtr inner_options);
+
+  // Network::TransportSocketOptions
+  const std::optional<std::string>& serverNameOverride() const override { return server_name_; }
+  const std::vector<std::string>& verifySubjectAltNameListOverride() const override {
+    return verify_san_list_;
+  }
+  const std::vector<std::string>& applicationProtocolListOverride() const override {
+    return inner_options_->applicationProtocolListOverride();
+  }
+  const std::vector<std::string>& applicationProtocolFallback() const override {
+    return inner_options_->applicationProtocolFallback();
+  }
+  std::optional<Network::ProxyProtocolData> proxyProtocolOptions() const override {
+    return inner_options_->proxyProtocolOptions();
+  }
+  OptRef<const Http11ProxyInfo> http11ProxyInfo() const override {
+    return inner_options_->http11ProxyInfo();
+  }
+  const StreamInfo::FilterState::Objects& downstreamSharedFilterStateObjects() const override {
+    return inner_options_->downstreamSharedFilterStateObjects();
+  }
+
+private:
+  const std::optional<std::string> server_name_;
+  const std::vector<std::string> verify_san_list_;
+  const Network::TransportSocketOptionsConstSharedPtr inner_options_;
+};
+
+// A dynamic forward proxy host whose TLS connections use the host's own DNS name.
+class TlsIdentityLogicalHost : public Upstream::LogicalHost {
+public:
+  static absl::StatusOr<std::unique_ptr<Upstream::LogicalHost>>
+  create(const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+         const Network::Address::InstanceConstSharedPtr& address,
+         const Upstream::HostDescription::AddressVector& address_list,
+         const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+         const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint);
+
+  const std::optional<std::string>& serverName() const { return server_name_; }
+  const std::vector<std::string>& verifySanList() const { return verify_san_list_; }
+
+  // Upstream::Host
+  CreateConnectionData createConnection(
+      Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
+      Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override;
+
+private:
+  TlsIdentityLogicalHost(
+      const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+      const Network::Address::InstanceConstSharedPtr& address,
+      const Upstream::HostDescription::AddressVector& address_list,
+      const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+      const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint, absl::Status& creation_status);
+
+  std::optional<std::string> server_name_;
+  std::vector<std::string> verify_san_list_;
+};
+
 class Cluster : public Upstream::BaseDynamicClusterImpl,
                 public Extensions::Common::DynamicForwardProxy::DfpCluster,
                 public Extensions::Common::DynamicForwardProxy::DnsCache::UpdateCallbacks {
@@ -206,6 +272,9 @@ private:
         pending_host_selection_handles_.reset();
       }
       if (host == nullptr && load_balancer_ != nullptr) {
+        // The finished lookup must not hold a pending request slot the next lookup may need.
+        handle_.reset();
+        auto_dec_.reset();
         Upstream::HostSelectionResponse next = load_balancer_->chooseNextCandidateHost(context_);
         if (next.cancelable != nullptr) {
           // The router only knows this handle, so this handle owns cancellation of the next lookup.

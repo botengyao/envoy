@@ -180,12 +180,12 @@ void AiProtocolManagerFilter::onDestroy() {
 Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers,
                                                                  bool end_stream) {
   request_headers_ = &headers;
-  applyModelTarget(headers);
   // Request-side processing is off entirely; per-route declarations still
   // matter to the encode path, which resolves them itself.
   if (!config_->requestHandlingEnabled()) {
     return Http::FilterHeadersStatus::Continue;
   }
+  applyModelTarget(headers);
 
   // A headers-only request carries no payload to inspect, so there is nothing to
   // hold the chain for: let the headers flow. (Pausing here would also deadlock,
@@ -245,10 +245,10 @@ void AiProtocolManagerFilter::applyModelTarget(Http::RequestHeaderMap& headers) 
   if (!upstream_callbacks.has_value()) {
     return;
   }
-  const auto* plan = decoder_callbacks_->streamInfo()
-                         .filterState()
-                         ->getDataReadOnly<Envoy::Extensions::Common::Ai::ModelRoutePlan>(
-                             Envoy::Extensions::Common::Ai::ModelRoutePlan::key());
+  auto* plan = decoder_callbacks_->streamInfo()
+                   .filterState()
+                   ->getDataMutable<Envoy::Extensions::Common::Ai::ModelRoutePlan>(
+                       Envoy::Extensions::Common::Ai::ModelRoutePlan::key());
   if (plan == nullptr) {
     return;
   }
@@ -259,6 +259,7 @@ void AiProtocolManagerFilter::applyModelTarget(Http::RequestHeaderMap& headers) 
     return;
   }
   plan->applyToHeaders(index.value(), headers);
+  model_plan_ = plan;
   model_target_ = &plan->target(index.value());
   upstream_callbacks->upstreamStreamInfo().filterState()->setData(
       Envoy::Extensions::Common::Ai::ModelAttempt::key(),
@@ -463,6 +464,11 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseHeaderMap& headers,
                                                                  bool end_stream) {
+  if (model_plan_ != nullptr && request_headers_ != nullptr) {
+    // The request headers are on the wire by now, and the shared downstream map outlives this
+    // attempt: keep the target's credential out of access logs and internal redirects.
+    model_plan_->removeCredentials(*request_headers_);
+  }
   // The encode path is observe-only: headers are never held and the handler
   // selection below can only make the filter inert, never affect the response.
   if (config_ == nullptr || !config_->tokenUsageEnabled()) {

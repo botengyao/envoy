@@ -47,18 +47,23 @@ const std::string& ModelRoutePlan::key() {
 }
 
 ModelRoutePlan::ModelRoutePlan(ModelTargetRegistrySharedPtr registry,
-                               std::vector<const ModelTarget*> targets, std::string canonical_path,
-                               std::string decision_id)
+                               std::vector<const ModelTarget*> targets, std::string decision_id)
     : DynamicHostCandidates(toCandidates(targets)), registry_(std::move(registry)),
-      targets_(std::move(targets)), canonical_path_(std::move(canonical_path)),
-      decision_id_(std::move(decision_id)) {}
+      targets_(std::move(targets)), decision_id_(std::move(decision_id)) {}
 
-void ModelRoutePlan::applyToHeaders(uint32_t index, Http::RequestHeaderMap& headers) const {
-  const ModelTarget& selected = target(index);
+void ModelRoutePlan::removeCredentials(Http::RequestHeaderMap& headers) const {
   for (const Http::LowerCaseString& header : registry_->credentialHeaders()) {
     headers.remove(header);
   }
-  headers.setPath(absl::StrReplaceAll(selected.path.empty() ? canonical_path_ : selected.path,
+}
+
+void ModelRoutePlan::applyToHeaders(uint32_t index, Http::RequestHeaderMap& headers) {
+  if (!canonical_path_.has_value()) {
+    canonical_path_ = std::string(headers.getPathValue());
+  }
+  const ModelTarget& selected = target(index);
+  removeCredentials(headers);
+  headers.setPath(absl::StrReplaceAll(selected.path.empty() ? *canonical_path_ : selected.path,
                                       {{"{model}", selected.model}}));
   headers.setHost(selected.port == 0 ? selected.host
                                      : absl::StrCat(selected.host, ":", selected.port));

@@ -77,13 +77,14 @@ message ClusterConfig {
   bool allow_coalesced_connections = 3;
 
   // If true, TLS connections to a host use the host's DNS name as SNI and as the subject alternative
-  // name to verify, replacing the values the router derives from the request with
-  // :ref:`auto_sni <envoy_v3_api_field_config.core.v3.UpstreamHttpProtocolOptions.auto_sni>` and
-  // :ref:`auto_san_validation <envoy_v3_api_field_config.core.v3.UpstreamHttpProtocolOptions.auto_san_validation>`.
-  // Other request-derived transport socket options are kept. Use this when attempts of one request
-  // can reach different hosts, for example through the ``envoy.upstream.dynamic_host_candidates``
-  // filter state, since the router derives SNI once per request from the ``:authority`` header.
-  // This applies to TCP based upstream connections.
+  // name to verify. This replaces every request-derived SNI and SAN override, including the values
+  // of :ref:`auto_sni <envoy_v3_api_field_config.core.v3.UpstreamHttpProtocolOptions.auto_sni>`,
+  // :ref:`auto_san_validation <envoy_v3_api_field_config.core.v3.UpstreamHttpProtocolOptions.auto_san_validation>`
+  // and the ``envoy.network.upstream_server_name`` filter state. Other request-derived transport
+  // socket options are kept. A host that is an IP address sends no SNI and is verified against the
+  // address. Use this when attempts of one request can reach different hosts, for example through
+  // the ``envoy.upstream.dynamic_host_candidates`` filter state, since the router derives SNI once
+  // per request from the ``:authority`` header. Not supported with ``sub_clusters_config`` or HTTP/3.
   bool tls_identity_from_host = 5;
 }
 

@@ -8,6 +8,7 @@
 #include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/extensions/common/ai/model_route_plan.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
@@ -15,6 +16,7 @@
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/stats/mocks.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/utility.h"
 
@@ -1824,6 +1826,168 @@ TEST_F(AiProtocolManagerFilterTest, TrailersDroppedAfterPayloadRejection) {
   // Send trailers on the dying stream.
   Http::TestRequestTrailerMapImpl trailers;
   EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::StopIteration);
+}
+
+namespace AiCommon = Envoy::Extensions::Common::Ai;
+
+class StaticCredential : public AiCommon::CredentialSource {
+public:
+  explicit StaticCredential(std::string value) : value_(std::move(value)) {}
+  absl::string_view credential() const override { return value_; }
+
+private:
+  const std::string value_;
+};
+
+class FakeUpstreamStreamFilterCallbacks : public Http::UpstreamStreamFilterCallbacks {
+public:
+  StreamInfo::StreamInfo& upstreamStreamInfo() override { return stream_info_; }
+  OptRef<Router::GenericUpstream> upstream() override { return {}; }
+  void dumpState(std::ostream&, int) const override {}
+  bool pausedForConnect() const override { return false; }
+  void setPausedForConnect(bool) override {}
+  bool pausedForWebsocketUpgrade() const override { return false; }
+  void setPausedForWebsocketUpgrade(bool) override {}
+  bool pausedForGenericUpgrade() const override { return false; }
+  void setPausedForGenericUpgrade(bool) override {}
+  void disableRouteTimeoutForWebsocketUpgrade() override {}
+  void disablePerTryTimeoutForWebsocketUpgrade() override {}
+  const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
+    return options_;
+  }
+  void addUpstreamCallbacks(Http::UpstreamCallbacks&) override {}
+  void setUpstreamToDownstream(Router::UpstreamToDownstream&) override {}
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  Http::ConnectionPool::Instance::StreamOptions options_{false, false};
+};
+
+// The filter in a dynamic forward proxy cluster's upstream chain, where the load balancer has
+// recorded which plan target each attempt connects to.
+class AiProtocolManagerModelTargetTest : public AiProtocolManagerFilterTest {
+public:
+  AiProtocolManagerModelTargetTest() {
+    std::vector<AiCommon::ModelTarget> targets(2);
+    targets[0].id = "primary";
+    targets[0].host = "api.primary.example.com";
+    targets[0].model = "model-a";
+    targets[0].path = "/v1/chat/completions";
+    targets[0].credential_header = Http::LowerCaseString("authorization");
+    targets[0].credential_prefix = "Bearer ";
+    targets[0].credential = std::make_shared<StaticCredential>("primary-token");
+    targets[1].id = "fallback";
+    targets[1].host = "api.fallback.example.com";
+    targets[1].model = "model-b";
+    targets[1].credential_header = Http::LowerCaseString("x-api-key");
+    targets[1].credential = std::make_shared<StaticCredential>("fallback-key");
+    auto registry = std::make_shared<const AiCommon::ModelTargetRegistry>(std::move(targets));
+    auto plan = std::make_shared<AiCommon::ModelRoutePlan>(
+        registry,
+        std::vector<const AiCommon::ModelTarget*>{registry->find("primary"),
+                                                  registry->find("fallback")},
+        "decision-1");
+    plan_ = plan.get();
+    callbacks_.stream_info_.filterState()->setData(AiCommon::ModelRoutePlan::key(), plan,
+                                                   StreamInfo::FilterState::LifeSpan::FilterChain);
+    ON_CALL(callbacks_, upstreamCallbacks())
+        .WillByDefault(
+            testing::Return(OptRef<Http::UpstreamStreamFilterCallbacks>{upstream_callbacks_}));
+    request_headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                                      {":path", "/chat/completions"},
+                                                      {":authority", "gateway.example.com"},
+                                                      {"content-type", "application/json"},
+                                                      {"authorization", "Bearer client-token"},
+                                                      {"x-api-key", "client-key"}};
+  }
+
+  const AiCommon::ModelAttempt* modelAttempt() {
+    return upstream_callbacks_.stream_info_.filterState()->getDataReadOnly<AiCommon::ModelAttempt>(
+        AiCommon::ModelAttempt::key());
+  }
+
+  AiCommon::ModelRoutePlan* plan_{};
+  FakeUpstreamStreamFilterCallbacks upstream_callbacks_;
+};
+
+TEST_F(AiProtocolManagerModelTargetTest, AttemptUsesSelectedTarget) {
+  plan_->selectForAttempt(1);
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+
+  EXPECT_EQ(request_headers_.getPathValue(), "/v1/chat/completions");
+  EXPECT_EQ(request_headers_.getHostValue(), "api.primary.example.com");
+  EXPECT_EQ(request_headers_.get_("authorization"), "Bearer primary-token");
+  EXPECT_FALSE(request_headers_.has("x-api-key"));
+  EXPECT_EQ(counterValue("model_target_applied"), 1);
+  ASSERT_NE(modelAttempt(), nullptr);
+  EXPECT_EQ(modelAttempt()->serializeAsString(), "primary");
+}
+
+// Attempts share the downstream request header map, so a retry starts from the headers the
+// previous attempt rewrote.
+TEST_F(AiProtocolManagerModelTargetTest, RetryUsesNextTargetOnRewrittenHeaders) {
+  plan_->selectForAttempt(1);
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+
+  plan_->selectForAttempt(2);
+  callbacks_.stream_info_.setAttemptCount(2);
+  createFilter();
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+
+  EXPECT_EQ(request_headers_.getPathValue(), "/chat/completions");
+  EXPECT_EQ(request_headers_.getHostValue(), "api.fallback.example.com");
+  EXPECT_EQ(request_headers_.get_("x-api-key"), "fallback-key");
+  EXPECT_FALSE(request_headers_.has("authorization"));
+  EXPECT_EQ(counterValue("model_target_applied"), 2);
+  ASSERT_NE(modelAttempt(), nullptr);
+  EXPECT_EQ(modelAttempt()->serializeAsString(), "fallback");
+}
+
+TEST_F(AiProtocolManagerModelTargetTest, DownstreamChainIgnoresPlan) {
+  plan_->selectForAttempt(1);
+  ON_CALL(callbacks_, upstreamCallbacks())
+      .WillByDefault(testing::Return(OptRef<Http::UpstreamStreamFilterCallbacks>{}));
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+
+  EXPECT_EQ(request_headers_.getHostValue(), "gateway.example.com");
+  EXPECT_EQ(request_headers_.get_("authorization"), "Bearer client-token");
+  EXPECT_EQ(counterValue("model_target_applied"), 0);
+}
+
+TEST_F(AiProtocolManagerModelTargetTest, AttemptWithoutSelectionIsUntouched) {
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+
+  EXPECT_EQ(request_headers_.getPathValue(), "/chat/completions");
+  EXPECT_EQ(request_headers_.getHostValue(), "gateway.example.com");
+  EXPECT_EQ(counterValue("model_target_applied"), 0);
+  EXPECT_EQ(modelAttempt(), nullptr);
+}
+
+TEST_F(AiProtocolManagerModelTargetTest, RewritesBodyModel) {
+  plan_->selectForAttempt(1);
+  replay_cb_ = new NiceMock<Event::MockSchedulableCallback>(&callbacks_.dispatcher_);
+  ASSERT_EQ(filter_->decodeHeaders(request_headers_, false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(R"({"model":"client-model","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(
+      nlohmann::json::parse(injected_.toString()),
+      nlohmann::json::parse(R"({"model":"model-a","messages":[{"role":"user","content":"hi"}]})"));
+}
+
+TEST_F(AiProtocolManagerModelTargetTest, ResponseRemovesCredentialsFromRequestHeaders) {
+  plan_->selectForAttempt(1);
+  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
+  ASSERT_TRUE(request_headers_.has("authorization"));
+
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_EQ(filter_->encodeHeaders(response_headers, true), Http::FilterHeadersStatus::Continue);
+  EXPECT_FALSE(request_headers_.has("authorization"));
+  EXPECT_FALSE(request_headers_.has("x-api-key"));
 }
 
 } // namespace

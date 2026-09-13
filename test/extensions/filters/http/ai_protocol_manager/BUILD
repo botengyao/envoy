@@ -125,11 +125,13 @@ envoy_extension_cc_test(
     deps = [
         "//envoy/http:codes_interface",
         "//source/common/buffer:buffer_lib",
+        "//source/extensions/common/ai:model_route_plan_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_lib",
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/stats:stats_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:logging_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",

@@ -276,7 +276,8 @@ private:
   // FilterManager orchestrating the AI filter chain.
   std::unique_ptr<FilterManager> filter_manager_;
 
-  // Owned by the request's plan in the downstream filter state, which outlives upstream filters.
+  // Owned by the downstream filter state, which outlives upstream filters.
+  Envoy::Extensions::Common::Ai::ModelRoutePlan* model_plan_{nullptr};
   const Envoy::Extensions::Common::Ai::ModelTarget* model_target_{nullptr};
 
   // Encode-path (response token-usage) state.

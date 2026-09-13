@@ -71,23 +71,26 @@ public:
         [this, target_ids, fallback_on](
             envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
                 hcm) {
-          hcm.mutable_route_config()
-              ->mutable_virtual_hosts(0)
-              ->mutable_routes(0)
-              ->mutable_route()
-              ->set_cluster("ai_dfp");
+          auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+          route->mutable_route()->set_cluster("ai_dfp");
+          if (rewrite_openai_prefix_) {
+            route->mutable_match()->set_prefix("/openai/");
+            route->mutable_route()->set_prefix_rewrite("/");
+          }
           // Config modifiers run after the fake upstreams exist, so target ports are known here.
           prependHttpFilter(hcm, resolverYaml());
-          prependHttpFilter(hcm, policyYaml(target_ids, fallback_on));
+          if (!target_ids.empty()) {
+            prependHttpFilter(hcm, policyYaml(target_ids, fallback_on));
+          }
         });
     HttpIntegrationTest::initialize();
   }
 
-  IntegrationStreamDecoderPtr sendChatRequest() {
+  IntegrationStreamDecoderPtr sendChatRequest(const std::string& path = "/v1/chat/completions") {
     codec_client_ = makeHttpConnection(lookupPort("http"));
     return codec_client_->makeRequestWithBody(
         Http::TestRequestHeaderMapImpl{{":method", "POST"},
-                                       {":path", "/v1/chat/completions"},
+                                       {":path", path},
                                        {":scheme", "http"},
                                        {":authority", "gateway.example.com"},
                                        {"content-type", "application/json"},
@@ -231,6 +234,13 @@ typed_config:
       credential:
         header_name: x-api-key
         generic_secret: {{name: anthropic-key}}
+    passthrough:
+      host: anthropic.lyft.com
+      port: {2}
+      model: claude-sonnet-4-5
+      credential:
+        header_name: x-api-key
+        generic_secret: {{name: anthropic-key}}
     unresolvable:
       host: doesnotexist.example.com
       port: {2}
@@ -293,6 +303,9 @@ transport_socket:
 
   ProviderDns dns_;
   TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&dns_};
+
+protected:
+  bool rewrite_openai_prefix_{false};
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, ModelFallbackIntegrationTest,
@@ -324,7 +337,7 @@ TEST_P(ModelFallbackIntegrationTest, SameHostModelFallbackOnRateLimit) {
 TEST_P(ModelFallbackIntegrationTest, CrossRegionThenCrossProviderFallback) {
   useAccessLog("%FILTER_STATE(envoy.ai.model_route_plan:FIELD:selected_target)% "
                "%FILTER_STATE(envoy.ai.model_route_plan:FIELD:decision_id)% "
-               "%UPSTREAM_REQUEST_ATTEMPT_COUNT%");
+               "%UPSTREAM_REQUEST_ATTEMPT_COUNT% %REQ(authorization)% %REQ(x-api-key)%");
   initializeWithPolicy("vertex-pro, vertex-east, anthropic");
   auto response = sendChatRequest();
 
@@ -346,7 +359,35 @@ TEST_P(ModelFallbackIntegrationTest, CrossRegionThenCrossProviderFallback) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_EQ(2, counter("cluster.ai_dfp.upstream_rq_retry"));
-  EXPECT_EQ("anthropic decision-1 3", waitForAccessLog(access_log_name_));
+  // Provider credentials do not stay in the downstream request headers.
+  EXPECT_EQ("anthropic decision-1 3 - -", waitForAccessLog(access_log_name_));
+}
+
+// Without a policy the request is rejected rather than sent to the authority the client names.
+TEST_P(ModelFallbackIntegrationTest, MissingPolicyFailsClosed) {
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
+  initializeWithPolicy("");
+  auto response = sendChatRequest();
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("503", response->headers().getStatusValue());
+  EXPECT_EQ("model_resolver_no_policy", waitForAccessLog(access_log_name_));
+  EXPECT_EQ(1, counter("http.config_test.model_resolver.no_policy"));
+}
+
+// A target without its own path receives the request path after the route rewrite.
+TEST_P(ModelFallbackIntegrationTest, TargetWithoutPathKeepsTheRewrittenPath) {
+  rewrite_openai_prefix_ = true;
+  initializeWithPolicy("passthrough");
+  auto response = sendChatRequest("/openai/v1/chat/completions");
+
+  waitForAttempt(2);
+  expectAttempt(2, "anthropic.lyft.com", "/v1/chat/completions", "claude-sonnet-4-5");
+  expectAnthropicCredential();
+  succeedAttempt();
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 // A target whose host does not resolve is skipped inside the attempt, without spending a retry.

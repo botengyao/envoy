@@ -75,97 +75,58 @@ uint32_t defaultPort(const Upstream::ClusterInfo& info) {
              : 80;
 }
 
-// Presents the host's DNS name as SNI and as the SAN to verify, and keeps every other
-// request-derived transport socket option.
-class HostTlsIdentityTransportSocketOptions : public Network::TransportSocketOptions {
-public:
-  HostTlsIdentityTransportSocketOptions(const std::optional<std::string>& server_name,
-                                        const std::vector<std::string>& verify_san_list,
-                                        Network::TransportSocketOptionsConstSharedPtr inner_options)
-      : server_name_(server_name), verify_san_list_(verify_san_list),
-        inner_options_(inner_options != nullptr
-                           ? std::move(inner_options)
-                           : std::make_shared<Network::TransportSocketOptionsImpl>()) {}
-
-  // Network::TransportSocketOptions
-  const std::optional<std::string>& serverNameOverride() const override { return server_name_; }
-  const std::vector<std::string>& verifySubjectAltNameListOverride() const override {
-    return verify_san_list_;
-  }
-  const std::vector<std::string>& applicationProtocolListOverride() const override {
-    return inner_options_->applicationProtocolListOverride();
-  }
-  const std::vector<std::string>& applicationProtocolFallback() const override {
-    return inner_options_->applicationProtocolFallback();
-  }
-  std::optional<Network::ProxyProtocolData> proxyProtocolOptions() const override {
-    return inner_options_->proxyProtocolOptions();
-  }
-  OptRef<const Http11ProxyInfo> http11ProxyInfo() const override {
-    return inner_options_->http11ProxyInfo();
-  }
-  const StreamInfo::FilterState::Objects& downstreamSharedFilterStateObjects() const override {
-    return inner_options_->downstreamSharedFilterStateObjects();
-  }
-
-private:
-  const std::optional<std::string> server_name_;
-  const std::vector<std::string> verify_san_list_;
-  const Network::TransportSocketOptionsConstSharedPtr inner_options_;
-};
-
-class TlsIdentityLogicalHost : public Upstream::LogicalHost {
-public:
-  static absl::StatusOr<std::unique_ptr<Upstream::LogicalHost>>
-  create(const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
-         const Network::Address::InstanceConstSharedPtr& address,
-         const Upstream::HostDescription::AddressVector& address_list,
-         const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
-         const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint) {
-    absl::Status creation_status = absl::OkStatus();
-    std::unique_ptr<Upstream::LogicalHost> host(
-        new TlsIdentityLogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint,
-                                   lb_endpoint, creation_status));
-    RETURN_IF_NOT_OK(creation_status);
-    return host;
-  }
-
-  // Upstream::Host
-  CreateConnectionData createConnection(
-      Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
-      Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override {
-    return LogicalHost::createConnection(
-        dispatcher, options,
-        std::make_shared<HostTlsIdentityTransportSocketOptions>(
-            server_name_, verify_san_list_, std::move(transport_socket_options)));
-  }
-
-private:
-  TlsIdentityLogicalHost(
-      const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
-      const Network::Address::InstanceConstSharedPtr& address,
-      const Upstream::HostDescription::AddressVector& address_list,
-      const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
-      const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint, absl::Status& creation_status)
-      : LogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint, lb_endpoint,
-                    nullptr, creation_status) {
-    // The DFP hostname is the DNS cache key, "host:port".
-    const auto authority = Http::Utility::parseAuthority(hostname);
-    if (!authority.is_ip_address_) {
-      server_name_ = std::string(authority.host_);
-    }
-    verify_san_list_.emplace_back(authority.host_);
-  }
-
-  std::optional<std::string> server_name_;
-  std::vector<std::string> verify_san_list_;
-};
-
 } // namespace
 
 REGISTER_FACTORY(DynamicHostObjectFactory, StreamInfo::FilterState::ObjectFactory);
 REGISTER_FACTORY(DynamicPortObjectFactory, StreamInfo::FilterState::ObjectFactory);
 REGISTER_FACTORY(DynamicHostCandidatesObjectFactory, StreamInfo::FilterState::ObjectFactory);
+
+HostTlsIdentityTransportSocketOptions::HostTlsIdentityTransportSocketOptions(
+    const std::optional<std::string>& server_name, const std::vector<std::string>& verify_san_list,
+    Network::TransportSocketOptionsConstSharedPtr inner_options)
+    : server_name_(server_name), verify_san_list_(verify_san_list),
+      inner_options_(inner_options != nullptr
+                         ? std::move(inner_options)
+                         : std::make_shared<Network::TransportSocketOptionsImpl>()) {}
+
+absl::StatusOr<std::unique_ptr<Upstream::LogicalHost>> TlsIdentityLogicalHost::create(
+    const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+    const Network::Address::InstanceConstSharedPtr& address,
+    const Upstream::HostDescription::AddressVector& address_list,
+    const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+    const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint) {
+  absl::Status creation_status = absl::OkStatus();
+  std::unique_ptr<Upstream::LogicalHost> host(
+      new TlsIdentityLogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint,
+                                 lb_endpoint, creation_status));
+  RETURN_IF_NOT_OK(creation_status);
+  return host;
+}
+
+TlsIdentityLogicalHost::TlsIdentityLogicalHost(
+    const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+    const Network::Address::InstanceConstSharedPtr& address,
+    const Upstream::HostDescription::AddressVector& address_list,
+    const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+    const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint, absl::Status& creation_status)
+    : LogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint, lb_endpoint,
+                  nullptr, creation_status) {
+  // The DFP hostname is the DNS cache key, "host:port".
+  const auto authority = Http::Utility::parseAuthority(hostname);
+  if (!authority.is_ip_address_) {
+    server_name_ = std::string(authority.host_);
+  }
+  verify_san_list_.emplace_back(authority.host_);
+}
+
+Upstream::Host::CreateConnectionData TlsIdentityLogicalHost::createConnection(
+    Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
+    Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const {
+  return LogicalHost::createConnection(
+      dispatcher, options,
+      std::make_shared<HostTlsIdentityTransportSocketOptions>(server_name_, verify_san_list_,
+                                                              std::move(transport_socket_options)));
+}
 
 Cluster::Cluster(
     const envoy::config::cluster::v3::Cluster& cluster,
@@ -504,7 +465,7 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
   const uint32_t default_port = is_secure ? 443 : 80;
 
   if (StreamInfo::StreamInfo* request_stream_info = context->requestStreamInfo();
-      request_stream_info != nullptr) {
+      request_stream_info != nullptr && !cluster->enableSubCluster()) {
     auto* candidates = request_stream_info->filterState()
                            ->getDataMutable<Common::DynamicForwardProxy::DynamicHostCandidates>(
                                Common::DynamicForwardProxy::DynamicHostCandidates::key());
@@ -636,10 +597,11 @@ Upstream::HostSelectionResponse Cluster::LoadBalancer::chooseCandidateHost(
     const std::string hostname =
         Common::DynamicForwardProxy::DnsHostInfo::normalizeHostForDfp(candidate.host, port);
     Upstream::HostSelectionResponse response =
-        cluster.enableSubCluster() ? cluster.chooseHost(hostname, context)
-                                   : selectHost(cluster, context, candidate.host, port, hostname,
-                                                /*from_candidates=*/true);
-    if (response.host != nullptr || response.cancelable != nullptr) {
+        selectHost(cluster, context, candidate.host, port, hostname, /*from_candidates=*/true);
+    // A local DNS cache limit says nothing about the candidate, so it stays usable.
+    if (response.host != nullptr || response.cancelable != nullptr ||
+        response.details == "dns_cache_pending_requests_overflow" ||
+        response.details == "dns_cache_overflow") {
       return response;
     }
     ENVOY_LOG(debug, "dfp host candidate {} has no host for attempt {}: {}", hostname, attempt,
@@ -817,6 +779,15 @@ ClusterFactory::createClusterWithConfig(
           envoy::config::cluster::v3::Cluster_LbPolicy::Cluster_LbPolicy_CLUSTER_PROVIDED) {
     return absl::InvalidArgumentError(
         "unsupported lb_policy 'CLUSTER_PROVIDED' in sub_cluster_config");
+  }
+  if (proto_config.tls_identity_from_host()) {
+    if (proto_config.has_sub_clusters_config()) {
+      return absl::InvalidArgumentError(
+          "tls_identity_from_host is not supported with sub_clusters_config");
+    }
+    if (new_cluster->info()->features() & Upstream::ClusterInfo::Features::HTTP3) {
+      return absl::InvalidArgumentError("tls_identity_from_host is not supported with HTTP/3");
+    }
   }
 
   auto lb = std::make_unique<Cluster::ThreadAwareLoadBalancer>(new_cluster);

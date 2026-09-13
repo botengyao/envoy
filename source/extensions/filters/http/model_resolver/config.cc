@@ -2,6 +2,7 @@
 
 #include "envoy/registry/registry.h"
 
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache_manager_impl.h"
 #include "source/extensions/filters/http/model_resolver/filter.h"
 
 namespace Envoy {
@@ -17,8 +18,10 @@ ModelResolverFilterFactory::createHttpFilterFactoryFromProtoTyped(
   Init::Manager& init_manager = extra_context.init_manager.has_value()
                                     ? extra_context.init_manager.ref()
                                     : context.initManager();
-  auto config = FilterConfig::create(proto_config, extra_context.stats_prefix,
-                                     extra_context.scopeOr(context), context, init_manager);
+  DfpCommon::DnsCacheManagerFactoryImpl dns_cache_manager_factory(context);
+  auto config =
+      FilterConfig::create(proto_config, extra_context.stats_prefix, extra_context.scopeOr(context),
+                           context, init_manager, dns_cache_manager_factory);
   RETURN_IF_NOT_OK_REF(config.status());
   return [config = std::move(config.value())](
              Envoy::Http::FilterChainFactoryCallbacks& callbacks) -> void {

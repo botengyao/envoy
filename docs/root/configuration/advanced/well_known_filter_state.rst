@@ -59,9 +59,10 @@ The following lists the filter state object keys used by the Envoy extensions to
 
 ``envoy.upstream.dynamic_host_candidates``
   :ref:`Dynamic forward proxy <envoy_v3_api_msg_extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig>` ordered
-  upstream hosts for a request. Each upstream attempt uses the next host, and a host that fails to resolve is skipped
-  within the attempt. Takes precedence over ``envoy.upstream.dynamic_host``. Accepts a comma-separated list of
-  ``host[:port]`` values as a constructor.
+  upstream hosts for a request. Each HTTP router attempt uses the next host, and a host that fails to resolve is
+  skipped for the rest of the request without using a retry. Takes precedence over ``envoy.upstream.dynamic_host``, and
+  is ignored with ``sub_clusters_config``. Accepts a comma-separated list of ``host[:port]`` values, with bracketed IPv6
+  addresses, as a constructor. Supports the ``selected`` and ``attempts`` fields.
 
 ``envoy.tcp_proxy.disable_tunneling``
   :ref:`TCP proxy tunneling override

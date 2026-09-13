@@ -19,8 +19,10 @@ envoy_extension_cc_test(
     deps = [
         "//source/common/stats:isolated_store_lib",
         "//source/extensions/filters/http/model_resolver:filter_lib",
+        "//test/extensions/common/dynamic_forward_proxy:mocks",
         "//test/mocks/http:http_mocks",
         "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/upstream:basic_resource_limit_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",

@@ -48,7 +48,7 @@ protected:
             makeTarget("pending", "api.example.com", 0, "model", "", "x-api-key", "", "")})),
         plan_(registry_,
               {registry_->find("vertex"), registry_->find("anthropic"), registry_->find("pending")},
-              "/v1/chat/completions", "decision-7") {}
+              "decision-7") {}
 
   const ModelTargetRegistrySharedPtr registry_;
   ModelRoutePlan plan_;
@@ -67,7 +67,9 @@ TEST_F(ModelRoutePlanTest, EachTargetOwnsTheRequestHeaders) {
                                          {"authorization", "Bearer client-token"},
                                          {"x-api-key", "client-key"}};
 
+  EXPECT_FALSE(plan_.canonicalPath().has_value());
   plan_.applyToHeaders(0, headers);
+  EXPECT_EQ("/v1/chat/completions", plan_.canonicalPath().value());
   EXPECT_EQ("/v1/models/gemini-2.5-pro:generateContent", headers.getPathValue());
   EXPECT_EQ("us-central1-aiplatform.googleapis.com", headers.getHostValue());
   EXPECT_EQ("Bearer gcp-token", headers.get_("authorization"));
@@ -87,6 +89,15 @@ TEST_F(ModelRoutePlanTest, UnavailableCredentialSendsNone) {
   plan_.applyToHeaders(2, headers);
   EXPECT_EQ("api.example.com", headers.getHostValue());
   EXPECT_FALSE(headers.has("x-api-key"));
+}
+
+TEST_F(ModelRoutePlanTest, RemoveCredentials) {
+  Http::TestRequestHeaderMapImpl headers{
+      {":path", "/"}, {"authorization", "Bearer gcp-token"}, {"x-api-key", "sk-test"}, {"a", "b"}};
+  plan_.removeCredentials(headers);
+  EXPECT_FALSE(headers.has("authorization"));
+  EXPECT_FALSE(headers.has("x-api-key"));
+  EXPECT_EQ("b", headers.get_("a"));
 }
 
 TEST_F(ModelRoutePlanTest, HostCandidatesFollowTargets) {

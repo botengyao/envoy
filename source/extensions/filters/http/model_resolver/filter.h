@@ -30,6 +30,7 @@ namespace DfpCommon = Envoy::Extensions::Common::DynamicForwardProxy;
   COUNTER(invalid_policy)                                                                          \
   COUNTER(unknown_target)                                                                          \
   COUNTER(incompatible_target)                                                                     \
+  COUNTER(unsupported_body)                                                                        \
   COUNTER(prewarm_started)                                                                         \
   COUNTER(prewarm_overflow)
 
@@ -47,7 +48,8 @@ class FilterConfig {
 public:
   static absl::StatusOr<FilterConfigConstSharedPtr>
   create(const ModelResolverProto& proto, const std::string& stats_prefix, Stats::Scope& scope,
-         Server::Configuration::ServerFactoryContext& context, Init::Manager& init_manager);
+         Server::Configuration::ServerFactoryContext& context, Init::Manager& init_manager,
+         DfpCommon::DnsCacheManagerFactory& dns_cache_manager_factory);
 
   const std::string& policyNamespace() const { return policy_namespace_; }
   const AiCommon::ModelTargetRegistrySharedPtr& registry() const { return registry_; }
@@ -57,7 +59,7 @@ public:
     return default_fallback_on_;
   }
   std::optional<std::chrono::milliseconds> maxPerTryTimeout() const { return max_per_try_timeout_; }
-  bool rejectWithoutPolicy() const { return reject_without_policy_; }
+  bool continueWithoutPolicy() const { return continue_without_policy_; }
   const DfpCommon::DnsCacheSharedPtr& dnsCache() const { return dns_cache_; }
   uint32_t prewarmFallbackTargets() const { return prewarm_fallback_targets_; }
   ModelResolverStats& stats() const { return stats_; }
@@ -72,7 +74,7 @@ private:
   const uint32_t max_retries_;
   std::vector<ModelRoutingPolicy::FallbackCondition> default_fallback_on_;
   std::optional<std::chrono::milliseconds> max_per_try_timeout_;
-  const bool reject_without_policy_;
+  const bool continue_without_policy_;
   DfpCommon::DnsCacheManagerSharedPtr dns_cache_manager_;
   DfpCommon::DnsCacheSharedPtr dns_cache_;
   const uint32_t prewarm_fallback_targets_;
@@ -97,7 +99,8 @@ private:
   enum class PolicyStatus { Missing, Invalid, Ok };
 
   PolicyStatus readPolicy(ModelRoutingPolicy& policy) const;
-  Envoy::Http::FilterHeadersStatus onUnusablePolicy(PolicyStatus status);
+  Envoy::Http::FilterHeadersStatus onUnusablePolicy(Stats::Counter& counter,
+                                                    absl::string_view details);
   bool compatible(const AiCommon::ModelTarget& target) const;
   void setRetryHeaders(Envoy::Http::RequestHeaderMap& headers, const ModelRoutingPolicy& policy,
                        size_t plan_size) const;
