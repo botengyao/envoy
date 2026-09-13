@@ -82,9 +82,15 @@ absl::StatusOr<json> getSessionId(const json& json_rpc) {
   return absl::InvalidArgumentError("JSON-RPC request (except notification) does not have an ID.");
 }
 
+// MCP 2026-07-28 requires every result to carry a resultType.
+bool includeResultType(const McpJsonRestBridgeFilterConfig& config) {
+  return config.maxSupportedProtocolVersion() >= McpConstants::MCP_VERSION_2026_07_28;
+}
+
 json translateJsonRestResponseToJsonRpc(absl::string_view tool_call_response,
-                                        const json& session_id, bool is_error) {
-  return json{
+                                        const json& session_id, bool is_error,
+                                        bool include_result_type) {
+  json ret = {
       {McpConstants::JSONRPC_FIELD, McpConstants::JSONRPC_VERSION},
       {McpConstants::ID_FIELD, session_id},
       {McpConstants::RESULT_FIELD,
@@ -95,6 +101,11 @@ json translateJsonRestResponseToJsonRpc(absl::string_view tool_call_response,
            {McpConstants::IS_ERROR_FIELD, is_error},
        }},
   };
+  if (include_result_type) {
+    ret[McpConstants::RESULT_FIELD][McpConstants::RESULT_TYPE_FIELD] =
+        McpConstants::RESULT_TYPE_COMPLETE;
+  }
+  return ret;
 }
 
 json generateInitializeResponse(const json& session_id, absl::string_view server_name,
@@ -636,7 +647,9 @@ McpJsonRestBridgeFilter::encodeHeaders(Http::ResponseHeaderMap& response_headers
     const bool is_error = response_code >= static_cast<int>(Http::Code::BadRequest);
     std::string synthetic;
     if (mcp_operation_ == McpOperation::ToolsCall) {
-      synthetic = translateJsonRestResponseToJsonRpc("", *session_id_, is_error).dump();
+      synthetic = translateJsonRestResponseToJsonRpc("", *session_id_, is_error,
+                                                     includeResultType(*config_))
+                      .dump();
     } else if (mcp_operation_ == McpOperation::ToolsList) {
       // headers-only means no tools list is available; return a server error.
       json ret = {
@@ -755,6 +768,10 @@ void McpJsonRestBridgeFilter::buildStreamingPrefixAndSuffix(bool is_error) {
              {McpConstants::IS_ERROR_FIELD, is_error},
          }},
     };
+    if (includeResultType(*config_)) {
+      ref[McpConstants::RESULT_FIELD][McpConstants::RESULT_TYPE_FIELD] =
+          McpConstants::RESULT_TYPE_COMPLETE;
+    }
     std::string ref_json = ref.dump();
     std::string marker = absl::StrCat("\"", McpConstants::CONTENT_FIELD, "\":[]");
     size_t pos = ref_json.rfind(marker);
@@ -780,6 +797,10 @@ void McpJsonRestBridgeFilter::buildStreamingPrefixAndSuffix(bool is_error) {
            {McpConstants::IS_ERROR_FIELD, is_error},
        }},
   };
+  if (includeResultType(*config_)) {
+    ref[McpConstants::RESULT_FIELD][McpConstants::RESULT_TYPE_FIELD] =
+        McpConstants::RESULT_TYPE_COMPLETE;
+  }
   std::string ref_json = ref.dump();
 
   // Locate the empty-string placeholder for the text value: `"text":""`.
@@ -848,7 +869,11 @@ void McpJsonRestBridgeFilter::serveToolsListLocal(
     response_fragments.emplace_back("}");
   }
 
-  response_fragments.emplace_back("]}}");
+  response_fragments.emplace_back("]");
+  if (includeResultType(*config_)) {
+    response_fragments.emplace_back(",\"resultType\":\"complete\"");
+  }
+  response_fragments.emplace_back("}}");
 
   std::string response_data;
   size_t reserve_size = 0;
@@ -1023,6 +1048,10 @@ void McpJsonRestBridgeFilter::encodeJsonRpcData(Http::ResponseHeaderMapOptRef re
                           getResponseCode(response_headers));
       break;
     }
+    if (includeResultType(*config_) && tools.is_object() &&
+        !tools.contains(McpConstants::RESULT_TYPE_FIELD)) {
+      tools[McpConstants::RESULT_TYPE_FIELD] = McpConstants::RESULT_TYPE_COMPLETE;
+    }
     json ret = {
         {McpConstants::JSONRPC_FIELD, McpConstants::JSONRPC_VERSION},
         {McpConstants::ID_FIELD, *session_id_},
@@ -1041,15 +1070,16 @@ void McpJsonRestBridgeFilter::encodeJsonRpcData(Http::ResponseHeaderMapOptRef re
           *encoder_callbacks_);
       response_body_str_ =
           translateJsonRestResponseToJsonRpc("Backend response returns an invalid UTF-8 payload.",
-                                             *session_id_, true)
+                                             *session_id_, true, includeResultType(*config_))
               .dump();
       setResponseMetadata(BridgeStatus::ResponseToolsCallInvalidUtf8,
                           getResponseCode(response_headers));
     } else {
       bool is_error = getResponseCode(response_headers) >= static_cast<int>(Http::Code::BadRequest);
-      response_body_str_ = translateJsonRestResponseToJsonRpc(
-                               absl::string_view(json_ptr, total_size), *session_id_, is_error)
-                               .dump();
+      response_body_str_ =
+          translateJsonRestResponseToJsonRpc(absl::string_view(json_ptr, total_size), *session_id_,
+                                             is_error, includeResultType(*config_))
+              .dump();
       if (is_error) {
         setResponseMetadata(BridgeStatus::ResponseHttpStatusError,
                             getResponseCode(response_headers));

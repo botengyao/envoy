@@ -33,6 +33,8 @@ constexpr absl::string_view TEXT_FIELD = "text";
 constexpr absl::string_view CONTENT_FIELD = "content";
 constexpr absl::string_view IS_ERROR_FIELD = "isError";
 constexpr absl::string_view ERROR_FIELD = "error";
+constexpr absl::string_view RESULT_TYPE_FIELD = "resultType";
+constexpr absl::string_view RESULT_TYPE_COMPLETE = "complete";
 
 // MCP Initialize constants
 constexpr absl::string_view MCP_VERSION_2024_11_05 = "2024-11-05";
