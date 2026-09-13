@@ -180,6 +180,7 @@ void AiProtocolManagerFilter::onDestroy() {
 Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHeaderMap& headers,
                                                                  bool end_stream) {
   request_headers_ = &headers;
+  applyModelTarget(headers);
   // Request-side processing is off entirely; per-route declarations still
   // matter to the encode path, which resolves them itself.
   if (!config_->requestHandlingEnabled()) {
@@ -204,6 +205,10 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
       ENVOY_LOG(debug, "ai_protocol_manager: route declares request API {}",
                 apiProtocolName(route_request_protocol_));
     }
+  }
+  // The body carries the model to rewrite, so it must go through the serializing path.
+  if (model_target_ != nullptr) {
+    route_has_request_ = true;
   }
 
   // A declared AI endpoint is parsed strictly. Any other route is parsed only if
@@ -233,6 +238,35 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // for an empty/trailer-only body, when the manager continues iteration).
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+void AiProtocolManagerFilter::applyModelTarget(Http::RequestHeaderMap& headers) {
+  auto upstream_callbacks = decoder_callbacks_->upstreamCallbacks();
+  if (!upstream_callbacks.has_value()) {
+    return;
+  }
+  const auto* plan = decoder_callbacks_->streamInfo()
+                         .filterState()
+                         ->getDataReadOnly<Envoy::Extensions::Common::Ai::ModelRoutePlan>(
+                             Envoy::Extensions::Common::Ai::ModelRoutePlan::key());
+  if (plan == nullptr) {
+    return;
+  }
+  // The dynamic forward proxy load balancer records which plan entry this attempt connected to.
+  const uint32_t attempt = decoder_callbacks_->streamInfo().attemptCount().value_or(1);
+  const std::optional<uint32_t> index = plan->selectionForAttempt(attempt);
+  if (!index.has_value()) {
+    return;
+  }
+  plan->applyToHeaders(index.value(), headers);
+  model_target_ = &plan->target(index.value());
+  upstream_callbacks->upstreamStreamInfo().filterState()->setData(
+      Envoy::Extensions::Common::Ai::ModelAttempt::key(),
+      std::make_shared<Envoy::Extensions::Common::Ai::ModelAttempt>(attempt, *model_target_),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  config_->stats().model_target_applied_.inc();
+  ENVOY_LOG(debug, "ai_protocol_manager: attempt {} uses model target '{}'", attempt,
+            model_target_->id);
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
@@ -402,6 +436,9 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
 
   if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
     ASSERT(request_headers_ != nullptr);
+    if (model_target_ != nullptr && request_json_.json().is_object()) {
+      request_json_.json()["model"] = model_target_->model;
+    }
     std::vector<AiFilterPtr> filters;
     // TODO(penguingao): Avoid always passing downstream StreamInfo when constructing
     // FilterManager; when AI Protocol Manager is placed in an upstream filter chain, it should

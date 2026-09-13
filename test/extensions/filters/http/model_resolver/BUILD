@@ -26,3 +26,23 @@ envoy_extension_cc_test(
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "model_fallback_integration_test",
+    size = "large",
+    srcs = ["model_fallback_integration_test.cc"],
+    data = ["//test/config/integration/certs"],
+    extension_names = ["envoy.filters.http.model_resolver"],
+    rbe_pool = "linux_x64_medium",
+    deps = [
+        "//source/extensions/clusters/dynamic_forward_proxy:cluster",
+        "//source/extensions/filters/http/ai_protocol_manager:config",
+        "//source/extensions/filters/http/model_resolver:config",
+        "//source/extensions/filters/http/set_metadata:config",
+        "//source/extensions/network/dns_resolver/getaddrinfo:config",
+        "//test/integration:http_integration_lib",
+        "//test/test_common:threadsafe_singleton_injector_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+    ],
+)

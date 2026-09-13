@@ -10,6 +10,7 @@
 #include "envoy/stats/scope.h"
 
 #include "source/common/common/logger.h"
+#include "source/extensions/common/ai/model_route_plan.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
@@ -241,6 +242,10 @@ private:
   // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
   void finalizeDecode(bool has_trailers);
 
+  // In the upstream placement, rewrites the request for the model route plan entry that this
+  // attempt connected to.
+  void applyModelTarget(Http::RequestHeaderMap& headers);
+
   ExternalBufferFactory& buffer_factory_;
   FilterConfigSharedPtr config_;
 
@@ -270,6 +275,9 @@ private:
 
   // FilterManager orchestrating the AI filter chain.
   std::unique_ptr<FilterManager> filter_manager_;
+
+  // Owned by the request's plan in the downstream filter state, which outlives upstream filters.
+  const Envoy::Extensions::Common::Ai::ModelTarget* model_target_{nullptr};
 
   // Encode-path (response token-usage) state.
   ResponseHandlerPtr response_handler_;
