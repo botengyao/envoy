@@ -695,6 +695,13 @@ envoy.filters.http.mcp_router:
   status: alpha
   type_urls:
   - envoy.extensions.filters.http.mcp_router.v3.McpRouter
+envoy.filters.http.model_resolver:
+  categories:
+  - envoy.filters.http
+  security_posture: unknown
+  status: wip
+  type_urls:
+  - envoy.extensions.filters.http.model_resolver.v3.ModelResolver
 envoy.filters.http.oauth2:
   categories:
   - envoy.filters.http

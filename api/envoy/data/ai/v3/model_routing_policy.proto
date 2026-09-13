@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package envoy.data.ai.v3;
+
+import "google/protobuf/duration.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.data.ai.v3";
+option java_outer_classname = "ModelRoutingPolicyProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/data/ai/v3;aiv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI model routing policy]
+
+// Ordered model routing decision for one request. An external policy decision point returns it,
+// for example as typed dynamic metadata from the external processing filter, and the
+// :ref:`model resolver filter <config_http_filters_model_resolver>` turns it into a plan that the
+// request's upstream attempts follow.
+message ModelRoutingPolicy {
+  // Failure classes after which a request may move on to its next target.
+  enum FallbackCondition {
+    FALLBACK_CONDITION_UNSPECIFIED = 0;
+
+    // The connection or TLS handshake to the target failed.
+    CONNECT_FAILURE = 1;
+
+    // The target reset the stream.
+    RESET = 2;
+
+    // The target responded with 429.
+    RATE_LIMITED = 3;
+
+    // The target responded with a 5xx status.
+    SERVER_ERROR = 4;
+
+    // The target responded with 503 or 529.
+    OVERLOADED = 5;
+
+    // The target responded with 502, 503 or 504, or the attempt timed out.
+    GATEWAY_ERROR = 6;
+  }
+
+  // Target IDs in preference order. Each ID names a target of the model resolver configuration.
+  // Every upstream attempt uses the next entry, so a repeated ID retries the same target.
+  repeated string target_ids = 1 [(validate.rules).repeated = {
+    min_items: 1
+    max_items: 16
+    items {string {min_len: 1}}
+  }];
+
+  // Conditions that allow moving on to the next target. When empty, the resolver's defaults apply.
+  repeated FallbackCondition fallback_on = 2
+      [(validate.rules).repeated = {items {enum {defined_only: true}}}];
+
+  // Time allowed for each attempt until response headers arrive. The resolver caps it.
+  google.protobuf.Duration per_try_timeout = 3;
+
+  // Opaque identifier of the decision, exposed to access logs.
+  string decision_id = 4 [(validate.rules).string = {max_len: 128}];
+}
