@@ -51,6 +51,15 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "dynamic_host_candidates_test",
+    srcs = ["dynamic_host_candidates_test.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/common/dynamic_forward_proxy:dynamic_host_candidates_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "dns_cache_resource_manager_test",
     srcs = ["dns_cache_resource_manager_test.cc"],
     rbe_pool = "linux_x64_small",

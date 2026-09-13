@@ -56,10 +56,116 @@ bool isProxying(StreamInfo::StreamInfo* stream_info) {
              Network::Http11ProxyInfoFilterState::key());
 }
 
+class DynamicHostCandidatesObjectFactory : public StreamInfo::FilterState::ObjectFactory {
+public:
+  std::string name() const override {
+    return Common::DynamicForwardProxy::DynamicHostCandidates::key();
+  }
+  std::unique_ptr<StreamInfo::FilterState::Object>
+  createFromBytes(absl::string_view data) const override {
+    return Common::DynamicForwardProxy::DynamicHostCandidates::fromString(data);
+  }
+};
+
+uint32_t defaultPort(const Upstream::ClusterInfo& info) {
+  return info.transportSocketMatcher()
+                 .resolve(nullptr, nullptr)
+                 .factory_.implementsSecureTransport()
+             ? 443
+             : 80;
+}
+
+// Presents the host's DNS name as SNI and as the SAN to verify, and keeps every other
+// request-derived transport socket option.
+class HostTlsIdentityTransportSocketOptions : public Network::TransportSocketOptions {
+public:
+  HostTlsIdentityTransportSocketOptions(const std::optional<std::string>& server_name,
+                                        const std::vector<std::string>& verify_san_list,
+                                        Network::TransportSocketOptionsConstSharedPtr inner_options)
+      : server_name_(server_name), verify_san_list_(verify_san_list),
+        inner_options_(inner_options != nullptr
+                           ? std::move(inner_options)
+                           : std::make_shared<Network::TransportSocketOptionsImpl>()) {}
+
+  // Network::TransportSocketOptions
+  const std::optional<std::string>& serverNameOverride() const override { return server_name_; }
+  const std::vector<std::string>& verifySubjectAltNameListOverride() const override {
+    return verify_san_list_;
+  }
+  const std::vector<std::string>& applicationProtocolListOverride() const override {
+    return inner_options_->applicationProtocolListOverride();
+  }
+  const std::vector<std::string>& applicationProtocolFallback() const override {
+    return inner_options_->applicationProtocolFallback();
+  }
+  std::optional<Network::ProxyProtocolData> proxyProtocolOptions() const override {
+    return inner_options_->proxyProtocolOptions();
+  }
+  OptRef<const Http11ProxyInfo> http11ProxyInfo() const override {
+    return inner_options_->http11ProxyInfo();
+  }
+  const StreamInfo::FilterState::Objects& downstreamSharedFilterStateObjects() const override {
+    return inner_options_->downstreamSharedFilterStateObjects();
+  }
+
+private:
+  const std::optional<std::string> server_name_;
+  const std::vector<std::string> verify_san_list_;
+  const Network::TransportSocketOptionsConstSharedPtr inner_options_;
+};
+
+class TlsIdentityLogicalHost : public Upstream::LogicalHost {
+public:
+  static absl::StatusOr<std::unique_ptr<Upstream::LogicalHost>>
+  create(const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+         const Network::Address::InstanceConstSharedPtr& address,
+         const Upstream::HostDescription::AddressVector& address_list,
+         const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+         const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint) {
+    absl::Status creation_status = absl::OkStatus();
+    std::unique_ptr<Upstream::LogicalHost> host(
+        new TlsIdentityLogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint,
+                                   lb_endpoint, creation_status));
+    RETURN_IF_NOT_OK(creation_status);
+    return host;
+  }
+
+  // Upstream::Host
+  CreateConnectionData createConnection(
+      Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
+      Network::TransportSocketOptionsConstSharedPtr transport_socket_options) const override {
+    return LogicalHost::createConnection(
+        dispatcher, options,
+        std::make_shared<HostTlsIdentityTransportSocketOptions>(
+            server_name_, verify_san_list_, std::move(transport_socket_options)));
+  }
+
+private:
+  TlsIdentityLogicalHost(
+      const Upstream::ClusterInfoConstSharedPtr& cluster, const std::string& hostname,
+      const Network::Address::InstanceConstSharedPtr& address,
+      const Upstream::HostDescription::AddressVector& address_list,
+      const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
+      const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint, absl::Status& creation_status)
+      : LogicalHost(cluster, hostname, address, address_list, locality_lb_endpoint, lb_endpoint,
+                    nullptr, creation_status) {
+    // The DFP hostname is the DNS cache key, "host:port".
+    const auto authority = Http::Utility::parseAuthority(hostname);
+    if (!authority.is_ip_address_) {
+      server_name_ = std::string(authority.host_);
+    }
+    verify_san_list_.emplace_back(authority.host_);
+  }
+
+  std::optional<std::string> server_name_;
+  std::vector<std::string> verify_san_list_;
+};
+
 } // namespace
 
 REGISTER_FACTORY(DynamicHostObjectFactory, StreamInfo::FilterState::ObjectFactory);
 REGISTER_FACTORY(DynamicPortObjectFactory, StreamInfo::FilterState::ObjectFactory);
+REGISTER_FACTORY(DynamicHostCandidatesObjectFactory, StreamInfo::FilterState::ObjectFactory);
 
 Cluster::Cluster(
     const envoy::config::cluster::v3::Cluster& cluster,
@@ -75,6 +181,7 @@ Cluster::Cluster(
       main_thread_dispatcher_(context.serverFactoryContext().mainThreadDispatcher()),
       orig_cluster_config_(cluster),
       allow_coalesced_connections_(config.allow_coalesced_connections()),
+      tls_identity_from_host_(config.tls_identity_from_host()),
       time_source_(context.serverFactoryContext().timeSource()),
       cm_(context.serverFactoryContext().clusterManager()),
       max_sub_clusters_(
@@ -306,9 +413,14 @@ absl::Status Cluster::addOrUpdateHost(
     }
 
     ENVOY_LOG(debug, "adding new dfproxy cluster host '{}'", host);
-    auto host_or_error = Upstream::LogicalHost::create(
-        info(), std::string{host}, host_info->address(), host_info->addressList(),
-        dummy_locality_lb_endpoint_, dummy_lb_endpoint_, nullptr);
+    auto host_or_error =
+        tls_identity_from_host_
+            ? TlsIdentityLogicalHost::create(info(), std::string{host}, host_info->address(),
+                                             host_info->addressList(), dummy_locality_lb_endpoint_,
+                                             dummy_lb_endpoint_)
+            : Upstream::LogicalHost::create(info(), std::string{host}, host_info->address(),
+                                            host_info->addressList(), dummy_locality_lb_endpoint_,
+                                            dummy_lb_endpoint_, nullptr);
     RETURN_IF_NOT_OK_REF(host_or_error.status());
 
     emplaced_host =
@@ -391,6 +503,18 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
                              .factory_.implementsSecureTransport();
   const uint32_t default_port = is_secure ? 443 : 80;
 
+  if (StreamInfo::StreamInfo* request_stream_info = context->requestStreamInfo();
+      request_stream_info != nullptr) {
+    auto* candidates = request_stream_info->filterState()
+                           ->getDataMutable<Common::DynamicForwardProxy::DynamicHostCandidates>(
+                               Common::DynamicForwardProxy::DynamicHostCandidates::key());
+    if (candidates != nullptr) {
+      const uint32_t attempt = request_stream_info->attemptCount().value_or(1);
+      return chooseCandidateHost(*cluster, context, *candidates, attempt,
+                                 candidates->selectForAttempt(attempt));
+    }
+  }
+
   const auto* stream_info = context->requestStreamInfo();
   const Router::StringAccessor* dynamic_host_filter_state = nullptr;
   if (stream_info) {
@@ -447,7 +571,14 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
   if (cluster->enableSubCluster()) {
     return cluster->chooseHost(hostname, context);
   }
-  Upstream::HostConstSharedPtr host = findHostByName(hostname);
+  return selectHost(*cluster, context, raw_host, port, hostname, /*from_candidates=*/false);
+}
+
+Upstream::HostSelectionResponse
+Cluster::LoadBalancer::selectHost(const Cluster& cluster, Upstream::LoadBalancerContext* context,
+                                  absl::string_view raw_host, uint32_t port,
+                                  const std::string& hostname, bool from_candidates) {
+  Upstream::HostConstSharedPtr host = cluster.findHostByName(hostname);
   bool force_refresh =
       Runtime::runtimeFeatureEnabled("envoy.reloadable_features.reresolve_if_no_connections") &&
       Runtime::runtimeFeatureEnabled("envoy.reloadable_features.dfp_cluster_resolves_hosts") &&
@@ -458,7 +589,7 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
   }
 
   // If the host is not found, the DFP cluster can now do asynchronous lookup.
-  Upstream::ResourceAutoIncDecPtr handle = cluster->dns_cache_->canCreateDnsRequest();
+  Upstream::ResourceAutoIncDecPtr handle = cluster.dns_cache_->canCreateDnsRequest();
 
   // Return an immediate failure if there's too many requests already.
   if (!handle) {
@@ -469,9 +600,12 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
   // resolution so create a DFPHostSelectionHandle to handle this.
   std::unique_ptr<DFPHostSelectionHandle> cancelable = std::make_unique<DFPHostSelectionHandle>(
       context, cluster_, hostname, pending_host_selection_handles_);
+  if (from_candidates) {
+    cancelable->setLoadBalancer(*this);
+  }
   bool is_proxying = isProxying(context->requestStreamInfo());
-  auto result = cluster->dns_cache_->loadDnsCacheEntryWithForceRefresh(raw_host, port, is_proxying,
-                                                                       force_refresh, *cancelable);
+  auto result = cluster.dns_cache_->loadDnsCacheEntryWithForceRefresh(raw_host, port, is_proxying,
+                                                                      force_refresh, *cancelable);
   switch (result.status_) {
   case Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryStatus::InCache:
     return {nullptr, result.host_info_.has_value() ? result.host_info_.value()->details() : ""};
@@ -489,6 +623,47 @@ Cluster::LoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
     break; // fall through
   }
   return {nullptr, "dns_cache_overflow"};
+}
+
+Upstream::HostSelectionResponse Cluster::LoadBalancer::chooseCandidateHost(
+    const Cluster& cluster, Upstream::LoadBalancerContext* context,
+    Common::DynamicForwardProxy::DynamicHostCandidates& candidates, uint32_t attempt,
+    std::optional<uint32_t> index) {
+  const uint32_t default_port = defaultPort(*cluster.info());
+  for (; index.has_value(); index = candidates.skipForAttempt(attempt)) {
+    const auto& candidate = candidates.candidates()[index.value()];
+    const uint32_t port = candidate.port != 0 ? candidate.port : default_port;
+    const std::string hostname =
+        Common::DynamicForwardProxy::DnsHostInfo::normalizeHostForDfp(candidate.host, port);
+    Upstream::HostSelectionResponse response =
+        cluster.enableSubCluster() ? cluster.chooseHost(hostname, context)
+                                   : selectHost(cluster, context, candidate.host, port, hostname,
+                                                /*from_candidates=*/true);
+    if (response.host != nullptr || response.cancelable != nullptr) {
+      return response;
+    }
+    ENVOY_LOG(debug, "dfp host candidate {} has no host for attempt {}: {}", hostname, attempt,
+              response.details);
+  }
+  return {nullptr, "dfp_host_candidates_exhausted"};
+}
+
+Upstream::HostSelectionResponse
+Cluster::LoadBalancer::chooseNextCandidateHost(Upstream::LoadBalancerContext* context) {
+  auto cluster = cluster_.lock();
+  StreamInfo::StreamInfo* stream_info = context->requestStreamInfo();
+  if (cluster == nullptr || stream_info == nullptr) {
+    return {nullptr};
+  }
+  auto* candidates = stream_info->filterState()
+                         ->getDataMutable<Common::DynamicForwardProxy::DynamicHostCandidates>(
+                             Common::DynamicForwardProxy::DynamicHostCandidates::key());
+  if (candidates == nullptr) {
+    return {nullptr};
+  }
+  const uint32_t attempt = stream_info->attemptCount().value_or(1);
+  return chooseCandidateHost(*cluster, context, *candidates, attempt,
+                             candidates->skipForAttempt(attempt));
 }
 
 Upstream::HostConstSharedPtr Cluster::LoadBalancer::findHostByName(const std::string& host) const {

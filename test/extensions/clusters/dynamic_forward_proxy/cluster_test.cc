@@ -136,6 +136,27 @@ public:
     return &lb_context_;
   }
 
+  Upstream::MockLoadBalancerContext*
+  setHostCandidatesAndReturnContext(const std::string& candidates, uint32_t attempt) {
+    StreamInfo::FilterStateSharedPtr filter_state = lb_context_.requestStreamInfo()->filterState();
+    const auto& key = Extensions::Common::DynamicForwardProxy::DynamicHostCandidates::key();
+    if (!filter_state->hasDataWithName(key)) {
+      filter_state->setData(
+          key,
+          Extensions::Common::DynamicForwardProxy::DynamicHostCandidates::fromString(candidates),
+          StreamInfo::FilterState::LifeSpan::FilterChain);
+    }
+    stream_info_.attempt_count_ = attempt;
+    return &lb_context_;
+  }
+
+  Extensions::Common::DynamicForwardProxy::DynamicHostCandidates& hostCandidates() {
+    return *lb_context_.requestStreamInfo()
+                ->filterState()
+                ->getDataMutable<Extensions::Common::DynamicForwardProxy::DynamicHostCandidates>(
+                    Extensions::Common::DynamicForwardProxy::DynamicHostCandidates::key());
+  }
+
   void setOutlierFailed(const std::string& host) {
     for (auto& h : cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()) {
       if (h->hostname() == host) {
@@ -780,6 +801,171 @@ TEST_F(ClusterTest, LoadBalancer_SelectPoolNoSSSL) {
       lb_->selectExistingConnection(&lb_context_, host, hash_key);
 
   ASSERT_FALSE(selection.has_value());
+}
+
+namespace DfpCommon = Extensions::Common::DynamicForwardProxy;
+
+TEST_F(ClusterTest, HostCandidatesSelectOneHostPerAttempt) {
+  initialize(default_yaml_config_, false);
+  makeTestHost("host1:80", "1.2.3.4");
+  makeTestHost("host2:80", "5.6.7.8");
+  EXPECT_CALL(*this, onMemberUpdateCb(SizeIs(1), SizeIs(0))).Times(2);
+  EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate("host1:80", host_map_["host1:80"]));
+  EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate("host2:80", host_map_["host2:80"]));
+  EXPECT_CALL(*host_map_["host1:80"], touch()).Times(2);
+  EXPECT_CALL(*host_map_["host2:80"], touch());
+
+  // The candidates win over :authority.
+  downstream_headers_.setHost("host2:80");
+  EXPECT_EQ("1.2.3.4:0", lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1))
+                             .host->address()
+                             ->asString());
+  EXPECT_EQ("1.2.3.4:0",
+            lb_->chooseHost(setHostCandidatesAndReturnContext("", 1)).host->address()->asString());
+  EXPECT_EQ("5.6.7.8:0",
+            lb_->chooseHost(setHostCandidatesAndReturnContext("", 2)).host->address()->asString());
+
+  const auto exhausted = lb_->chooseHost(setHostCandidatesAndReturnContext("", 3));
+  EXPECT_EQ(nullptr, exhausted.host);
+  EXPECT_EQ(nullptr, exhausted.cancelable);
+  EXPECT_EQ("dfp_host_candidates_exhausted", exhausted.details);
+}
+
+TEST_F(ClusterTest, HostCandidatesSkipCachedDnsFailureWithinAttempt) {
+  initialize(default_yaml_config_, false);
+  makeTestHost("host2:80", "5.6.7.8");
+  EXPECT_CALL(*this, onMemberUpdateCb(SizeIs(1), SizeIs(0)));
+  EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate("host2:80", host_map_["host2:80"]));
+
+  NiceMock<Upstream::MockBasicResourceLimit> resource_limit;
+  auto failed_host_info = std::make_shared<NiceMock<DfpCommon::MockDnsHostInfo>>();
+  ON_CALL(*failed_host_info, details()).WillByDefault(Return("dns_resolution_failure"));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_())
+      .WillOnce(Return(new Upstream::ResourceAutoIncDec(resource_limit)));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host1", 80, _, _))
+      .WillOnce(Return(DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+          DfpCommon::DnsCache::LoadDnsCacheEntryStatus::InCache, nullptr, failed_host_info}));
+  EXPECT_CALL(*host_map_["host2:80"], touch());
+
+  EXPECT_EQ("5.6.7.8:0", lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1))
+                             .host->address()
+                             ->asString());
+  EXPECT_EQ(1U, hostCandidates().selectionForAttempt(1));
+  EXPECT_EQ("dfp_host_candidates_exhausted",
+            lb_->chooseHost(setHostCandidatesAndReturnContext("", 2)).details);
+}
+
+TEST_F(ClusterTest, HostCandidatesContinueAfterAsyncDnsFailure) {
+  initialize(default_yaml_config_, false);
+  makeTestHost("host2:80", "5.6.7.8");
+  EXPECT_CALL(*this, onMemberUpdateCb(SizeIs(1), SizeIs(0)));
+  EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate("host2:80", host_map_["host2:80"]));
+
+  NiceMock<Upstream::MockBasicResourceLimit> resource_limit;
+  auto* dns_cache_handle = new NiceMock<DfpCommon::MockLoadDnsCacheEntryHandle>();
+  DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks* callbacks = nullptr;
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_())
+      .WillOnce(Return(new Upstream::ResourceAutoIncDec(resource_limit)));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host1", 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks = &cb;
+        return DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+            DfpCommon::DnsCache::LoadDnsCacheEntryStatus::Loading, dns_cache_handle, std::nullopt};
+      }));
+
+  auto selection = lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1));
+  ASSERT_EQ(nullptr, selection.host);
+  ASSERT_NE(nullptr, selection.cancelable);
+  ASSERT_NE(nullptr, callbacks);
+
+  EXPECT_CALL(*host_map_["host2:80"], touch());
+  EXPECT_CALL(lb_context_, onAsyncHostSelection(_, _))
+      .WillOnce([](Upstream::HostConstSharedPtr&& host, std::string&&) {
+        ASSERT_NE(nullptr, host);
+        EXPECT_EQ("5.6.7.8:0", host->address()->asString());
+      });
+  callbacks->onLoadDnsCacheComplete(std::make_shared<NiceMock<DfpCommon::MockDnsHostInfo>>());
+  EXPECT_EQ(1U, hostCandidates().selectionForAttempt(1));
+}
+
+TEST_F(ClusterTest, HostCandidatesChainAsyncLookups) {
+  initialize(default_yaml_config_, false);
+
+  NiceMock<Upstream::MockBasicResourceLimit> resource_limit;
+  auto* handle1 = new NiceMock<DfpCommon::MockLoadDnsCacheEntryHandle>();
+  auto* handle2 = new NiceMock<DfpCommon::MockLoadDnsCacheEntryHandle>();
+  DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks* callbacks1 = nullptr;
+  DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks* callbacks2 = nullptr;
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_())
+      .Times(2)
+      .WillRepeatedly(Invoke([&]() { return new Upstream::ResourceAutoIncDec(resource_limit); }));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host1", 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks1 = &cb;
+        return DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+            DfpCommon::DnsCache::LoadDnsCacheEntryStatus::Loading, handle1, std::nullopt};
+      }));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host2", 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks2 = &cb;
+        return DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+            DfpCommon::DnsCache::LoadDnsCacheEntryStatus::Loading, handle2, std::nullopt};
+      }));
+
+  auto selection = lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1));
+  ASSERT_NE(nullptr, selection.cancelable);
+
+  // The first lookup fails and starts the second one without notifying the router.
+  EXPECT_CALL(lb_context_, onAsyncHostSelection(_, _)).Times(0);
+  callbacks1->onLoadDnsCacheComplete(std::make_shared<NiceMock<DfpCommon::MockDnsHostInfo>>());
+  ASSERT_NE(nullptr, callbacks2);
+  testing::Mock::VerifyAndClearExpectations(&lb_context_);
+
+  makeTestHost("host2:80", "5.6.7.8");
+  EXPECT_CALL(*this, onMemberUpdateCb(SizeIs(1), SizeIs(0)));
+  EXPECT_OK(update_callbacks_->onDnsHostAddOrUpdate("host2:80", host_map_["host2:80"]));
+  EXPECT_CALL(*host_map_["host2:80"], touch());
+  EXPECT_CALL(*host_map_["host2:80"], details()).WillOnce(Return(""));
+  EXPECT_CALL(lb_context_, onAsyncHostSelection(_, _))
+      .WillOnce([](Upstream::HostConstSharedPtr&& host, std::string&&) {
+        ASSERT_NE(nullptr, host);
+        EXPECT_EQ("5.6.7.8:0", host->address()->asString());
+      });
+  callbacks2->onLoadDnsCacheComplete(host_map_["host2:80"]);
+}
+
+TEST_F(ClusterTest, HostCandidatesCancelChainedLookup) {
+  initialize(default_yaml_config_, false);
+
+  NiceMock<Upstream::MockBasicResourceLimit> resource_limit;
+  auto* handle1 = new NiceMock<DfpCommon::MockLoadDnsCacheEntryHandle>();
+  auto* handle2 = new NiceMock<DfpCommon::MockLoadDnsCacheEntryHandle>();
+  DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks* callbacks1 = nullptr;
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_())
+      .Times(2)
+      .WillRepeatedly(Invoke([&]() { return new Upstream::ResourceAutoIncDec(resource_limit); }));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host1", 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           DfpCommon::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks1 = &cb;
+        return DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+            DfpCommon::DnsCache::LoadDnsCacheEntryStatus::Loading, handle1, std::nullopt};
+      }));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_("host2", 80, _, _))
+      .WillOnce(Return(DfpCommon::MockDnsCache::MockLoadDnsCacheEntryResult{
+          DfpCommon::DnsCache::LoadDnsCacheEntryStatus::Loading, handle2, std::nullopt}));
+  EXPECT_CALL(lb_context_, onAsyncHostSelection(_, _)).Times(0);
+
+  auto selection = lb_->chooseHost(setHostCandidatesAndReturnContext("host1,host2", 1));
+  ASSERT_NE(nullptr, selection.cancelable);
+  callbacks1->onLoadDnsCacheComplete(std::make_shared<NiceMock<DfpCommon::MockDnsHostInfo>>());
+
+  EXPECT_CALL(*handle2, onDestroy());
+  selection.cancelable->cancel();
+  lb_.reset();
 }
 
 class ClusterFactoryTest : public testing::Test {

@@ -11,6 +11,7 @@
 #include "source/extensions/clusters/common/logical_host.h"
 #include "source/extensions/common/dynamic_forward_proxy/cluster_store.h"
 #include "source/extensions/common/dynamic_forward_proxy/dns_cache.h"
+#include "source/extensions/common/dynamic_forward_proxy/dynamic_host_candidates.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -113,6 +114,9 @@ private:
                              std::vector<uint8_t>& hash_key) override;
     OptRef<Envoy::Http::ConnectionPool::ConnectionLifetimeCallbacks> lifetimeCallbacks() override;
 
+    // Moves the current attempt past a host candidate whose lookup found no host.
+    Upstream::HostSelectionResponse chooseNextCandidateHost(Upstream::LoadBalancerContext* context);
+
     // Envoy::Http::ConnectionPool::ConnectionLifetimeCallbacks
     void onConnectionOpen(Envoy::Http::ConnectionPool::Instance& pool,
                           std::vector<uint8_t>& hash_key,
@@ -123,6 +127,15 @@ private:
                               const Network::Connection& connection) override;
 
   private:
+    Upstream::HostSelectionResponse selectHost(const Cluster& cluster,
+                                               Upstream::LoadBalancerContext* context,
+                                               absl::string_view raw_host, uint32_t port,
+                                               const std::string& hostname, bool from_candidates);
+    Upstream::HostSelectionResponse
+    chooseCandidateHost(const Cluster& cluster, Upstream::LoadBalancerContext* context,
+                        Common::DynamicForwardProxy::DynamicHostCandidates& candidates,
+                        uint32_t attempt, std::optional<uint32_t> index);
+
     struct ConnectionInfo {
       Envoy::Http::ConnectionPool::Instance* pool_; // Not a ref to allow assignment in remove().
       const Network::Connection* connection_;       // Not a ref to allow assignment in remove().
@@ -169,6 +182,9 @@ private:
     void cancel() override {
       // Cancels the DNS callback.
       handle_.reset();
+      if (chained_ != nullptr) {
+        chained_->cancel();
+      }
 
       if (pending_host_selection_handles_.has_value()) {
         // Removes itself from the pending host selection handles so that the cluster will not
@@ -189,6 +205,16 @@ private:
         pending_host_selection_handles_->erase(this);
         pending_host_selection_handles_.reset();
       }
+      if (host == nullptr && load_balancer_ != nullptr) {
+        Upstream::HostSelectionResponse next = load_balancer_->chooseNextCandidateHost(context_);
+        if (next.cancelable != nullptr) {
+          // The router only knows this handle, so this handle owns cancellation of the next lookup.
+          chained_ = std::move(next.cancelable);
+          return;
+        }
+        host = std::move(next.host);
+        details = std::move(next.details);
+      }
       context_->onAsyncHostSelection(std::move(host), std::move(details));
     }
 
@@ -196,6 +222,8 @@ private:
       handle_ = std::move(handle);
     }
     void setAutoDec(Upstream::ResourceAutoIncDecPtr&& dec) { auto_dec_ = std::move(dec); }
+    // Set for host candidates, whose failed lookups continue with the next candidate.
+    void setLoadBalancer(LoadBalancer& load_balancer) { load_balancer_ = &load_balancer; }
 
   private:
     friend class LoadBalancer;
@@ -206,6 +234,8 @@ private:
     std::weak_ptr<const Cluster> cluster_;
     std::string hostname_;
     OptRef<absl::flat_hash_set<DFPHostSelectionHandle*>> pending_host_selection_handles_;
+    LoadBalancer* load_balancer_{};
+    std::unique_ptr<Upstream::AsyncHostSelectionHandle> chained_;
   };
 
   class LoadBalancerFactory : public Upstream::LoadBalancerFactory {
@@ -260,6 +290,7 @@ private:
 
   // True if H2 and H3 connections may be reused across different origins.
   const bool allow_coalesced_connections_;
+  const bool tls_identity_from_host_;
 
   mutable absl::Mutex host_map_lock_;
   HostInfoMap host_map_ ABSL_GUARDED_BY(host_map_lock_);
