@@ -249,8 +249,8 @@
 /*/extensions/filters/http/mcp_json_rest_bridge @paulhong01 @leon-gg @botengyao @tyxia @yanavlasov @guoyilin42
 # MCP router filter
 /*/extensions/filters/http/mcp_router @botengyao @yanavlasov @wdauchy @agrawroh
-# AI model resolver filter
-/*/extensions/filters/http/model_resolver @botengyao @penguingao @tyxia
+# AI model routing filter
+/*/extensions/filters/http/model_routing @botengyao @penguingao
 /*/extensions/common/ai @botengyao @penguingao @tyxia
 # HTTP A2A filter
 /*/extensions/filters/http/a2a @tyxia @botengyao @yanavlasov @agrawroh

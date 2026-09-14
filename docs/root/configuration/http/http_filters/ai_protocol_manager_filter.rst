@@ -416,7 +416,7 @@ clean end of stream through its encoder chain — and non-2xx attempts never
 engage extraction — so only the winning attempt publishes metadata.
 
 Model route plans: when ``request_handling`` is set and the request carries a
-plan from the :ref:`model resolver <config_http_filters_model_resolver>`, the
+plan from the :ref:`model routing <config_http_filters_model_routing>`, the
 upstream installation rewrites each attempt for the plan target the attempt
 connected to. It sets ``:path`` and ``:authority`` and writes the target model
 to the JSON body's ``model`` field. The body of such a request is parsed

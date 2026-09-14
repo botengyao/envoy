@@ -27,7 +27,7 @@ envoy_cc_library(
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
-        "@envoy_api//envoy/extensions/filters/http/model_resolver/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/http/model_routing/v3:pkg_cc_proto",
         "@nlohmann_json//:json",
     ],
 )
@@ -40,6 +40,6 @@ envoy_cc_extension(
         ":filter_lib",
         "//envoy/registry",
         "//source/extensions/filters/http/common:factory_base_lib",
-        "@envoy_api//envoy/extensions/filters/http/model_resolver/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/http/model_routing/v3:pkg_cc_proto",
     ],
 )

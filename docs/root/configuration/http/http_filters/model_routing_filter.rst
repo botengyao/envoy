@@ -1,18 +1,18 @@
-.. _config_http_filters_model_resolver:
+.. _config_http_filters_model_routing:
 
-Model resolver
+Model routing
 ==============
 
-The model resolver filter turns an ordered model routing decision into a plan that the router's
+The model routing filter turns an ordered model routing decision into a plan that the router's
 retries follow, so that one request can fall back across models, regions and providers.
 
 * This filter should be configured with the type URL
-  ``type.googleapis.com/envoy.extensions.filters.http.model_resolver.v3.ModelResolver``.
-* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.model_resolver.v3.ModelResolver>`
+  ``type.googleapis.com/envoy.extensions.filters.http.model_routing.v3.ModelRouting``.
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.model_routing.v3.ModelRouting>`
 
 .. attention::
 
-  The model resolver filter is under active development.
+  The model routing filter is under active development.
 
 How it works
 ------------
@@ -41,8 +41,8 @@ By default, a request without a valid policy, or with a body other than uncompre
 503 response. On a dynamic forward proxy route such a request would otherwise go to the host the
 client names. ``continue_without_policy`` lets it continue without a plan instead.
 
-The :ref:`dynamic forward proxy filter <config_http_filters_dynamic_forward_proxy>` after the
-resolver, with ``allow_dynamic_host_from_filter_state`` set, resolves the hosts of all targets before
+The :ref:`dynamic forward proxy filter <config_http_filters_dynamic_forward_proxy>` after this
+filter, with ``allow_dynamic_host_from_filter_state`` set, resolves the hosts of all targets before
 the request reaches the router. Targets whose host fails to resolve get no attempt, and the retries
 are lowered to the number of targets that resolved.
 
@@ -53,7 +53,7 @@ An upstream :ref:`AI protocol manager <config_http_filters_ai_protocol_manager>`
 Request models
 --------------
 
-With ``prefer_request_models``, an AI protocol manager filter before the resolver parses the request
+With ``prefer_request_models``, an AI protocol manager filter before this filter parses the request
 body on a route that declares its request API. The request's ``models`` list, or else its ``model``,
 then selects the policy targets whose ``model`` matches, in the order the request lists them.
 Targets that serve the same model keep their policy order. When no target matches, for example for
@@ -118,9 +118,9 @@ The filters after the policy decision point:
 .. code-block:: yaml
 
   http_filters:
-  - name: envoy.filters.http.model_resolver
+  - name: envoy.filters.http.model_routing
     typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.model_resolver.v3.ModelResolver
+      "@type": type.googleapis.com/envoy.extensions.filters.http.model_routing.v3.ModelRouting
   - name: envoy.filters.http.dynamic_forward_proxy
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -174,7 +174,7 @@ Router upstream logs see each attempt's target with
 Statistics
 ----------
 
-The filter emits statistics in the ``http.<stat_prefix>.model_resolver.`` namespace.
+The filter emits statistics in the ``http.<stat_prefix>.model_routing.`` namespace.
 
 .. csv-table::
   :header: Name, Type, Description

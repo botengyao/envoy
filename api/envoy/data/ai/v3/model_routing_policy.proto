@@ -20,7 +20,7 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 
 // Ordered model routing decision for one request. An external policy decision point returns it,
 // for example as dynamic metadata from the external processing filter, and the
-// :ref:`model resolver filter <config_http_filters_model_resolver>` turns it into a plan that the
+// :ref:`model routing filter <config_http_filters_model_routing>` turns it into a plan that the
 // request's upstream attempts follow.
 message ModelRoutingPolicy {
   // Failure classes after which a request may move on to its next target. Each maps to a router

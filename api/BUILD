@@ -242,7 +242,7 @@ proto_library(
         "//envoy/extensions/filters/http/mcp/v3:pkg",
         "//envoy/extensions/filters/http/mcp_json_rest_bridge/v3:pkg",
         "//envoy/extensions/filters/http/mcp_router/v3:pkg",
-        "//envoy/extensions/filters/http/model_resolver/v3:pkg",
+        "//envoy/extensions/filters/http/model_routing/v3:pkg",
         "//envoy/extensions/filters/http/oauth2/v3:pkg",
         "//envoy/extensions/filters/http/on_demand/v3:pkg",
         "//envoy/extensions/filters/http/original_src/v3:pkg",

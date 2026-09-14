@@ -1,23 +1,23 @@
 syntax = "proto3";
 
-package envoy.extensions.filters.http.model_resolver.v3;
+package envoy.extensions.filters.http.model_routing.v3;
 
 import "xds/annotations/v3/status.proto";
 
 import "udpa/annotations/status.proto";
 
-option java_package = "io.envoyproxy.envoy.extensions.filters.http.model_resolver.v3";
-option java_outer_classname = "ModelResolverProto";
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.model_routing.v3";
+option java_outer_classname = "ModelRoutingProto";
 option java_multiple_files = true;
-option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/model_resolver/v3;model_resolverv3";
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/model_routing/v3;model_routingv3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 option (xds.annotations.v3.file_status).work_in_progress = true;
 
-// [#protodoc-title: Model resolver]
-// Model resolver :ref:`configuration overview <config_http_filters_model_resolver>`.
-// [#extension: envoy.filters.http.model_resolver]
+// [#protodoc-title: Model routing]
+// Model routing :ref:`configuration overview <config_http_filters_model_routing>`.
+// [#extension: envoy.filters.http.model_routing]
 
-message ModelResolver {
+message ModelRouting {
   // Dynamic metadata namespace holding the request's
   // :ref:`ModelRoutingPolicy <envoy_v3_api_msg_data.ai.v3.ModelRoutingPolicy>`, either as typed
   // metadata or as a ``Struct`` in the policy's JSON form. Defaults to ``envoy.ai.model_routing``.

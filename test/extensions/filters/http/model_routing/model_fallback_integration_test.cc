@@ -84,7 +84,7 @@ public:
           // Filters are prepended, so they are added in reverse order. Config modifiers run after
           // the fake upstreams exist, so target ports are known here.
           prependHttpFilter(hcm, dfpFilterYaml());
-          prependHttpFilter(hcm, resolverYaml());
+          prependHttpFilter(hcm, routingYaml());
           if (parse_request_) {
             prependHttpFilter(hcm, R"EOF(
 name: envoy.filters.http.ai_protocol_manager
@@ -226,11 +226,11 @@ typed_config:
                        absl::StrJoin(targets, ", "), fallback_on);
   }
 
-  std::string resolverYaml() const {
+  std::string routingYaml() const {
     return fmt::format(R"EOF(
-name: envoy.filters.http.model_resolver
+name: envoy.filters.http.model_routing
 typed_config:
-  "@type": type.googleapis.com/envoy.extensions.filters.http.model_resolver.v3.ModelResolver
+  "@type": type.googleapis.com/envoy.extensions.filters.http.model_routing.v3.ModelRouting
   prefer_request_models: {}
 )EOF",
                        prefer_request_models_);
@@ -336,7 +336,7 @@ TEST_P(ModelFallbackIntegrationTest, SameHostModelFallbackOnRateLimit) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_EQ(1, counter("cluster.ai_dfp.upstream_rq_retry"));
-  EXPECT_EQ(1, counter("http.config_test.model_resolver.plan_created"));
+  EXPECT_EQ(1, counter("http.config_test.model_routing.plan_created"));
 }
 
 // Each attempt reaches a different host with its own TLS identity, path and model.
@@ -373,8 +373,8 @@ TEST_P(ModelFallbackIntegrationTest, MissingPolicyFailsClosed) {
 
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("503", response->headers().getStatusValue());
-  EXPECT_EQ("model_resolver_no_policy", waitForAccessLog(access_log_name_));
-  EXPECT_EQ(1, counter("http.config_test.model_resolver.no_policy"));
+  EXPECT_EQ("model_routing_no_policy", waitForAccessLog(access_log_name_));
+  EXPECT_EQ(1, counter("http.config_test.model_routing.no_policy"));
 }
 
 // A target without its own path receives the request path after the route rewrite.

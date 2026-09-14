@@ -48,7 +48,7 @@ host when forwarding. See the example below within the configured routes.
   <envoy_v3_api_field_extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig.allow_dynamic_host_from_filter_state>`,
   a request that carries the ``envoy.upstream.dynamic_host_candidates`` filter state has every candidate
   host resolved before it continues, and ``x-envoy-max-retries`` is lowered to one less than the number of
-  candidates that resolved. The :ref:`model resolver <config_http_filters_model_resolver>` filter sets
+  candidates that resolved. The :ref:`model routing <config_http_filters_model_routing>` filter sets
   this filter state.
 
 .. note::

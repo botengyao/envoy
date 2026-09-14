@@ -4,7 +4,7 @@
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/extensions/common/dynamic_forward_proxy/dynamic_host_candidates.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
-#include "source/extensions/filters/http/model_resolver/filter.h"
+#include "source/extensions/filters/http/model_routing/filter.h"
 
 #include "test/mocks/http/mocks.h"
 #include "test/test_common/utility.h"
@@ -18,7 +18,7 @@ using testing::_;
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
-namespace ModelResolver {
+namespace ModelRouting {
 namespace {
 
 using DynamicHostCandidates = Envoy::Extensions::Common::DynamicForwardProxy::DynamicHostCandidates;
@@ -30,12 +30,12 @@ targets:
 - {host: c.example.com, model: model-c}
 )EOF";
 
-class ModelResolverFilterTest : public testing::Test {
+class ModelRoutingFilterTest : public testing::Test {
 protected:
   void initialize(absl::string_view config = "{}") {
-    ModelResolverProto proto;
+    ModelRoutingProto proto;
     TestUtility::loadFromYaml(std::string(config), proto);
-    filter_ = std::make_unique<ModelResolverFilter>(
+    filter_ = std::make_unique<ModelRoutingFilter>(
         std::make_shared<const FilterConfig>(proto, "test.", *stats_.rootScope()));
     filter_->setDecoderFilterCallbacks(callbacks_);
   }
@@ -76,19 +76,19 @@ protected:
   }
 
   uint64_t counter(absl::string_view name) {
-    return TestUtility::findCounter(stats_, absl::StrCat("test.model_resolver.", name))->value();
+    return TestUtility::findCounter(stats_, absl::StrCat("test.model_routing.", name))->value();
   }
 
   Stats::IsolatedStoreImpl stats_;
   NiceMock<Http::MockStreamDecoderFilterCallbacks> callbacks_;
-  std::unique_ptr<ModelResolverFilter> filter_;
+  std::unique_ptr<ModelRoutingFilter> filter_;
   Http::TestRequestHeaderMapImpl headers_{{":method", "POST"},
                                           {":path", "/v1/chat/completions"},
                                           {":authority", "gateway"},
                                           {"content-type", "application/json"}};
 };
 
-TEST_F(ModelResolverFilterTest, TypedPolicyBuildsPlanAndEnablesRetries) {
+TEST_F(ModelRoutingFilterTest, TypedPolicyBuildsPlanAndEnablesRetries) {
   initialize();
   setTypedPolicy(absl::StrCat(ThreeTargets, "decision_id: d-1\n"));
 
@@ -115,7 +115,7 @@ TEST_F(ModelResolverFilterTest, TypedPolicyBuildsPlanAndEnablesRetries) {
   EXPECT_EQ(1, counter("plan_created"));
 }
 
-TEST_F(ModelResolverFilterTest, StructPolicyConditionsAndPerTryTimeout) {
+TEST_F(ModelRoutingFilterTest, StructPolicyConditionsAndPerTryTimeout) {
   initialize();
   setStructPolicy(R"({"targets":[{"host":"a.example.com","model":"model-a"},
                                  {"host":"b.example.com","model":"model-b"}],
@@ -131,7 +131,7 @@ TEST_F(ModelResolverFilterTest, StructPolicyConditionsAndPerTryTimeout) {
   EXPECT_EQ("9000", headers_.get_("x-envoy-upstream-rq-per-try-timeout-ms"));
 }
 
-TEST_F(ModelResolverFilterTest, SingleTargetDisablesRouteRetries) {
+TEST_F(ModelRoutingFilterTest, SingleTargetDisablesRouteRetries) {
   initialize();
   setTypedPolicy("{targets: [{host: b.example.com, model: model-b}], per_try_timeout: 2s}");
 
@@ -142,7 +142,7 @@ TEST_F(ModelResolverFilterTest, SingleTargetDisablesRouteRetries) {
   EXPECT_EQ("2000", headers_.get_("x-envoy-upstream-rq-per-try-timeout-ms"));
 }
 
-TEST_F(ModelResolverFilterTest, ZeroPerTryTimeoutIgnored) {
+TEST_F(ModelRoutingFilterTest, ZeroPerTryTimeoutIgnored) {
   initialize();
   ModelRoutingPolicy policy;
   auto* target = policy.add_targets();
@@ -156,16 +156,16 @@ TEST_F(ModelResolverFilterTest, ZeroPerTryTimeoutIgnored) {
   EXPECT_FALSE(headers_.has("x-envoy-upstream-rq-per-try-timeout-ms"));
 }
 
-TEST_F(ModelResolverFilterTest, MissingPolicyRejectedByDefault) {
+TEST_F(ModelRoutingFilterTest, MissingPolicyRejectedByDefault) {
   initialize();
   EXPECT_CALL(callbacks_,
-              sendLocalReply(Http::Code::ServiceUnavailable, "", _, _, "model_resolver_no_policy"));
+              sendLocalReply(Http::Code::ServiceUnavailable, "", _, _, "model_routing_no_policy"));
   EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers_, false));
   EXPECT_EQ(nullptr, plan());
   EXPECT_EQ(1, counter("no_policy"));
 }
 
-TEST_F(ModelResolverFilterTest, MissingPolicyContinuesWhenAllowed) {
+TEST_F(ModelRoutingFilterTest, MissingPolicyContinuesWhenAllowed) {
   initialize("continue_without_policy: true");
   EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(headers_, false));
@@ -174,7 +174,7 @@ TEST_F(ModelResolverFilterTest, MissingPolicyContinuesWhenAllowed) {
   EXPECT_EQ(1, counter("no_policy"));
 }
 
-TEST_F(ModelResolverFilterTest, InvalidTargetRejectsPolicy) {
+TEST_F(ModelRoutingFilterTest, InvalidTargetRejectsPolicy) {
   initialize();
   const std::vector<std::string> invalid_targets = {
       R"({host: "a.example.com:443", model: m})",
@@ -186,7 +186,7 @@ TEST_F(ModelResolverFilterTest, InvalidTargetRejectsPolicy) {
       R"({host: a.example.com, model: "a\nb", path: "/v1/{model}"})",
   };
   EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::ServiceUnavailable, "", _, _,
-                                         "model_resolver_invalid_policy"))
+                                         "model_routing_invalid_policy"))
       .Times(invalid_targets.size());
   for (const std::string& target : invalid_targets) {
     setTypedPolicy(absl::StrCat("targets: [", target, "]"));
@@ -201,11 +201,11 @@ TEST_F(ModelResolverFilterTest, InvalidTargetRejectsPolicy) {
   ASSERT_NE(nullptr, plan());
 }
 
-TEST_F(ModelResolverFilterTest, BodyTheUpstreamFilterCannotRewrite) {
+TEST_F(ModelRoutingFilterTest, BodyTheUpstreamFilterCannotRewrite) {
   initialize();
   setTypedPolicy(ThreeTargets);
   EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::ServiceUnavailable, "", _, _,
-                                         "model_resolver_unsupported_body"))
+                                         "model_routing_unsupported_body"))
       .Times(2);
 
   headers_.setContentType("multipart/form-data; boundary=x");
@@ -218,7 +218,7 @@ TEST_F(ModelResolverFilterTest, BodyTheUpstreamFilterCannotRewrite) {
   EXPECT_EQ(2, counter("unsupported_body"));
 }
 
-TEST_F(ModelResolverFilterTest, IdentityEncodedJsonAndHeadersOnlyRequests) {
+TEST_F(ModelRoutingFilterTest, IdentityEncodedJsonAndHeadersOnlyRequests) {
   initialize();
   setTypedPolicy(ThreeTargets);
   headers_.setContentType("application/vnd.api+json");
@@ -230,7 +230,7 @@ TEST_F(ModelResolverFilterTest, IdentityEncodedJsonAndHeadersOnlyRequests) {
   EXPECT_EQ(2, counter("plan_created"));
 }
 
-TEST_F(ModelResolverFilterTest, TypedMetadataOfAnotherType) {
+TEST_F(ModelRoutingFilterTest, TypedMetadataOfAnotherType) {
   initialize("continue_without_policy: true");
   envoy::config::core::v3::Metadata other;
   std::ignore =
@@ -241,7 +241,7 @@ TEST_F(ModelResolverFilterTest, TypedMetadataOfAnotherType) {
   EXPECT_EQ(1, counter("invalid_policy"));
 }
 
-TEST_F(ModelResolverFilterTest, StructPolicyWithWrongShape) {
+TEST_F(ModelRoutingFilterTest, StructPolicyWithWrongShape) {
   initialize("continue_without_policy: true");
   setStructPolicy(R"({"targets":[{"host":{"name":"a.example.com"},"model":"m"}]})");
   filter_->decodeHeaders(headers_, false);
@@ -249,7 +249,7 @@ TEST_F(ModelResolverFilterTest, StructPolicyWithWrongShape) {
   EXPECT_EQ(1, counter("invalid_policy"));
 }
 
-TEST_F(ModelResolverFilterTest, PolicyOutOfBounds) {
+TEST_F(ModelRoutingFilterTest, PolicyOutOfBounds) {
   initialize("continue_without_policy: true");
   ModelRoutingPolicy policy;
   for (int i = 0; i < 17; ++i) {
@@ -275,7 +275,7 @@ TEST_F(ModelResolverFilterTest, PolicyOutOfBounds) {
   EXPECT_EQ(3, counter("invalid_policy"));
 }
 
-TEST_F(ModelResolverFilterTest, CustomPolicyNamespace) {
+TEST_F(ModelRoutingFilterTest, CustomPolicyNamespace) {
   initialize("policy_metadata_namespace: pdp.decision");
   ModelRoutingPolicy policy;
   TestUtility::loadFromYaml(std::string(ThreeTargets), policy);
@@ -286,7 +286,7 @@ TEST_F(ModelResolverFilterTest, CustomPolicyNamespace) {
   EXPECT_EQ("2", headers_.get_("x-envoy-max-retries"));
 }
 
-TEST_F(ModelResolverFilterTest, RequestModelsOrderThePlan) {
+TEST_F(ModelRoutingFilterTest, RequestModelsOrderThePlan) {
   initialize("prefer_request_models: true");
   setTypedPolicy(R"EOF(
 targets:
@@ -303,7 +303,7 @@ targets:
   EXPECT_EQ("2", headers_.get_("x-envoy-max-retries"));
 }
 
-TEST_F(ModelResolverFilterTest, RequestModelSelectsTargets) {
+TEST_F(ModelRoutingFilterTest, RequestModelSelectsTargets) {
   initialize("prefer_request_models: true");
   setTypedPolicy(ThreeTargets);
   setParsedRequestBody(R"({"model":"model-b","messages":[]})");
@@ -314,7 +314,7 @@ TEST_F(ModelResolverFilterTest, RequestModelSelectsTargets) {
   EXPECT_EQ("0", headers_.get_("x-envoy-max-retries"));
 }
 
-TEST_F(ModelResolverFilterTest, UnmatchedRequestModelsKeepThePolicy) {
+TEST_F(ModelRoutingFilterTest, UnmatchedRequestModelsKeepThePolicy) {
   initialize("prefer_request_models: true");
   setTypedPolicy(ThreeTargets);
   setParsedRequestBody(R"({"model":"auto"})");
@@ -325,7 +325,7 @@ TEST_F(ModelResolverFilterTest, UnmatchedRequestModelsKeepThePolicy) {
   EXPECT_EQ(1, counter("request_models_unmatched"));
 }
 
-TEST_F(ModelResolverFilterTest, RequestModelsIgnoredByDefault) {
+TEST_F(ModelRoutingFilterTest, RequestModelsIgnoredByDefault) {
   initialize();
   setTypedPolicy(ThreeTargets);
   setParsedRequestBody(R"({"model":"model-b"})");
@@ -337,7 +337,7 @@ TEST_F(ModelResolverFilterTest, RequestModelsIgnoredByDefault) {
 }
 
 } // namespace
-} // namespace ModelResolver
+} // namespace ModelRouting
 } // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

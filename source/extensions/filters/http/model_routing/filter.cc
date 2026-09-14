@@ -1,4 +1,4 @@
-#include "source/extensions/filters/http/model_resolver/filter.h"
+#include "source/extensions/filters/http/model_routing/filter.h"
 
 #include <algorithm>
 
@@ -19,7 +19,7 @@
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
-namespace ModelResolver {
+namespace ModelRouting {
 
 namespace {
 
@@ -179,29 +179,29 @@ std::vector<absl::string_view> requestModels(const StreamInfo::FilterState& filt
 
 } // namespace
 
-FilterConfig::FilterConfig(const ModelResolverProto& proto, const std::string& stats_prefix,
+FilterConfig::FilterConfig(const ModelRoutingProto& proto, const std::string& stats_prefix,
                            Stats::Scope& scope)
     : policy_namespace_(proto.policy_metadata_namespace().empty()
                             ? std::string(DefaultPolicyNamespace)
                             : proto.policy_metadata_namespace()),
       continue_without_policy_(proto.continue_without_policy()),
       prefer_request_models_(proto.prefer_request_models()),
-      stats_{ALL_MODEL_RESOLVER_STATS(
-          POOL_COUNTER_PREFIX(scope, absl::StrCat(stats_prefix, "model_resolver.")))} {}
+      stats_{ALL_MODEL_ROUTING_STATS(
+          POOL_COUNTER_PREFIX(scope, absl::StrCat(stats_prefix, "model_routing.")))} {}
 
 Envoy::Http::FilterHeadersStatus
-ModelResolverFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool end_stream) {
+ModelRoutingFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool end_stream) {
   ModelRoutingPolicy policy;
   switch (readPolicy(policy)) {
   case PolicyStatus::Missing:
-    return onUnusablePolicy(config_->stats().no_policy_, "model_resolver_no_policy");
+    return onUnusablePolicy(config_->stats().no_policy_, "model_routing_no_policy");
   case PolicyStatus::Invalid:
-    return onUnusablePolicy(config_->stats().invalid_policy_, "model_resolver_invalid_policy");
+    return onUnusablePolicy(config_->stats().invalid_policy_, "model_routing_invalid_policy");
   case PolicyStatus::Ok:
     break;
   }
   if (!end_stream && !rewritableBody(headers)) {
-    return onUnusablePolicy(config_->stats().unsupported_body_, "model_resolver_unsupported_body");
+    return onUnusablePolicy(config_->stats().unsupported_body_, "model_routing_unsupported_body");
   }
 
   std::vector<AiCommon::ModelTarget> targets;
@@ -227,8 +227,7 @@ ModelResolverFilter::decodeHeaders(Envoy::Http::RequestHeaderMap& headers, bool 
   return Envoy::Http::FilterHeadersStatus::Continue;
 }
 
-ModelResolverFilter::PolicyStatus
-ModelResolverFilter::readPolicy(ModelRoutingPolicy& policy) const {
+ModelRoutingFilter::PolicyStatus ModelRoutingFilter::readPolicy(ModelRoutingPolicy& policy) const {
   const auto& metadata = decoder_callbacks_->streamInfo().dynamicMetadata();
   if (const auto typed = metadata.typed_filter_metadata().find(config_->policyNamespace());
       typed != metadata.typed_filter_metadata().end()) {
@@ -254,8 +253,8 @@ ModelResolverFilter::readPolicy(ModelRoutingPolicy& policy) const {
   return validPolicy(policy) ? PolicyStatus::Ok : PolicyStatus::Invalid;
 }
 
-Envoy::Http::FilterHeadersStatus ModelResolverFilter::onUnusablePolicy(Stats::Counter& counter,
-                                                                       absl::string_view details) {
+Envoy::Http::FilterHeadersStatus ModelRoutingFilter::onUnusablePolicy(Stats::Counter& counter,
+                                                                      absl::string_view details) {
   counter.inc();
   if (config_->continueWithoutPolicy()) {
     return Envoy::Http::FilterHeadersStatus::Continue;
@@ -266,7 +265,7 @@ Envoy::Http::FilterHeadersStatus ModelResolverFilter::onUnusablePolicy(Stats::Co
 }
 
 std::vector<AiCommon::ModelTarget>
-ModelResolverFilter::orderByRequestModels(std::vector<AiCommon::ModelTarget> targets) const {
+ModelRoutingFilter::orderByRequestModels(std::vector<AiCommon::ModelTarget> targets) const {
   const std::vector<absl::string_view> models =
       requestModels(*decoder_callbacks_->streamInfo().filterState());
   if (models.empty()) {
@@ -289,7 +288,7 @@ ModelResolverFilter::orderByRequestModels(std::vector<AiCommon::ModelTarget> tar
   return ordered;
 }
 
-} // namespace ModelResolver
+} // namespace ModelRouting
 } // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

@@ -60,7 +60,7 @@ HTTP filters
   lua_filter
   mcp_filter
   mcp_router_filter
-  model_resolver_filter
+  model_routing_filter
   oauth2_filter
   on_demand_updates_filter
   original_src_filter
