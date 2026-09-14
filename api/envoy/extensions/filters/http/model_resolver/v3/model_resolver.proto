@@ -2,18 +2,9 @@ syntax = "proto3";
 
 package envoy.extensions.filters.http.model_resolver.v3;
 
-import "envoy/data/ai/v3/model_routing_policy.proto";
-import "envoy/extensions/common/dynamic_forward_proxy/v3/dns_cache.proto";
-import "envoy/extensions/transport_sockets/tls/v3/secret.proto";
-import "envoy/type/ai/v3/api_protocol.proto";
-
-import "google/protobuf/duration.proto";
-import "google/protobuf/wrappers.proto";
-
 import "xds/annotations/v3/status.proto";
 
 import "udpa/annotations/status.proto";
-import "validate/validate.proto";
 
 option java_package = "io.envoyproxy.envoy.extensions.filters.http.model_resolver.v3";
 option java_outer_classname = "ModelResolverProto";
@@ -26,86 +17,23 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // Model resolver :ref:`configuration overview <config_http_filters_model_resolver>`.
 // [#extension: envoy.filters.http.model_resolver]
 
-// [#next-free-field: 10]
 message ModelResolver {
   // Dynamic metadata namespace holding the request's
   // :ref:`ModelRoutingPolicy <envoy_v3_api_msg_data.ai.v3.ModelRoutingPolicy>`, either as typed
   // metadata or as a ``Struct`` in the policy's JSON form. Defaults to ``envoy.ai.model_routing``.
+  // The policy names the hosts that requests connect to, so only trusted filters may write this
+  // namespace.
   string policy_metadata_namespace = 1;
-
-  // Targets a policy can name, keyed by target ID. Policies name targets only by ID, so hosts,
-  // paths and credentials always come from this configuration.
-  map<string, ModelTarget> targets = 2 [(validate.rules).map = {
-    min_pairs: 1
-    keys {string {min_len: 1}}
-  }];
-
-  // The API protocol that clients use on routes with this filter. Plans skip targets that speak a
-  // different protocol, since the request is not translated.
-  type.ai.v3.ApiProtocol client_api_protocol = 3 [(validate.rules).enum = {defined_only: true}];
-
-  // Upper bound on the retries a plan allows, set through ``x-envoy-max-retries``. Defaults to 3.
-  google.protobuf.UInt32Value max_retries = 4;
-
-  // Fallback conditions used when a policy lists none. Defaults to ``CONNECT_FAILURE``,
-  // ``RATE_LIMITED``, ``OVERLOADED`` and ``GATEWAY_ERROR``.
-  repeated data.ai.v3.ModelRoutingPolicy.FallbackCondition default_fallback_on = 5;
-
-  // Upper bound on a policy's ``per_try_timeout``. A policy's value is ignored when this is unset.
-  google.protobuf.Duration max_per_try_timeout = 6 [(validate.rules).duration = {gt {}}];
 
   // If true, a request without a usable policy, or with a body other than uncompressed JSON,
   // continues without a plan. By default it gets a 503 response, because on a dynamic forward proxy
   // route a request without a plan goes to the host the client names.
-  bool continue_without_policy = 7;
+  bool continue_without_policy = 2;
 
-  // The DNS cache of the dynamic forward proxy cluster that serves the targets. When set with
-  // ``prewarm_fallback_targets``, the hosts of fallback targets are resolved in the background
-  // while the first attempt is in progress. It must be identical to the cluster's
-  // ``dns_cache_config``.
-  common.dynamic_forward_proxy.v3.DnsCacheConfig dns_cache_config = 8;
-
-  // Number of fallback targets, after the first plan entry, whose hosts are resolved in the
-  // background. Targets without a port are resolved on port 443, which matches the default port of
-  // a TLS cluster only.
-  uint32 prewarm_fallback_targets = 9 [(validate.rules).uint32 = {lte: 16}];
-}
-
-// [#next-free-field: 7]
-message ModelTarget {
-  // DNS name, IPv4 address or bracketed IPv6 address of the target, without a port. It is used by
-  // the dynamic forward proxy cluster and as the request authority.
-  string host = 1
-      [(validate.rules).string = {min_len: 1 well_known_regex: HTTP_HEADER_VALUE strict: false}];
-
-  // Port of the target. Zero uses the cluster's default port and leaves the port out of the
-  // request authority.
-  uint32 port = 2 [(validate.rules).uint32 = {lte: 65535}];
-
-  // Model name written to the request body's ``model`` field.
-  string model = 3 [(validate.rules).string = {min_len: 1}];
-
-  // Request path for the target, in which ``{model}`` is replaced with ``model``. Defaults to the
-  // client's request path.
-  string path = 4;
-
-  // API protocol the target speaks. Unset means the client API protocol.
-  type.ai.v3.ApiProtocol api_protocol = 5 [(validate.rules).enum = {defined_only: true}];
-
-  // Credential sent to this target. Credential headers of all targets are removed from requests
-  // to other targets.
-  Credential credential = 6;
-}
-
-message Credential {
-  // Header that carries the credential, for example ``authorization`` or ``x-api-key``.
-  string header_name = 1
-      [(validate.rules).string = {min_len: 1 well_known_regex: HTTP_HEADER_NAME strict: false}];
-
-  // Prefix added in front of the secret, for example ``Bearer``.
-  string value_prefix = 2;
-
-  // Generic secret holding the credential.
-  transport_sockets.tls.v3.SdsSecretConfig generic_secret = 3
-      [(validate.rules).message = {required: true}];
+  // If true, and an :ref:`AI protocol manager <config_http_filters_ai_protocol_manager>` filter
+  // earlier in the chain parsed the request body, the plan follows the models the request asks
+  // for. The request's ``models`` list, or else its ``model``, selects the policy targets whose
+  // ``model`` matches, in the order the request lists them, and the policy order breaks ties. When
+  // no target matches, the policy is used as it is.
+  bool prefer_request_models = 3;
 }

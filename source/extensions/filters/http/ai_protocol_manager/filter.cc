@@ -259,7 +259,6 @@ void AiProtocolManagerFilter::applyModelTarget(Http::RequestHeaderMap& headers) 
     return;
   }
   plan->applyToHeaders(index.value(), headers);
-  model_plan_ = plan;
   model_target_ = &plan->target(index.value());
   upstream_callbacks->upstreamStreamInfo().filterState()->setData(
       Envoy::Extensions::Common::Ai::ModelAttempt::key(),
@@ -464,11 +463,6 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
 
 Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseHeaderMap& headers,
                                                                  bool end_stream) {
-  if (model_plan_ != nullptr && request_headers_ != nullptr) {
-    // The request headers are on the wire by now, and the shared downstream map outlives this
-    // attempt: keep the target's credential out of access logs and internal redirects.
-    model_plan_->removeCredentials(*request_headers_);
-  }
   // The encode path is observe-only: headers are never held and the handler
   // selection below can only make the filter inert, never affect the response.
   if (config_ == nullptr || !config_->tokenUsageEnabled()) {

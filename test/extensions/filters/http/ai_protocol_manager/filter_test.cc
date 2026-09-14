@@ -1830,15 +1830,6 @@ TEST_F(AiProtocolManagerFilterTest, TrailersDroppedAfterPayloadRejection) {
 
 namespace AiCommon = Envoy::Extensions::Common::Ai;
 
-class StaticCredential : public AiCommon::CredentialSource {
-public:
-  explicit StaticCredential(std::string value) : value_(std::move(value)) {}
-  absl::string_view credential() const override { return value_; }
-
-private:
-  const std::string value_;
-};
-
 class FakeUpstreamStreamFilterCallbacks : public Http::UpstreamStreamFilterCallbacks {
 public:
   StreamInfo::StreamInfo& upstreamStreamInfo() override { return stream_info_; }
@@ -1872,20 +1863,10 @@ public:
     targets[0].host = "api.primary.example.com";
     targets[0].model = "model-a";
     targets[0].path = "/v1/chat/completions";
-    targets[0].credential_header = Http::LowerCaseString("authorization");
-    targets[0].credential_prefix = "Bearer ";
-    targets[0].credential = std::make_shared<StaticCredential>("primary-token");
     targets[1].id = "fallback";
     targets[1].host = "api.fallback.example.com";
     targets[1].model = "model-b";
-    targets[1].credential_header = Http::LowerCaseString("x-api-key");
-    targets[1].credential = std::make_shared<StaticCredential>("fallback-key");
-    auto registry = std::make_shared<const AiCommon::ModelTargetRegistry>(std::move(targets));
-    auto plan = std::make_shared<AiCommon::ModelRoutePlan>(
-        registry,
-        std::vector<const AiCommon::ModelTarget*>{registry->find("primary"),
-                                                  registry->find("fallback")},
-        "decision-1");
+    auto plan = std::make_shared<AiCommon::ModelRoutePlan>(std::move(targets), "decision-1");
     plan_ = plan.get();
     callbacks_.stream_info_.filterState()->setData(AiCommon::ModelRoutePlan::key(), plan,
                                                    StreamInfo::FilterState::LifeSpan::FilterChain);
@@ -1895,9 +1876,7 @@ public:
     request_headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"},
                                                       {":path", "/chat/completions"},
                                                       {":authority", "gateway.example.com"},
-                                                      {"content-type", "application/json"},
-                                                      {"authorization", "Bearer client-token"},
-                                                      {"x-api-key", "client-key"}};
+                                                      {"content-type", "application/json"}};
   }
 
   const AiCommon::ModelAttempt* modelAttempt() {
@@ -1915,8 +1894,6 @@ TEST_F(AiProtocolManagerModelTargetTest, AttemptUsesSelectedTarget) {
 
   EXPECT_EQ(request_headers_.getPathValue(), "/v1/chat/completions");
   EXPECT_EQ(request_headers_.getHostValue(), "api.primary.example.com");
-  EXPECT_EQ(request_headers_.get_("authorization"), "Bearer primary-token");
-  EXPECT_FALSE(request_headers_.has("x-api-key"));
   EXPECT_EQ(counterValue("model_target_applied"), 1);
   ASSERT_NE(modelAttempt(), nullptr);
   EXPECT_EQ(modelAttempt()->serializeAsString(), "primary");
@@ -1935,8 +1912,6 @@ TEST_F(AiProtocolManagerModelTargetTest, RetryUsesNextTargetOnRewrittenHeaders) 
 
   EXPECT_EQ(request_headers_.getPathValue(), "/chat/completions");
   EXPECT_EQ(request_headers_.getHostValue(), "api.fallback.example.com");
-  EXPECT_EQ(request_headers_.get_("x-api-key"), "fallback-key");
-  EXPECT_FALSE(request_headers_.has("authorization"));
   EXPECT_EQ(counterValue("model_target_applied"), 2);
   ASSERT_NE(modelAttempt(), nullptr);
   EXPECT_EQ(modelAttempt()->serializeAsString(), "fallback");
@@ -1949,7 +1924,6 @@ TEST_F(AiProtocolManagerModelTargetTest, DownstreamChainIgnoresPlan) {
   EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
 
   EXPECT_EQ(request_headers_.getHostValue(), "gateway.example.com");
-  EXPECT_EQ(request_headers_.get_("authorization"), "Bearer client-token");
   EXPECT_EQ(counterValue("model_target_applied"), 0);
 }
 
@@ -1977,17 +1951,6 @@ TEST_F(AiProtocolManagerModelTargetTest, RewritesBodyModel) {
   EXPECT_EQ(
       nlohmann::json::parse(injected_.toString()),
       nlohmann::json::parse(R"({"model":"model-a","messages":[{"role":"user","content":"hi"}]})"));
-}
-
-TEST_F(AiProtocolManagerModelTargetTest, ResponseRemovesCredentialsFromRequestHeaders) {
-  plan_->selectForAttempt(1);
-  EXPECT_EQ(filter_->decodeHeaders(request_headers_, true), Http::FilterHeadersStatus::Continue);
-  ASSERT_TRUE(request_headers_.has("authorization"));
-
-  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
-  EXPECT_EQ(filter_->encodeHeaders(response_headers, true), Http::FilterHeadersStatus::Continue);
-  EXPECT_FALSE(request_headers_.has("authorization"));
-  EXPECT_FALSE(request_headers_.has("x-api-key"));
 }
 
 } // namespace

@@ -19,42 +19,56 @@ How it works
 
 A policy decision point, for example an :ref:`external processor <config_http_filters_ext_proc>`,
 writes a :ref:`ModelRoutingPolicy <envoy_v3_api_msg_data.ai.v3.ModelRoutingPolicy>` to dynamic
-metadata. The policy lists target IDs in preference order. Hosts, paths and credentials only come
-from the filter configuration, so the policy can only choose among configured destinations.
+metadata. The policy lists targets in preference order, and each target names the host, port, model
+and optional path of one endpoint. The filter has no targets of its own, so only trusted filters may
+write the policy's metadata namespace.
 
-For each request that carries a policy, the filter:
+For each request that carries a valid policy, the filter:
 
-#. Drops unknown target IDs and targets whose API protocol differs from ``client_api_protocol``.
+#. Optionally orders the targets by the models the request asks for, see `Request models`_.
 #. Stores the ordered targets in filter state under ``envoy.ai.model_route_plan``. The same object
    is the ``envoy.upstream.dynamic_host_candidates`` host list of the
    :ref:`dynamic forward proxy cluster <envoy_v3_api_msg_extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig>`,
    so each upstream attempt connects to the host of the next target.
-#. Sets ``x-envoy-max-retries`` to one less than the number of targets, capped by ``max_retries``,
-   and, for plans with more than one target, sets ``x-envoy-retry-on`` and
-   ``x-envoy-retriable-status-codes`` from the policy's fallback conditions.
+#. Sets ``x-envoy-max-retries`` to one less than the number of targets and, for plans with more than
+   one target, sets ``x-envoy-retry-on`` and ``x-envoy-retriable-status-codes`` from the policy's
+   fallback conditions.
 #. Sets ``x-envoy-hedge-on-per-try-timeout: false``, because all attempts of a request share one
-   request header map.
-#. Sets ``x-envoy-upstream-rq-per-try-timeout-ms`` from the policy's per-try timeout when
-   ``max_per_try_timeout`` is configured, capped by it.
-#. Optionally resolves the hosts of fallback targets in the background.
+   request header map, and sets ``x-envoy-upstream-rq-per-try-timeout-ms`` from the policy's
+   per-try timeout.
 
-By default, a request without a usable policy, or with a body other than uncompressed JSON, gets a
+By default, a request without a valid policy, or with a body other than uncompressed JSON, gets a
 503 response. On a dynamic forward proxy route such a request would otherwise go to the host the
 client names. ``continue_without_policy`` lets it continue without a plan instead.
 
+The :ref:`dynamic forward proxy filter <config_http_filters_dynamic_forward_proxy>` after the
+resolver, with ``allow_dynamic_host_from_filter_state`` set, resolves the hosts of all targets before
+the request reaches the router. Targets whose host fails to resolve get no attempt, and the retries
+are lowered to the number of targets that resolved.
+
 An upstream :ref:`AI protocol manager <config_http_filters_ai_protocol_manager>` filter with
 ``request_handling`` enabled then rewrites each attempt for its target: the ``:path``, the
-``:authority``, the credential header and the body's ``model`` field. The credential headers of all
-targets are removed first, so a credential never reaches another target, and they are removed again
-once the response starts.
+``:authority`` and the body's ``model`` field.
+
+Request models
+--------------
+
+With ``prefer_request_models``, an AI protocol manager filter before the resolver parses the request
+body on a route that declares its request API. The request's ``models`` list, or else its ``model``,
+then selects the policy targets whose ``model`` matches, in the order the request lists them.
+Targets that serve the same model keep their policy order. When no target matches, for example for
+``"model": "auto"``, the policy is used as it is. The request can only choose among the targets of
+the policy.
 
 Deployment notes
 ----------------
 
 * Enable ``tls_identity_from_host`` on the dynamic forward proxy cluster, since the attempts of one
   request connect to different hosts.
-* Do not add the dynamic forward proxy HTTP filter to these routes. It only resolves the request's
-  ``:authority``.
+* The filter does not handle credentials. Remove the client's credential with the route's
+  ``request_headers_to_remove``, and add each provider's credential with an upstream filter after
+  the AI protocol manager, for example ``envoy.filters.http.credential_injector`` selected by the
+  rewritten ``:authority``.
 * The retry headers are merged with the route's retry policy: route ``retry_on`` conditions still
   apply and ``retriable_request_headers`` can disable retries. Leave the route without its own retry
   policy.
@@ -66,14 +80,40 @@ Deployment notes
 Limitations
 -----------
 
-* A target whose host fails to resolve is skipped within an attempt without using a retry. The
-  router can then run out of targets before it runs out of retries, and the extra retry ends with a
-  503 ``dfp_host_candidates_exhausted`` instead of the last provider response.
+* A host that resolved when the request started, but fails to resolve again before its attempt, is
+  skipped within that attempt. The router can then run out of targets before it runs out of
+  retries, and the extra retry ends with a 503 ``dfp_host_candidates_exhausted``.
 * DNS resolution of targets is not bounded by the per-try timeout; ``dns_query_timeout`` of the DNS
   cache bounds each lookup.
 
 Example
 -------
+
+A policy in the JSON form that a policy decision point can return as ``envoy.ai.model_routing``
+dynamic metadata:
+
+.. code-block:: json
+
+  {
+    "targets": [
+      {
+        "id": "vertex",
+        "host": "us-central1-aiplatform.googleapis.com",
+        "model": "google/gemini-2.5-pro",
+        "path": "/v1/projects/example/locations/us-central1/endpoints/openapi/chat/completions"
+      },
+      {
+        "id": "anthropic",
+        "host": "api.anthropic.com",
+        "model": "claude-sonnet-4-5",
+        "path": "/v1/chat/completions"
+      }
+    ],
+    "fallback_on": ["CONNECT_FAILURE", "RATE_LIMITED", "OVERLOADED"],
+    "decision_id": "d-42"
+  }
+
+The filters after the policy decision point:
 
 .. code-block:: yaml
 
@@ -81,35 +121,35 @@ Example
   - name: envoy.filters.http.model_resolver
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.http.model_resolver.v3.ModelResolver
-      client_api_protocol: OPENAI_CHAT_COMPLETIONS
-      max_retries: 3
-      targets:
-        vertex-pro:
-          host: us-central1-aiplatform.googleapis.com
-          model: google/gemini-2.5-pro
-          path: /v1/projects/example/locations/us-central1/endpoints/openapi/chat/completions
-          credential:
-            header_name: authorization
-            value_prefix: "Bearer "
-            generic_secret: {name: vertex-token}
-        anthropic:
-          host: api.anthropic.com
-          model: claude-sonnet-4-5
-          path: /v1/chat/completions
-          credential:
-            header_name: x-api-key
-            generic_secret: {name: anthropic-key}
+  - name: envoy.filters.http.dynamic_forward_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+      allow_dynamic_host_from_filter_state: true
+      dns_cache_config:
+        name: ai_dns
+        dns_lookup_family: V4_ONLY
   - name: envoy.filters.http.router
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
-The upstream filters of the dynamic forward proxy cluster:
+The dynamic forward proxy cluster, which uses the same DNS cache:
 
 .. code-block:: yaml
 
+  name: ai_dfp
+  lb_policy: CLUSTER_PROVIDED
+  cluster_type:
+    name: envoy.clusters.dynamic_forward_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+      tls_identity_from_host: true
+      dns_cache_config:
+        name: ai_dns
+        dns_lookup_family: V4_ONLY
   typed_extension_protocol_options:
     envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
       "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+      auto_config: {}
       http_filters:
       - name: envoy.filters.http.ai_protocol_manager
         typed_config:
@@ -142,9 +182,6 @@ The filter emits statistics in the ``http.<stat_prefix>.model_resolver.`` namesp
 
   plan_created, Counter, Requests that got a plan
   no_policy, Counter, Requests without a policy
-  invalid_policy, Counter, Requests whose policy was malformed or named no usable target
+  invalid_policy, Counter, Requests whose policy was malformed or named an invalid target
   unsupported_body, Counter, Requests with a policy whose body is not uncompressed JSON
-  unknown_target, Counter, Policy target IDs missing from the configuration
-  incompatible_target, Counter, Policy targets that speak another API protocol
-  prewarm_started, Counter, Background lookups started for fallback targets
-  prewarm_overflow, Counter, Background lookups skipped by the DNS cache circuit breaker
+  request_models_unmatched, Counter, Requests whose models matched no policy target

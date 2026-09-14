@@ -1,5 +1,7 @@
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+#include "envoy/type/ai/v3/api_protocol.pb.h"
 
 #include "source/common/tls/ssl_handshaker.h"
 
@@ -10,6 +12,8 @@
 #include "test/test_common/threadsafe_singleton_injector.h"
 
 #include "absl/strings/match.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "gtest/gtest.h"
 
 using testing::HasSubstr;
@@ -34,6 +38,8 @@ constexpr absl::string_view CentralPath =
 constexpr absl::string_view EastPath =
     "/v1/projects/demo/locations/us-east1/endpoints/openapi/chat/completions";
 constexpr absl::string_view AnthropicPath = "/v1/chat/completions";
+constexpr absl::string_view ChatBody =
+    R"({"model":"auto","messages":[{"role":"user","content":"hello"}]})";
 
 class ModelFallbackIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                      public HttpIntegrationTest {
@@ -62,10 +68,6 @@ public:
       bootstrap.mutable_static_resources()->clear_clusters();
       TestUtility::loadFromYaml(clusterYaml(),
                                 *bootstrap.mutable_static_resources()->add_clusters());
-      TestUtility::loadFromYaml(secretYaml("vertex-token", "vertex-secret"),
-                                *bootstrap.mutable_static_resources()->add_secrets());
-      TestUtility::loadFromYaml(secretYaml("anthropic-key", "anthropic-secret"),
-                                *bootstrap.mutable_static_resources()->add_secrets());
     });
     config_helper_.addConfigModifier(
         [this, target_ids, fallback_on](
@@ -73,12 +75,32 @@ public:
                 hcm) {
           auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
           route->mutable_route()->set_cluster("ai_dfp");
+          // The client's credential is for the gateway, not for the providers.
+          route->add_request_headers_to_remove("authorization");
           if (rewrite_openai_prefix_) {
             route->mutable_match()->set_prefix("/openai/");
             route->mutable_route()->set_prefix_rewrite("/");
           }
-          // Config modifiers run after the fake upstreams exist, so target ports are known here.
+          // Filters are prepended, so they are added in reverse order. Config modifiers run after
+          // the fake upstreams exist, so target ports are known here.
+          prependHttpFilter(hcm, dfpFilterYaml());
           prependHttpFilter(hcm, resolverYaml());
+          if (parse_request_) {
+            prependHttpFilter(hcm, R"EOF(
+name: envoy.filters.http.ai_protocol_manager
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling: {}
+)EOF");
+            envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
+                per_route;
+            per_route.mutable_request()->set_api_protocol(
+                envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+            std::ignore =
+                (*route
+                      ->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
+                    .PackFrom(per_route);
+          }
           if (!target_ids.empty()) {
             prependHttpFilter(hcm, policyYaml(target_ids, fallback_on));
           }
@@ -86,7 +108,8 @@ public:
     HttpIntegrationTest::initialize();
   }
 
-  IntegrationStreamDecoderPtr sendChatRequest(const std::string& path = "/v1/chat/completions") {
+  IntegrationStreamDecoderPtr sendChatRequest(const std::string& path = "/v1/chat/completions",
+                                              absl::string_view body = ChatBody) {
     codec_client_ = makeHttpConnection(lookupPort("http"));
     return codec_client_->makeRequestWithBody(
         Http::TestRequestHeaderMapImpl{{":method", "POST"},
@@ -95,7 +118,7 @@ public:
                                        {":authority", "gateway.example.com"},
                                        {"content-type", "application/json"},
                                        {"authorization", "Bearer client-token"}},
-        R"({"model":"auto","messages":[{"role":"user","content":"hello"}]})");
+        std::string(body));
   }
 
   void waitForAttempt(int upstream) {
@@ -137,15 +160,6 @@ public:
     EXPECT_THAT(upstream_request_->body().toString(),
                 HasSubstr(absl::StrCat("\"model\":\"", model, "\"")));
     EXPECT_EQ(host, serverName());
-  }
-
-  void expectVertexCredential() {
-    EXPECT_EQ("Bearer vertex-secret", header("authorization"));
-    EXPECT_EQ("", header("x-api-key"));
-  }
-
-  void expectAnthropicCredential() {
-    EXPECT_EQ("anthropic-secret", header("x-api-key"));
     EXPECT_EQ("", header("authorization"));
   }
 
@@ -166,17 +180,37 @@ private:
     }
   }
 
-  static std::string secretYaml(absl::string_view name, absl::string_view value) {
-    return fmt::format(R"EOF(
-name: {}
-generic_secret:
-  secret:
-    inline_string: {}
-)EOF",
-                       name, value);
+  std::string targetYaml(absl::string_view name) const {
+    const auto target = [name](absl::string_view host, uint32_t target_port,
+                               absl::string_view model, absl::string_view path) {
+      return absl::StrCat("{id: ", name, ", host: ", host, ", port: ", target_port,
+                          ", model: ", model,
+                          path.empty() ? "" : absl::StrCat(", path: \"", path, "\""), "}");
+    };
+    if (name == "vertex-pro") {
+      return target("vertex-us-central1.lyft.com", port(0), "gemini-2.5-pro", CentralPath);
+    }
+    if (name == "vertex-flash") {
+      return target("vertex-us-central1.lyft.com", port(0), "gemini-2.5-flash", CentralPath);
+    }
+    if (name == "vertex-east") {
+      return target("vertex-us-east1.lyft.com", port(1), "gemini-2.5-pro", EastPath);
+    }
+    if (name == "anthropic") {
+      return target("anthropic.lyft.com", port(2), "claude-sonnet-4-5", AnthropicPath);
+    }
+    if (name == "passthrough") {
+      return target("anthropic.lyft.com", port(2), "claude-sonnet-4-5", "");
+    }
+    EXPECT_EQ("unresolvable", name);
+    return target("doesnotexist.example.com", port(2), "never-used", "");
   }
 
-  static std::string policyYaml(const std::string& target_ids, const std::string& fallback_on) {
+  std::string policyYaml(const std::string& target_ids, const std::string& fallback_on) const {
+    std::vector<std::string> targets;
+    for (absl::string_view name : absl::StrSplit(target_ids, ", ")) {
+      targets.push_back(targetYaml(name));
+    }
     return fmt::format(R"EOF(
 name: envoy.filters.http.set_metadata
 typed_config:
@@ -185,11 +219,11 @@ typed_config:
   - metadata_namespace: envoy.ai.model_routing
     typed_value:
       "@type": type.googleapis.com/envoy.data.ai.v3.ModelRoutingPolicy
-      target_ids: [{}]
+      targets: [{}]
       fallback_on: [{}]
       decision_id: decision-1
 )EOF",
-                       target_ids, fallback_on);
+                       absl::StrJoin(targets, ", "), fallback_on);
   }
 
   std::string resolverYaml() const {
@@ -197,61 +231,38 @@ typed_config:
 name: envoy.filters.http.model_resolver
 typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.model_resolver.v3.ModelResolver
-  client_api_protocol: OPENAI_CHAT_COMPLETIONS
-  targets:
-    vertex-pro:
-      host: vertex-us-central1.lyft.com
-      port: {0}
-      model: gemini-2.5-pro
-      path: {3}
-      credential:
-        header_name: authorization
-        value_prefix: "Bearer "
-        generic_secret: {{name: vertex-token}}
-    vertex-flash:
-      host: vertex-us-central1.lyft.com
-      port: {0}
-      model: gemini-2.5-flash
-      path: {3}
-      credential:
-        header_name: authorization
-        value_prefix: "Bearer "
-        generic_secret: {{name: vertex-token}}
-    vertex-east:
-      host: vertex-us-east1.lyft.com
-      port: {1}
-      model: gemini-2.5-pro
-      path: {4}
-      credential:
-        header_name: authorization
-        value_prefix: "Bearer "
-        generic_secret: {{name: vertex-token}}
-    anthropic:
-      host: anthropic.lyft.com
-      port: {2}
-      model: claude-sonnet-4-5
-      path: {5}
-      credential:
-        header_name: x-api-key
-        generic_secret: {{name: anthropic-key}}
-    passthrough:
-      host: anthropic.lyft.com
-      port: {2}
-      model: claude-sonnet-4-5
-      credential:
-        header_name: x-api-key
-        generic_secret: {{name: anthropic-key}}
-    unresolvable:
-      host: doesnotexist.example.com
-      port: {2}
-      model: never-used
-    responses-only:
-      host: anthropic.lyft.com
-      port: {2}
-      model: claude-sonnet-4-5
-      api_protocol: OPENAI_RESPONSES
+  prefer_request_models: {}
 )EOF",
-                       port(0), port(1), port(2), CentralPath, EastPath, AnthropicPath);
+                       prefer_request_models_);
+  }
+
+  // The HTTP filter and the cluster share one DNS cache, so their configurations must match.
+  std::string dnsCacheYaml(absl::string_view indent) const {
+    const std::string yaml = fmt::format(R"EOF(
+name: ai_dns
+dns_lookup_family: {}
+typed_dns_resolver_config:
+  name: envoy.network.dns_resolver.getaddrinfo
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.getaddrinfo.v3.GetAddrInfoDnsResolverConfig
+)EOF",
+                                         Network::Test::ipVersionToDnsFamily(GetParam()));
+    std::vector<std::string> lines;
+    for (absl::string_view line : absl::StrSplit(yaml, '\n', absl::SkipEmpty())) {
+      lines.push_back(absl::StrCat(indent, line));
+    }
+    return absl::StrJoin(lines, "\n");
+  }
+
+  std::string dfpFilterYaml() const {
+    return absl::StrCat(R"EOF(
+name: envoy.filters.http.dynamic_forward_proxy
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+  allow_dynamic_host_from_filter_state: true
+  dns_cache_config:
+)EOF",
+                        dnsCacheYaml("    "), "\n");
   }
 
   std::string clusterYaml() const {
@@ -266,12 +277,7 @@ cluster_type:
     "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
     tls_identity_from_host: true
     dns_cache_config:
-      name: ai_dns
-      dns_lookup_family: {}
-      typed_dns_resolver_config:
-        name: envoy.network.dns_resolver.getaddrinfo
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.getaddrinfo.v3.GetAddrInfoDnsResolverConfig
+{}
 typed_extension_protocol_options:
   envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
     "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -297,7 +303,7 @@ transport_socket:
         trusted_ca:
           filename: {}
 )EOF",
-        Network::Test::ipVersionToDnsFamily(GetParam()),
+        dnsCacheYaml("      "),
         TestEnvironment::runfilesPath("test/config/integration/certs/upstreamcacert.pem"));
   }
 
@@ -306,6 +312,8 @@ transport_socket:
 
 protected:
   bool rewrite_openai_prefix_{false};
+  bool parse_request_{false};
+  bool prefer_request_models_{false};
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, ModelFallbackIntegrationTest,
@@ -319,12 +327,10 @@ TEST_P(ModelFallbackIntegrationTest, SameHostModelFallbackOnRateLimit) {
 
   waitForAttempt(0);
   expectAttempt(0, "vertex-us-central1.lyft.com", CentralPath, "gemini-2.5-pro");
-  expectVertexCredential();
   failAttempt("429");
 
   waitForAttempt(0);
   expectAttempt(0, "vertex-us-central1.lyft.com", CentralPath, "gemini-2.5-flash");
-  expectVertexCredential();
   succeedAttempt();
 
   ASSERT_TRUE(response->waitForEndStream());
@@ -333,34 +339,30 @@ TEST_P(ModelFallbackIntegrationTest, SameHostModelFallbackOnRateLimit) {
   EXPECT_EQ(1, counter("http.config_test.model_resolver.plan_created"));
 }
 
-// Each attempt reaches a different host with its own TLS identity, path, model and credential.
+// Each attempt reaches a different host with its own TLS identity, path and model.
 TEST_P(ModelFallbackIntegrationTest, CrossRegionThenCrossProviderFallback) {
   useAccessLog("%FILTER_STATE(envoy.ai.model_route_plan:FIELD:selected_target)% "
                "%FILTER_STATE(envoy.ai.model_route_plan:FIELD:decision_id)% "
-               "%UPSTREAM_REQUEST_ATTEMPT_COUNT% %REQ(authorization)% %REQ(x-api-key)%");
+               "%UPSTREAM_REQUEST_ATTEMPT_COUNT% %REQ(authorization)%");
   initializeWithPolicy("vertex-pro, vertex-east, anthropic");
   auto response = sendChatRequest();
 
   waitForAttempt(0);
   expectAttempt(0, "vertex-us-central1.lyft.com", CentralPath, "gemini-2.5-pro");
-  expectVertexCredential();
   failAttempt("503");
 
   waitForAttempt(1);
   expectAttempt(1, "vertex-us-east1.lyft.com", EastPath, "gemini-2.5-pro");
-  expectVertexCredential();
   failAttempt("503");
 
   waitForAttempt(2);
   expectAttempt(2, "anthropic.lyft.com", AnthropicPath, "claude-sonnet-4-5");
-  expectAnthropicCredential();
   succeedAttempt();
 
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_EQ(2, counter("cluster.ai_dfp.upstream_rq_retry"));
-  // Provider credentials do not stay in the downstream request headers.
-  EXPECT_EQ("anthropic decision-1 3 - -", waitForAccessLog(access_log_name_));
+  EXPECT_EQ("anthropic decision-1 3 -", waitForAccessLog(access_log_name_));
 }
 
 // Without a policy the request is rejected rather than sent to the authority the client names.
@@ -383,15 +385,14 @@ TEST_P(ModelFallbackIntegrationTest, TargetWithoutPathKeepsTheRewrittenPath) {
 
   waitForAttempt(2);
   expectAttempt(2, "anthropic.lyft.com", "/v1/chat/completions", "claude-sonnet-4-5");
-  expectAnthropicCredential();
   succeedAttempt();
 
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
-// A target whose host does not resolve is skipped inside the attempt, without spending a retry.
-TEST_P(ModelFallbackIntegrationTest, UnresolvableTargetSkippedWithinAttempt) {
+// A target whose host does not resolve gets no attempt.
+TEST_P(ModelFallbackIntegrationTest, UnresolvableTargetSkipped) {
   initializeWithPolicy("unresolvable, vertex-pro");
   auto response = sendChatRequest();
 
@@ -402,6 +403,24 @@ TEST_P(ModelFallbackIntegrationTest, UnresolvableTargetSkippedWithinAttempt) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_EQ(0, counter("cluster.ai_dfp.upstream_rq_retry"));
+}
+
+// The dynamic forward proxy filter resolves every target first and limits the retries to the
+// targets that resolved, so the client gets the last provider's error rather than a local reply.
+TEST_P(ModelFallbackIntegrationTest, UnresolvableTargetLeavesNoExtraRetry) {
+  initializeWithPolicy("vertex-pro, unresolvable, vertex-east");
+  auto response = sendChatRequest();
+
+  waitForAttempt(0);
+  failAttempt("429");
+
+  waitForAttempt(1);
+  expectAttempt(1, "vertex-us-east1.lyft.com", EastPath, "gemini-2.5-pro");
+  failAttempt("429");
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("429", response->headers().getStatusValue());
+  EXPECT_EQ(1, counter("cluster.ai_dfp.upstream_rq_retry"));
 }
 
 // A client error is not a fallback condition, so the provider response is returned as is.
@@ -428,28 +447,11 @@ TEST_P(ModelFallbackIntegrationTest, ExhaustedPlanReturnsLastProviderError) {
   waitForAttempt(0);
   failAttempt("503");
   waitForAttempt(2);
-  expectAnthropicCredential();
   failAttempt("529");
 
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("529", response->headers().getStatusValue());
   EXPECT_EQ(1, counter("cluster.ai_dfp.upstream_rq_retry"));
-}
-
-// Unknown and protocol-incompatible targets are dropped, leaving a single-target plan.
-TEST_P(ModelFallbackIntegrationTest, UnusableTargetsAreDropped) {
-  initializeWithPolicy("responses-only, missing, vertex-east");
-  auto response = sendChatRequest();
-
-  waitForAttempt(1);
-  expectAttempt(1, "vertex-us-east1.lyft.com", EastPath, "gemini-2.5-pro");
-  failAttempt("503");
-
-  ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_EQ("503", response->headers().getStatusValue());
-  EXPECT_EQ(1, counter("http.config_test.model_resolver.unknown_target"));
-  EXPECT_EQ(1, counter("http.config_test.model_resolver.incompatible_target"));
-  EXPECT_EQ(0, counter("cluster.ai_dfp.upstream_rq_retry"));
 }
 
 // The policy's fallback conditions replace the defaults.
@@ -463,6 +465,28 @@ TEST_P(ModelFallbackIntegrationTest, PolicyFallbackConditionsReplaceDefaults) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("429", response->headers().getStatusValue());
   EXPECT_EQ(0, counter("cluster.ai_dfp.upstream_rq_retry"));
+}
+
+// The models the client lists, as parsed by the AI protocol manager, reorder the policy.
+TEST_P(ModelFallbackIntegrationTest, RequestModelsReorderThePolicy) {
+  parse_request_ = true;
+  prefer_request_models_ = true;
+  initializeWithPolicy("vertex-pro, anthropic");
+  auto response = sendChatRequest(
+      "/v1/chat/completions",
+      R"({"model":"auto","models":["claude-sonnet-4-5","gemini-2.5-pro"],"messages":[{"role":"user","content":"hello"}]})");
+
+  waitForAttempt(2);
+  expectAttempt(2, "anthropic.lyft.com", AnthropicPath, "claude-sonnet-4-5");
+  failAttempt("429");
+
+  waitForAttempt(0);
+  expectAttempt(0, "vertex-us-central1.lyft.com", CentralPath, "gemini-2.5-pro");
+  succeedAttempt();
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(1, counter("cluster.ai_dfp.upstream_rq_retry"));
 }
 
 } // namespace

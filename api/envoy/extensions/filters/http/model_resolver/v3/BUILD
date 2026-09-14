@@ -6,10 +6,6 @@ licenses(["notice"])  # Apache 2
 
 api_proto_package(
     deps = [
-        "//envoy/data/ai/v3:pkg",
-        "//envoy/extensions/common/dynamic_forward_proxy/v3:pkg",
-        "//envoy/extensions/transport_sockets/tls/v3:pkg",
-        "//envoy/type/ai/v3:pkg",
         "@xds//udpa/annotations:pkg",
         "@xds//xds/annotations/v3:pkg",
     ],

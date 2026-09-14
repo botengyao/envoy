@@ -18,14 +18,14 @@ envoy_extension_cc_test(
     rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/stats:isolated_store_lib",
+        "//source/extensions/common/dynamic_forward_proxy:dynamic_host_candidates_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//source/extensions/filters/http/model_resolver:filter_lib",
-        "//test/extensions/common/dynamic_forward_proxy:mocks",
         "//test/mocks/http:http_mocks",
-        "//test/mocks/server:server_factory_context_mocks",
-        "//test/mocks/upstream:basic_resource_limit_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
+        "@nlohmann_json//:json",
     ],
 )
 
@@ -39,12 +39,15 @@ envoy_extension_cc_test(
     deps = [
         "//source/extensions/clusters/dynamic_forward_proxy:cluster",
         "//source/extensions/filters/http/ai_protocol_manager:config",
+        "//source/extensions/filters/http/dynamic_forward_proxy:config",
         "//source/extensions/filters/http/model_resolver:config",
         "//source/extensions/filters/http/set_metadata:config",
         "//source/extensions/network/dns_resolver/getaddrinfo:config",
         "//test/integration:http_integration_lib",
         "//test/test_common:threadsafe_singleton_injector_lib",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+        "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
     ],
 )

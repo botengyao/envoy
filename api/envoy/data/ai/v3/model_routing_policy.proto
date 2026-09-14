@@ -19,7 +19,7 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#protodoc-title: AI model routing policy]
 
 // Ordered model routing decision for one request. An external policy decision point returns it,
-// for example as typed dynamic metadata from the external processing filter, and the
+// for example as dynamic metadata from the external processing filter, and the
 // :ref:`model resolver filter <config_http_filters_model_resolver>` turns it into a plan that the
 // request's upstream attempts follow.
 message ModelRoutingPolicy {
@@ -49,20 +49,38 @@ message ModelRoutingPolicy {
     GATEWAY_ERROR = 6;
   }
 
-  // Target IDs in preference order. Each ID names a target of the model resolver configuration.
-  // Every upstream attempt uses the next entry, so a repeated ID retries the same target.
-  repeated string target_ids = 1 [(validate.rules).repeated = {
-    min_items: 1
-    max_items: 16
-    items {string {min_len: 1}}
-  }];
+  // A model served by one endpoint.
+  // [#next-free-field: 6]
+  message Target {
+    // Name of the target in logs. Defaults to ``model``.
+    string id = 1 [(validate.rules).string = {max_len: 128}];
 
-  // Conditions that allow moving on to the next target. When empty, the resolver's defaults apply.
+    // DNS name, IPv4 address or bracketed IPv6 address of the endpoint, without a port. The dynamic
+    // forward proxy cluster connects to it, and it becomes the request authority.
+    string host = 2 [(validate.rules).string = {min_len: 1 max_len: 255}];
+
+    // Port of the endpoint. Zero selects the cluster's default port and leaves the port out of the
+    // request authority.
+    uint32 port = 3 [(validate.rules).uint32 = {lte: 65535}];
+
+    // Model name the endpoint expects in the request body's ``model`` field.
+    string model = 4 [(validate.rules).string = {min_len: 1 max_len: 256}];
+
+    // Request path for the endpoint, in which ``{model}`` is replaced with ``model``. When empty,
+    // the request keeps its path after route rewrites.
+    string path = 5 [(validate.rules).string = {max_len: 1024}];
+  }
+
+  // Targets in preference order. The first attempt uses the first target and each retry uses the
+  // next one, so a repeated target is retried.
+  repeated Target targets = 1 [(validate.rules).repeated = {min_items: 1 max_items: 16}];
+
+  // Conditions that allow moving on to the next target. When empty, ``CONNECT_FAILURE``,
+  // ``RATE_LIMITED``, ``OVERLOADED`` and ``GATEWAY_ERROR`` apply.
   repeated FallbackCondition fallback_on = 2
       [(validate.rules).repeated = {items {enum {defined_only: true not_in: 0}}}];
 
-  // Time allowed for each attempt until response headers arrive. The resolver caps it, and ignores
-  // it unless its configuration sets an upper bound.
+  // Time allowed for each attempt until response headers arrive.
   google.protobuf.Duration per_try_timeout = 3 [(validate.rules).duration = {gt {}}];
 
   // Opaque identifier of the decision, exposed to access logs.
