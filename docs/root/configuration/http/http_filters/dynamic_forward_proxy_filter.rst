@@ -44,6 +44,15 @@ host when forwarding. See the example below within the configured routes.
 
 .. note::
 
+  With :ref:`allow_dynamic_host_from_filter_state
+  <envoy_v3_api_field_extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig.allow_dynamic_host_from_filter_state>`,
+  a request that carries the ``envoy.upstream.dynamic_host_candidates`` filter state has every candidate
+  host resolved before it continues, and ``x-envoy-max-retries`` is lowered to one less than the number of
+  candidates that resolved. The :ref:`model resolver <config_http_filters_model_resolver>` filter sets
+  this filter state.
+
+.. note::
+
   Configuring a :ref:`transport_socket with name envoy.transport_sockets.tls <envoy_v3_api_field_config.cluster.v3.Cluster.transport_socket>` on the cluster with
   *trusted_ca* certificates instructs Envoy to use TLS when connecting to upstream hosts and verify
   the certificate chain. Additionally, Envoy will automatically perform SAN verification for the

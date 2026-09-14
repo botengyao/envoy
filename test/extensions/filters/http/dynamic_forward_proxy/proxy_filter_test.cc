@@ -3,11 +3,13 @@
 #include "envoy/router/string_accessor.h"
 #include "envoy/stream_info/uint32_accessor.h"
 
+#include "source/common/network/utility.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/common/stream_info/uint32_accessor_impl.h"
 #include "source/common/stream_info/upstream_address.h"
 #include "source/extensions/common/dynamic_forward_proxy/cluster_store.h"
 #include "source/extensions/common/dynamic_forward_proxy/dns_cache_impl.h"
+#include "source/extensions/common/dynamic_forward_proxy/dynamic_host_candidates.h"
 #include "source/extensions/filters/http/dynamic_forward_proxy/proxy_filter.h"
 
 #include "test/extensions/common/dynamic_forward_proxy/mocks.h"
@@ -893,6 +895,28 @@ protected:
       std::make_unique<Upstream::ResourceAutoIncDec>(pending_requests_);
 };
 
+TEST_F(ProxyFilterWithFilterStateHostDisabledTest, IgnoresHostCandidatesWhenFlagDisabled) {
+  EXPECT_CALL(*transport_socket_factory_, implementsSecureTransport())
+      .Times(AnyNumber())
+      .WillRepeatedly(Return(false));
+  ON_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_()).WillByDefault(Invoke([this]() {
+    return new Upstream::ResourceAutoIncDec(pending_requests_);
+  }));
+  filter_state_->setData(
+      Common::DynamicForwardProxy::DynamicHostCandidates::key(),
+      Common::DynamicForwardProxy::DynamicHostCandidates::fromString("a.example.com,b.example.com"),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  auto* handle = new Common::DynamicForwardProxy::MockLoadDnsCacheEntryHandle();
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("foo"), 80, _, _))
+      .WillOnce(Return(
+          MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Loading, handle, std::nullopt}));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+  EXPECT_CALL(*handle, onDestroy());
+  filter_->onDestroy();
+}
+
 TEST_F(ProxyFilterWithFilterStateHostDisabledTest, DoesNotUseFilterStateWhenFlagDisabled) {
   Upstream::ResourceAutoIncDec* circuit_breakers_(
       new Upstream::ResourceAutoIncDec(pending_requests_));
@@ -1154,6 +1178,157 @@ INSTANTIATE_TEST_SUITE_P(
         IPv6TestCase{"[2001:db8:85a3::8a2e:370:7334]:9999", "[2001:db8:85a3::8a2e:370:7334]", 9999,
                      "IPv6FullAddressWithCustomPort"}),
     [](const testing::TestParamInfo<IPv6TestCase>& info) { return info.param.test_name; });
+
+class ProxyFilterHostCandidatesTest : public ProxyFilterWithFilterStateHostTest {
+public:
+  void SetUp() override {
+    ProxyFilterWithFilterStateHostTest::SetUp();
+    EXPECT_CALL(*transport_socket_factory_, implementsSecureTransport())
+        .Times(AnyNumber())
+        .WillRepeatedly(Return(false));
+    ON_CALL(*dns_cache_manager_->dns_cache_, canCreateDnsRequest_()).WillByDefault(Invoke([this]() {
+      return new Upstream::ResourceAutoIncDec(pending_requests_);
+    }));
+  }
+
+  void setCandidates(absl::string_view candidates) {
+    filter_state_->setData(
+        Common::DynamicForwardProxy::DynamicHostCandidates::key(),
+        Common::DynamicForwardProxy::DynamicHostCandidates::fromString(candidates),
+        StreamInfo::FilterState::LifeSpan::FilterChain);
+  }
+
+  static Common::DynamicForwardProxy::DnsHostInfoSharedPtr hostInfo(bool resolved) {
+    auto host_info = std::make_shared<NiceMock<Common::DynamicForwardProxy::MockDnsHostInfo>>();
+    if (resolved) {
+      host_info->address_ = Network::Utility::parseInternetAddressNoThrow("10.0.0.1");
+    }
+    ON_CALL(*host_info, details()).WillByDefault(Return("dns_resolution_failure"));
+    return host_info;
+  }
+
+  static MockLoadDnsCacheEntryResult inCache(bool resolved) {
+    return {LoadDnsCacheEntryStatus::InCache, nullptr, hostInfo(resolved)};
+  }
+};
+
+// Candidates that share a host are resolved once, and a candidate the DNS cache has no room for
+// stays usable.
+TEST_F(ProxyFilterHostCandidatesTest, CachedCandidatesLimitRetries) {
+  setCandidates("a.example.com,b.example.com:8443,a.example.com,c.example.com");
+  request_headers_.addCopy(Http::Headers::get().EnvoyMaxRetries, "3");
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("a.example.com"), 80, _, _))
+      .WillOnce(Return(inCache(true)));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("b.example.com"), 8443, _, _))
+      .WillOnce(Return(inCache(false)));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("c.example.com"), 80, _, _))
+      .WillOnce(Return(
+          MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Overflow, nullptr, std::nullopt}));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("foo"), _, _, _)).Times(0);
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+  EXPECT_EQ("2", request_headers_.get_("x-envoy-max-retries"));
+  filter_->onDestroy();
+}
+
+TEST_F(ProxyFilterHostCandidatesTest, RouteRetriesAboveUsableCandidatesAreLimited) {
+  setCandidates("a.example.com,b.example.com");
+  callbacks_.route_->route_entry_.retry_policy_->num_retries_ = 5;
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(_, _, _, _))
+      .Times(2)
+      .WillRepeatedly(Return(inCache(true)));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+  EXPECT_EQ("1", request_headers_.get_("x-envoy-max-retries"));
+  filter_->onDestroy();
+}
+
+TEST_F(ProxyFilterHostCandidatesTest, RetriesWithinUsableCandidatesAreKept) {
+  setCandidates("a.example.com,b.example.com,c.example.com");
+  callbacks_.route_->route_entry_.retry_policy_->num_retries_ = 1;
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(_, _, _, _))
+      .Times(3)
+      .WillRepeatedly(Return(inCache(true)));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers_, false));
+  EXPECT_FALSE(request_headers_.has("x-envoy-max-retries"));
+  filter_->onDestroy();
+}
+
+TEST_F(ProxyFilterHostCandidatesTest, WaitsForEveryLoadingCandidate) {
+  setCandidates("a.example.com,b.example.com");
+  request_headers_.addCopy(Http::Headers::get().EnvoyMaxRetries, "1");
+  Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks* callbacks_a{};
+  Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks* callbacks_b{};
+  auto* handle_a = new Common::DynamicForwardProxy::MockLoadDnsCacheEntryHandle();
+  auto* handle_b = new Common::DynamicForwardProxy::MockLoadDnsCacheEntryHandle();
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("a.example.com"), 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks_a = &cb;
+        return MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Loading, handle_a,
+                                           std::nullopt};
+      }));
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("b.example.com"), 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks_b = &cb;
+        return MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Loading, handle_b,
+                                           std::nullopt};
+      }));
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+  ASSERT_NE(nullptr, callbacks_a);
+  ASSERT_NE(nullptr, callbacks_b);
+
+  EXPECT_CALL(callbacks_, continueDecoding()).Times(0);
+  callbacks_a->onLoadDnsCacheComplete(hostInfo(false));
+
+  EXPECT_CALL(callbacks_, continueDecoding());
+  callbacks_b->onLoadDnsCacheComplete(hostInfo(true));
+  EXPECT_EQ("0", request_headers_.get_("x-envoy-max-retries"));
+
+  EXPECT_CALL(*handle_a, onDestroy());
+  EXPECT_CALL(*handle_b, onDestroy());
+  filter_->onDestroy();
+}
+
+TEST_F(ProxyFilterHostCandidatesTest, FailsWhenNoCandidateResolves) {
+  setCandidates("a.example.com");
+  Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks* callbacks_a{};
+  auto* handle = new Common::DynamicForwardProxy::MockLoadDnsCacheEntryHandle();
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("a.example.com"), 80, _, _))
+      .WillOnce(Invoke([&](absl::string_view, uint16_t, bool,
+                           Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks& cb) {
+        callbacks_a = &cb;
+        return MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Loading, handle, std::nullopt};
+      }));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+
+  EXPECT_CALL(callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::ServiceUnavailable, Eq("DNS resolution failure"), _, _,
+                             Eq("dns_resolution_failure")));
+  callbacks_a->onLoadDnsCacheComplete(hostInfo(false));
+
+  EXPECT_CALL(*handle, onDestroy());
+  filter_->onDestroy();
+}
+
+TEST_F(ProxyFilterHostCandidatesTest, DestroyCancelsPendingCandidates) {
+  setCandidates("a.example.com");
+  auto* handle = new Common::DynamicForwardProxy::MockLoadDnsCacheEntryHandle();
+  EXPECT_CALL(*dns_cache_manager_->dns_cache_, loadDnsCacheEntry_(Eq("a.example.com"), 80, _, _))
+      .WillOnce(Return(
+          MockLoadDnsCacheEntryResult{LoadDnsCacheEntryStatus::Loading, handle, std::nullopt}));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopAllIterationAndWatermark,
+            filter_->decodeHeaders(request_headers_, false));
+
+  EXPECT_CALL(*handle, onDestroy());
+  filter_->onDestroy();
+}
 
 } // namespace
 } // namespace DynamicForwardProxy

@@ -7,12 +7,17 @@
 #include "envoy/router/string_accessor.h"
 #include "envoy/stream_info/uint32_accessor.h"
 
+#include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
 #include "source/common/network/filter_state_proxy_info.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/runtime/runtime_features.h"
 #include "source/common/stream_info/upstream_address.h"
 #include "source/extensions/common/dynamic_forward_proxy/cluster_store.h"
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -170,6 +175,7 @@ void ProxyFilter::onDestroy() {
   // Make sure we destroy any active cache/cluster load handle in case we are getting reset and
   // deferred deleted.
   cache_load_handle_.reset();
+  host_candidate_lookups_.clear();
   circuit_breaker_.reset();
   cluster_load_handle_.reset();
   if (cluster_init_timer_) {
@@ -301,6 +307,16 @@ Http::FilterHeadersStatus ProxyFilter::decodeHeaders(Http::RequestHeaderMap& hea
 
   latchTime(decoder_callbacks_, DNS_START);
   const bool is_proxying = isProxying();
+  if (config_->allowDynamicHostFromFilterState()) {
+    if (const auto* candidates =
+            decoder_callbacks_->streamInfo()
+                .filterState()
+                ->getDataReadOnly<Common::DynamicForwardProxy::DynamicHostCandidates>(
+                    Common::DynamicForwardProxy::DynamicHostCandidates::key());
+        candidates != nullptr) {
+      return loadHostCandidates(*candidates, headers, *route_entry, default_port, is_proxying);
+    }
+  }
   if (headers.Host()->value().getStringView().empty()) {
     decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
                                        ResponseStrings::get().EmptyHostHeader, nullptr,
@@ -488,6 +504,101 @@ void ProxyFilter::onLoadDnsCacheComplete(
   addHostAddressToFilterState(host_info->address());
 
   decoder_callbacks_->continueDecoding();
+}
+
+Http::FilterHeadersStatus ProxyFilter::loadHostCandidates(
+    const Common::DynamicForwardProxy::DynamicHostCandidates& candidates,
+    Http::RequestHeaderMap& headers, const Router::RouteEntry& route_entry, uint16_t default_port,
+    bool is_proxying) {
+  request_headers_ = &headers;
+  proxying_host_candidates_ = is_proxying;
+  max_retries_ = route_entry.retryPolicy() != nullptr ? route_entry.retryPolicy()->numRetries() : 1;
+  uint64_t header_retries;
+  if (headers.EnvoyMaxRetries() != nullptr &&
+      absl::SimpleAtoi(headers.getEnvoyMaxRetriesValue(), &header_retries)) {
+    max_retries_ = header_retries;
+  }
+
+  struct Host {
+    absl::string_view host;
+    uint16_t port;
+    uint32_t candidates;
+  };
+  std::vector<Host> hosts;
+  absl::flat_hash_map<std::string, size_t> host_indexes;
+  for (const auto& candidate : candidates.candidates()) {
+    const uint16_t port = candidate.port != 0 ? candidate.port : default_port;
+    const auto [it, inserted] = host_indexes.try_emplace(
+        Common::DynamicForwardProxy::DnsHostInfo::normalizeHostForDfp(candidate.host, port),
+        hosts.size());
+    if (inserted) {
+      hosts.push_back({candidate.host, port, 0});
+    }
+    ++hosts[it->second].candidates;
+  }
+
+  for (const Host& host : hosts) {
+    auto lookup = std::make_unique<HostCandidateLookup>(*this, host.candidates);
+    auto result = config_->cache().loadDnsCacheEntry(host.host, host.port, is_proxying, *lookup);
+    switch (result.status_) {
+    case LoadDnsCacheEntryStatus::InCache:
+      recordHostCandidate(host.candidates,
+                          result.host_info_.has_value() ? result.host_info_.value() : nullptr);
+      break;
+    case LoadDnsCacheEntryStatus::Loading:
+      lookup->handle_ = std::move(result.handle_);
+      host_candidate_lookups_.push_back(std::move(lookup));
+      ++pending_host_candidates_;
+      break;
+    case LoadDnsCacheEntryStatus::Overflow:
+      // A local DNS cache limit says nothing about the host, so its candidates stay usable.
+      usable_host_candidates_ += host.candidates;
+      break;
+    }
+  }
+
+  if (pending_host_candidates_ > 0) {
+    ENVOY_STREAM_LOG(debug, "waiting to load {} host candidates", *decoder_callbacks_,
+                     pending_host_candidates_);
+    return Http::FilterHeadersStatus::StopAllIterationAndWatermark;
+  }
+  return onHostCandidatesLoaded() ? Http::FilterHeadersStatus::Continue
+                                  : Http::FilterHeadersStatus::StopIteration;
+}
+
+void ProxyFilter::recordHostCandidate(
+    uint32_t candidates, const Common::DynamicForwardProxy::DnsHostInfoSharedPtr& host_info) {
+  if (proxying_host_candidates_ || (host_info != nullptr && host_info->address() != nullptr)) {
+    usable_host_candidates_ += candidates;
+  } else if (host_info != nullptr) {
+    host_candidate_failure_ = host_info->details();
+  }
+}
+
+void ProxyFilter::onHostCandidateLoaded(
+    uint32_t candidates, const Common::DynamicForwardProxy::DnsHostInfoSharedPtr& host_info) {
+  recordHostCandidate(candidates, host_info);
+  if (--pending_host_candidates_ == 0 && onHostCandidatesLoaded()) {
+    decoder_callbacks_->continueDecoding();
+  }
+}
+
+bool ProxyFilter::onHostCandidatesLoaded() {
+  latchTime(decoder_callbacks_, DNS_END);
+  circuit_breaker_.reset();
+  if (usable_host_candidates_ == 0) {
+    onDnsResolutionFail(host_candidate_failure_.empty() ? "no_host" : host_candidate_failure_);
+    return false;
+  }
+  // The cluster skips candidates whose host failed to resolve without using a retry, so a retry
+  // beyond the usable candidates would find no host.
+  if (max_retries_ >= usable_host_candidates_) {
+    request_headers_->setCopy(Http::Headers::get().EnvoyMaxRetries,
+                              absl::StrCat(usable_host_candidates_ - 1));
+  }
+  ENVOY_STREAM_LOG(debug, "{} usable host candidates", *decoder_callbacks_,
+                   usable_host_candidates_);
+  return true;
 }
 
 } // namespace DynamicForwardProxy
