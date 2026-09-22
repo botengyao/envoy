@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package envoy.data.ai.v3;
+
+import "envoy/type/ai/v3/api_protocol.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.data.ai.v3";
+option java_outer_classname = "LlmProtocolProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/data/ai/v3;aiv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: AI LLM protocol]
+
+// The LLM wire protocol a request payload follows, named at runtime by a filter that identifies
+// the caller rather than by the route that matched it.
+//
+// Carried as the filter state object ``envoy.ai.llm_protocol.request``, which the :ref:`AI
+// Protocol Manager <config_http_filters_ai_protocol_manager>` reads in place of its own route
+// declaration on routes that set :ref:`api_protocol_from_filter_state
+// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol_from_filter_state>`.
+// It must be set before that filter's decode headers, because the declared API configures the
+// payload parser before the first body byte arrives.
+//
+// The object is registered under its key with a filter state object factory that builds it from
+// an ``ApiProtocol`` enum-value name, such as ``ANTHROPIC_MESSAGES``, so an extension that cannot
+// link the AI Protocol Manager -- :ref:`set_filter_state <config_http_filters_set_filter_state>`,
+// Lua, ext_proc -- can still set it.
+message RequestLlmProtocol {
+  // The wire API the request payload follows. ``API_PROTOCOL_UNSPECIFIED`` names no API and
+  // leaves the route's own declaration in effect.
+  type.ai.v3.ApiProtocol api_protocol = 1 [(validate.rules).enum = {defined_only: true}];
+}

@@ -123,6 +123,20 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "llm_protocol_lib",
+    srcs = ["llm_protocol.cc"],
+    hdrs = ["llm_protocol.h"],
+    deps = [
+        ":api_protocol_conversion_lib",
+        ":token_usage_lib",
+        "//envoy/registry",
+        "//envoy/stream_info:filter_state_interface",
+        "@abseil-cpp//absl/strings",
+        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
     name = "api_protocol_adapters_lib",
     srcs = ["api_protocol_adapters.cc"],
     deps = [
@@ -390,6 +404,7 @@ envoy_cc_library(
         ":filter_manager_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
+        ":llm_protocol_lib",
         ":response_handler_lib",
         ":schema_lib",
         ":serializer_lib",

@@ -17,6 +17,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/llm_protocol.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 
 #include "absl/strings/match.h"
@@ -224,15 +225,15 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // Copy what the route declared; see the note on route_has_request_ for why the
-  // config is not held by pointer.
+  // Resolve the endpoint declaration and its wire API and copy both out; see the
+  // note on route_has_request_ for why the config is not held by pointer.
   if (const RouteConfig* route_config =
           Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(decoder_callbacks_);
       route_config != nullptr) {
     route_has_request_ = route_config->hasRequest();
-    route_request_protocol_ = route_config->requestProtocol();
+    route_request_protocol_ = resolveRequestProtocol(*route_config);
     if (route_has_request_) {
-      ENVOY_LOG(debug, "ai_protocol_manager: route declares request API {}",
+      ENVOY_LOG(debug, "ai_protocol_manager: AI endpoint with request API {}",
                 apiProtocolName(route_request_protocol_));
     }
   }
@@ -269,6 +270,33 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // for an empty/trailer-only body, when the manager continues iteration).
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+ApiProtocol AiProtocolManagerFilter::resolveRequestProtocol(const RouteConfig& route_config) const {
+  // Looked up only where the route asked for it: every other stream would pay a
+  // filter state probe for a feature it does not use.
+  if (!route_config.requestProtocolFromFilterState()) {
+    return route_config.requestProtocol();
+  }
+
+  const StreamInfo::FilterStateSharedPtr& filter_state =
+      decoder_callbacks_->streamInfo().filterState();
+  if (filter_state == nullptr) {
+    return route_config.requestProtocol();
+  }
+
+  const auto* declared =
+      filter_state->getDataReadOnly<RequestLlmProtocol>(RequestLlmProtocol::kFilterStateKey);
+  // An object naming no protocol is "I looked and did not know", which leaves
+  // the route's own declaration standing.
+  if (declared == nullptr || declared->protocol() == ApiProtocol::Unspecified) {
+    return route_config.requestProtocol();
+  }
+
+  config_->stats().request_protocol_from_filter_state_.inc();
+  ENVOY_LOG(debug, "ai_protocol_manager: filter state names request API {}",
+            apiProtocolName(declared->protocol()));
+  return declared->protocol();
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {

@@ -88,6 +88,7 @@ public:
   explicit RouteConfig(const PerRouteProto& proto)
       : has_request_(proto.has_request()),
         request_protocol_(protocolFromProto(proto.request().api_protocol())),
+        request_protocol_from_filter_state_(proto.request().api_protocol_from_filter_state()),
         response_protocol_(protocolFromProto(proto.response().api_protocol())) {}
 
   // Whether the route hands its request payload to the filter to hold and
@@ -95,6 +96,10 @@ public:
   bool hasRequest() const { return has_request_; }
   ApiProtocol requestProtocol() const { return request_protocol_; }
   ApiProtocol responseProtocol() const { return response_protocol_; }
+
+  // Whether a RequestLlmProtocol filter state object, when one is set, names
+  // the request wire API in place of requestProtocol().
+  bool requestProtocolFromFilterState() const { return request_protocol_from_filter_state_; }
 
   // The wire API for response extraction on this route: the declared response
   // API, falling back to the declared request API.
@@ -105,6 +110,7 @@ public:
 private:
   const bool has_request_ = false;
   const ApiProtocol request_protocol_ = ApiProtocol::Unspecified;
+  const bool request_protocol_from_filter_state_ = false;
   const ApiProtocol response_protocol_ = ApiProtocol::Unspecified;
 };
 
@@ -188,6 +194,10 @@ public:
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap& trailers) override;
 
 private:
+  // The request wire API for this stream: what the route declared, or what a
+  // RequestLlmProtocol filter state object named where the route opted in.
+  ApiProtocol resolveRequestProtocol(const RouteConfig& route_config) const;
+
   // Feeds one body frame to the parser in place. Returns false only if the
   // payload was rejected, in which case the caller must not offload or replay
   // it; a best-effort parse that fails abandons parsing and returns true.

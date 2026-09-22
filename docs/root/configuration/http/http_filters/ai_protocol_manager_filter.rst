@@ -132,6 +132,72 @@ declaration covers gateways whose response API differs from the request API,
 e.g. under protocol translation); when the response API is undeclared it
 falls back to the request API.
 
+Naming the wire API from filter state
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Where the wire API is a property of the caller rather than of the path -- one
+endpoint serving agents that each speak their own API -- the route table cannot
+express it without a route per caller. A route that sets
+:ref:`api_protocol_from_filter_state
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol_from_filter_state>`
+instead takes the request wire API from the ``envoy.ai.llm_protocol.request``
+filter state object -- :ref:`RequestLlmProtocol
+<envoy_v3_api_msg_data.ai.v3.RequestLlmProtocol>` -- set by a filter ahead of
+this one that recognizes the caller. It falls back to ``api_protocol`` when no
+object was set, or when the object names ``API_PROTOCOL_UNSPECIFIED``.
+
+The object has to be set before this filter's decode headers: the declared API
+configures the payload parser, so the filter that names it must decide from the
+request headers alone. A filter that can only decide from the body is too late.
+
+This is off by default. Which schema a payload is held to stays the route's
+decision, because an override is only as trustworthy as whatever set it; the
+``ai_protocol_manager.request_protocol_from_filter_state`` counter shows how
+often one took effect.
+
+Setting the object needs no dependency on this filter: it is registered with a
+filter state object factory that builds it from an :ref:`ApiProtocol
+<envoy_v3_api_enum_type.ai.v3.ApiProtocol>` enum-value name, so
+:ref:`set_filter_state <config_http_filters_set_filter_state>`, Lua and ext_proc
+can all write it.
+
+.. code-block:: yaml
+
+  http_filters:
+  - name: envoy.filters.http.set_filter_state
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+      on_request_headers:
+      - object_key: envoy.ai.llm_protocol.request
+        format_string:
+          text_format_source:
+            inline_string: "%REQ(x-llm-api)%"
+  - name: envoy.filters.http.ai_protocol_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+      request_handling: {}
+
+The example reads a request header, which is only safe for a header the edge
+strips from client requests: a caller that can set it picks the schema its own
+payload is validated against.
+
+.. code-block:: yaml
+
+  routes:
+  - match:
+      prefix: "/"
+    route:
+      cluster: llm
+    typed_per_filter_config:
+      envoy.filters.http.ai_protocol_manager:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+        request:
+          api_protocol: OPENAI_CHAT_COMPLETIONS
+          api_protocol_from_filter_state: true
+
+Filter-level configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 The filter-level configuration decides what happens on every other route. By
 default those requests are passed through untouched -- not parsed, and not
 offloaded; setting
@@ -498,6 +564,7 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   request_parse_error, Counter, A declared AI endpoint's payload was not well-formed JSON and was rejected with a 400.
   request_schema_invalid, Counter, "A declared AI endpoint's payload parsed but violated its API's payload schema, and was rejected with a 400."
   request_passthrough, Counter, "A payload on an unconfigured route failed to parse under :ref:`parse_unconfigured_routes <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>` and was forwarded unchanged; never a request failure."
+  request_protocol_from_filter_state, Counter, "A route that set :ref:`api_protocol_from_filter_state <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol_from_filter_state>` took its request wire API from the ``envoy.ai.llm_protocol.request`` filter state object rather than from its own declaration."
   request_external_buffer_error, Counter, The external buffer failed irrecoverably on the request path and the stream was answered with a 500.
   response_external_buffer_error, Counter, The external buffer failed irrecoverably on the response path and the stream was answered with a 500.
   token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).

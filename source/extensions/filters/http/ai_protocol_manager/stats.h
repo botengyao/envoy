@@ -15,6 +15,7 @@ namespace AiProtocolManager {
   COUNTER(request_parse_error)                                                                     \
   COUNTER(request_schema_invalid)                                                                  \
   COUNTER(request_passthrough)                                                                     \
+  COUNTER(request_protocol_from_filter_state)                                                      \
   COUNTER(request_external_buffer_error)                                                           \
   COUNTER(response_external_buffer_error)                                                          \
   COUNTER(token_usage_found)                                                                       \
