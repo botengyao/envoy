@@ -727,21 +727,25 @@ envoy_benchmark_test(
     benchmark_binary = "linked_object_speed_test",
 )
 
+# Needs --define=execution_context=enabled so its deps see the same define-dependent type layouts.
 envoy_cc_test(
     name = "execution_context_test",
-    srcs = ["execution_context_test.cc"],
-    copts = [
-        "-DENVOY_ENABLE_EXECUTION_CONTEXT",
-    ],
+    srcs = select({
+        "//bazel:enable_execution_context": ["execution_context_test.cc"],
+        "//conditions:default": [],
+    }),
     rbe_pool = "linux_x64_small",
-    deps = [
-        "//envoy/common:execution_context",
-        "//source/common/api:api_lib",
-        "//source/common/http:conn_manager_lib",
-        "//source/common/http:filter_manager_lib",
-        "//test/mocks:common_lib",
-        "//test/mocks/stream_info:stream_info_mocks",
-    ],
+    deps = select({
+        "//bazel:enable_execution_context": [
+            "//envoy/common:execution_context",
+            "//source/common/api:api_lib",
+            "//source/common/http:conn_manager_lib",
+            "//source/common/http:filter_manager_lib",
+            "//test/mocks:common_lib",
+            "//test/mocks/stream_info:stream_info_mocks",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 envoy_cc_test(
