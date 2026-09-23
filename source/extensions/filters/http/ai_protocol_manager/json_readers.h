@@ -115,6 +115,19 @@ constexpr absl::string_view Messages = "messages";
 constexpr absl::string_view Input = "input";
 constexpr absl::string_view Contents = "contents";
 constexpr absl::string_view Tools = "tools";
+constexpr absl::string_view SystemInstruction = "systemInstruction";
+constexpr absl::string_view SystemInstructionSnake = "system_instruction";
+constexpr absl::string_view System = "system";
+constexpr absl::string_view StopSequences = "stop_sequences";
+constexpr absl::string_view TopK = "top_k";
+constexpr absl::string_view Thinking = "thinking";
+constexpr absl::string_view InputSchema = "input_schema";
+constexpr absl::string_view ResponseFormat = "response_format";
+constexpr absl::string_view FrequencyPenalty = "frequency_penalty";
+constexpr absl::string_view PresencePenalty = "presence_penalty";
+constexpr absl::string_view StreamOptions = "stream_options";
+constexpr absl::string_view LogitBias = "logit_bias";
+constexpr absl::string_view Function = "function";
 } // namespace Keys
 
 } // namespace AiProtocolManager

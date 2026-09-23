@@ -3,7 +3,6 @@
 #include <memory>
 #include <string>
 
-#include "envoy/data/ai/v3/llm_protocol.pb.h"
 #include "envoy/registry/registry.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_conversion.h"
@@ -13,20 +12,14 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
-ProtobufTypes::MessagePtr RequestLlmProtocol::serializeAsProto() const {
-  auto proto = std::make_unique<envoy::data::ai::v3::RequestLlmProtocol>();
-  proto->set_api_protocol(protocolToProto(protocol_));
-  return proto;
-}
-
 std::optional<std::string> RequestLlmProtocol::serializeAsString() const {
   return std::string(apiProtocolName(protocol_));
 }
 
 StreamInfo::FilterState::Object::FieldType
 RequestLlmProtocol::getField(absl::string_view field_name) const {
-  // Backed by a string literal, so the view outlives the call.
   if (field_name == "api_protocol") {
+    // Backed by a string literal, so the view outlives the call.
     return apiProtocolName(protocol_);
   }
   return absl::monostate{};

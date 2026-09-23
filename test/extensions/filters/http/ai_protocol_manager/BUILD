@@ -214,7 +214,6 @@ envoy_extension_cc_test(
         "//source/common/stream_info:filter_state_lib",
         "//source/extensions/filters/http/ai_protocol_manager:llm_protocol_lib",
         "@abseil-cpp//absl/types:variant",
-        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
     ],
 )
 

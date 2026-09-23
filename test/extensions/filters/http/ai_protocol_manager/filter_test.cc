@@ -197,15 +197,20 @@ public:
         .WillByDefault(testing::Return(route_config_.get()));
   }
 
-  // Attaches a per-route config declaring an AI endpoint that takes its wire API
-  // from filter state, falling back to `route_protocol`.
-  void setRouteConfigFromFilterState(envoy::type::ai::v3::ApiProtocol route_protocol) {
+  // Declares an AI endpoint naming `protocol`; API_PROTOCOL_UNSPECIFIED declares
+  // the endpoint without naming a wire API, leaving it to be inferred.
+  void setRouteConfigWithProtocol(envoy::type::ai::v3::ApiProtocol protocol) {
     PerRouteProto proto;
-    proto.mutable_request()->set_api_protocol(route_protocol);
-    proto.mutable_request()->set_api_protocol_from_filter_state(true);
+    proto.mutable_request()->set_api_protocol(protocol);
     route_config_ = std::make_unique<RouteConfig>(proto);
     ON_CALL(callbacks_, mostSpecificPerFilterConfig())
         .WillByDefault(testing::Return(route_config_.get()));
+  }
+
+  Http::FilterHeadersStatus decodeHeadersWithPath(absl::string_view path) {
+    request_headers_ = requestHeaders();
+    request_headers_.setPath(path);
+    return filter_->decodeHeaders(request_headers_, /*end_stream=*/false);
   }
 
   void setRequestLlmProtocol(ApiProtocol protocol) {
@@ -1981,7 +1986,7 @@ TEST_F(AiProtocolManagerFilterTest, SchemaValidationRejectsInvalidPayload) {
 // On a route that opted in, the wire API comes from filter state: a payload
 // valid under the route's own (unnamed) API is held to the named one instead.
 TEST_F(AiProtocolManagerFilterTest, FilterStateNamesRequestApi) {
-  setRouteConfigFromFilterState(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
   setRequestLlmProtocol(ApiProtocol::AnthropicMessages);
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
@@ -1996,25 +2001,9 @@ TEST_F(AiProtocolManagerFilterTest, FilterStateNamesRequestApi) {
   EXPECT_EQ(counterValue("request_schema_invalid"), 1);
 }
 
-// Filter state names an API the route did not ask to take: the route's own
-// declaration stands.
-TEST_F(AiProtocolManagerFilterTest, FilterStateIgnoredWithoutRouteOptIn) {
-  setRouteConfig();
-  setRequestLlmProtocol(ApiProtocol::AnthropicMessages);
-  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
-
-  Buffer::OwnedImpl body(openAiOnlyPayload());
-  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
-  drain();
-
-  EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(counterValue("request_protocol_from_filter_state"), 0);
-  EXPECT_EQ(counterValue("request_schema_invalid"), 0);
-}
-
 // Filter state wins over a route that named an API of its own.
 TEST_F(AiProtocolManagerFilterTest, FilterStateOverridesRouteDeclaration) {
-  setRouteConfigFromFilterState(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  setRouteConfigWithProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
   setRequestLlmProtocol(ApiProtocol::AnthropicMessages);
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
@@ -2030,7 +2019,7 @@ TEST_F(AiProtocolManagerFilterTest, FilterStateOverridesRouteDeclaration) {
 // An object naming no API is "I looked and did not know": the route's
 // declaration is what the payload is held to.
 TEST_F(AiProtocolManagerFilterTest, UnspecifiedFilterStateLeavesRouteDeclaration) {
-  setRouteConfigFromFilterState(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  setRouteConfigWithProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
   setRequestLlmProtocol(ApiProtocol::Unspecified);
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
@@ -2045,7 +2034,7 @@ TEST_F(AiProtocolManagerFilterTest, UnspecifiedFilterStateLeavesRouteDeclaration
 // The route opted in but nothing set the object, which is the ordinary case for
 // a caller the registry did not recognize.
 TEST_F(AiProtocolManagerFilterTest, MissingFilterStateLeavesRouteDeclaration) {
-  setRouteConfigFromFilterState(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  setRouteConfigWithProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
   Buffer::OwnedImpl body(openAiOnlyPayload());
@@ -2054,6 +2043,101 @@ TEST_F(AiProtocolManagerFilterTest, MissingFilterStateLeavesRouteDeclaration) {
 
   EXPECT_EQ(local_reply_calls_, 0);
   EXPECT_EQ(counterValue("request_protocol_from_filter_state"), 0);
+}
+
+// Nobody named an API, so the provider's own URL contract does. The payload
+// violates the detected schema and is forwarded anyway: an inferred contract is
+// not one the operator declared, so it must not fail a request.
+TEST_F(AiProtocolManagerFilterTest, DetectsRequestApiFromPathAndDoesNotValidate) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  EXPECT_EQ(decodeHeadersWithPath("/v1/messages"), Http::FilterHeadersStatus::StopIteration);
+
+  // Valid OpenAI, and invalid Anthropic: no `max_tokens`.
+  Buffer::OwnedImpl body(openAiOnlyPayload());
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_headers"), 1);
+  EXPECT_EQ(counterValue("request_schema_invalid"), 0);
+}
+
+// A route that named its API is not second-guessed, whatever the path says.
+TEST_F(AiProtocolManagerFilterTest, DeclaredApiSkipsDetection) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  EXPECT_EQ(decodeHeadersWithPath("/v1/messages"), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(openAiOnlyPayload());
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_headers"), 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_payload"), 0);
+}
+
+// The path decided, so the payload never gets a turn -- even carrying a marker
+// of a different dialect.
+TEST_F(AiProtocolManagerFilterTest, HeaderDetectionPreemptsPayloadDetection) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  EXPECT_EQ(decodeHeadersWithPath("/v1/messages"), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"model":"m","messages":[{"role":"user","content":"hi"}],"response_format":{}})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(counterValue("request_protocol_detected_headers"), 1);
+  EXPECT_EQ(counterValue("request_protocol_detected_payload"), 0);
+}
+
+// A path the providers do not define leaves the payload's own shape to decide.
+TEST_F(AiProtocolManagerFilterTest, DetectsRequestApiFromPayloadShape) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  EXPECT_EQ(decodeHeadersWithPath("/generate"), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(
+      R"({"model":"m","messages":[{"role":"user","content":"hi"}],"stop_sequences":["END"]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_headers"), 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_payload"), 1);
+  EXPECT_EQ(counterValue("request_protocol_undetermined"), 0);
+}
+
+// Neither the path nor the payload separates Chat Completions from Anthropic
+// Messages, and nothing is claimed.
+TEST_F(AiProtocolManagerFilterTest, AmbiguousRequestLeavesProtocolUndetermined) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  EXPECT_EQ(decodeHeadersWithPath("/generate"), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(openAiOnlyPayload());
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(counterValue("request_protocol_detected_payload"), 0);
+  EXPECT_EQ(counterValue("request_protocol_undetermined"), 1);
+}
+
+// Filter state outranks every inference, and unlike them it is enforced.
+TEST_F(AiProtocolManagerFilterTest, FilterStateOutranksDetection) {
+  setRouteConfigWithProtocol(envoy::type::ai::v3::API_PROTOCOL_UNSPECIFIED);
+  setRequestLlmProtocol(ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(decodeHeadersWithPath("/v1/messages"), Http::FilterHeadersStatus::StopIteration);
+
+  // Missing the `messages` Chat Completions requires.
+  Buffer::OwnedImpl body(R"({"model":"gpt-4"})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::BadRequest);
+  EXPECT_EQ(counterValue("request_protocol_from_filter_state"), 1);
+  EXPECT_EQ(counterValue("request_protocol_detected_headers"), 0);
+  EXPECT_EQ(counterValue("request_schema_invalid"), 1);
 }
 
 // Trailers arriving after a stream was rejected are dropped with StopIteration.

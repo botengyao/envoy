@@ -1,4 +1,3 @@
-#include "envoy/data/ai/v3/llm_protocol.pb.h"
 #include "envoy/registry/registry.h"
 #include "envoy/stream_info/filter_state.h"
 
@@ -26,15 +25,6 @@ protected:
 
   const StreamInfo::FilterState::ObjectFactory* factory_{nullptr};
 };
-
-TEST(RequestLlmProtocolTest, SerializesAsProto) {
-  const RequestLlmProtocol object(ApiProtocol::AnthropicMessages);
-  const auto message = object.serializeAsProto();
-  ASSERT_NE(message, nullptr);
-  const auto* proto = dynamic_cast<const envoy::data::ai::v3::RequestLlmProtocol*>(message.get());
-  ASSERT_NE(proto, nullptr);
-  EXPECT_EQ(proto->api_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
-}
 
 TEST(RequestLlmProtocolTest, SerializesAsEnumValueName) {
   EXPECT_EQ(RequestLlmProtocol(ApiProtocol::GeminiGenerateContent).serializeAsString(),

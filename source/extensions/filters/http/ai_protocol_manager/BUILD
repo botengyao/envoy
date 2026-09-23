@@ -106,6 +106,7 @@ envoy_cc_library(
     deps = [
         ":json_readers_lib",
         "//envoy/common:pure_lib",
+        "//envoy/http:header_map_interface",
         "//source/common/common:assert_lib",
         "@abseil-cpp//absl/strings",
         "@nlohmann_json//:json",
@@ -132,7 +133,6 @@ envoy_cc_library(
         "//envoy/registry",
         "//envoy/stream_info:filter_state_interface",
         "@abseil-cpp//absl/strings",
-        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
     ],
 )
 
@@ -143,6 +143,7 @@ envoy_cc_library(
         ":json_readers_lib",
         ":schema_lib",
         ":token_usage_lib",
+        "//envoy/http:header_map_interface",
         "//source/common/common:macros",
         "//source/extensions/filters/http/ai_protocol_manager/schema:anthropic_messages_lib",
         "//source/extensions/filters/http/ai_protocol_manager/schema:gemini_generate_content_lib",

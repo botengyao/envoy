@@ -4,6 +4,8 @@
 #include "source/extensions/filters/http/ai_protocol_manager/api_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 
+#include "test/test_common/utility.h"
+
 #include "gtest/gtest.h"
 
 namespace Envoy {
@@ -107,6 +109,134 @@ TEST(DetectFormatTest, Unknown) {
   EXPECT_EQ(AdapterRegistry::detect(parse(R"({"text":"hello"})")), ApiProtocol::Unspecified);
   // `ping` is a weak marker any gateway may emit: it must not lock detection.
   EXPECT_EQ(AdapterRegistry::detect(parse(R"({"type":"ping"})")), ApiProtocol::Unspecified);
+}
+
+// ---------------------------------------------------------------------------
+// Request detection, from headers.
+
+ApiProtocol detectHeaders(Http::TestRequestHeaderMapImpl headers) {
+  return AdapterRegistry::detectFromRequestHeaders(headers);
+}
+
+TEST(DetectRequestHeadersTest, MatchesEachProvidersPath) {
+  EXPECT_EQ(detectHeaders({{":path", "/v1/chat/completions"}}), ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(detectHeaders({{":path", "/v1/responses"}}), ApiProtocol::OpenAiResponses);
+  EXPECT_EQ(detectHeaders({{":path", "/v1/messages"}}), ApiProtocol::AnthropicMessages);
+  EXPECT_EQ(detectHeaders({{":path", "/v1beta/models/gemini-2.5-pro:generateContent"}}),
+            ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(detectHeaders({{":path", "/v1beta/models/gemini-2.5-pro:streamGenerateContent"}}),
+            ApiProtocol::GeminiGenerateContent);
+}
+
+// Gateways mount providers under a prefix, so the provider's own path is
+// matched as a suffix rather than whole.
+TEST(DetectRequestHeadersTest, MatchesUnderAGatewayPrefix) {
+  EXPECT_EQ(detectHeaders({{":path", "/openai/v1/chat/completions"}}),
+            ApiProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(detectHeaders({{":path", "/proxy/anthropic/v1/messages"}}),
+            ApiProtocol::AnthropicMessages);
+}
+
+TEST(DetectRequestHeadersTest, IgnoresQueryString) {
+  EXPECT_EQ(
+      detectHeaders({{":path", "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"}}),
+      ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(detectHeaders({{":path", "/v1/chat/completions?trace=1"}}),
+            ApiProtocol::OpenAiChatCompletions);
+}
+
+TEST(DetectRequestHeadersTest, FallsBackToTheAnthropicVersionHeader) {
+  EXPECT_EQ(detectHeaders({{":path", "/generate"}, {"anthropic-version", "2023-06-01"}}),
+            ApiProtocol::AnthropicMessages);
+}
+
+// The path is the API the client chose to call; a translating gateway routing
+// /chat/completions to an Anthropic backend still speaks OpenAI inbound.
+TEST(DetectRequestHeadersTest, PathWinsOverTheHeader) {
+  EXPECT_EQ(detectHeaders({{":path", "/v1/chat/completions"}, {"anthropic-version", "2023-06-01"}}),
+            ApiProtocol::OpenAiChatCompletions);
+}
+
+TEST(DetectRequestHeadersTest, UnknownPathDetectsNothing) {
+  EXPECT_EQ(detectHeaders({{":path", "/healthz"}}), ApiProtocol::Unspecified);
+  EXPECT_EQ(detectHeaders({{":path", "/"}}), ApiProtocol::Unspecified);
+  // A near miss must not match: the provider's path is /v1/messages.
+  EXPECT_EQ(detectHeaders({{":path", "/v2/messages"}}), ApiProtocol::Unspecified);
+}
+
+// ---------------------------------------------------------------------------
+// Request detection, from the payload's shape.
+
+TEST(DetectRequestPayloadTest, Gemini) {
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(
+                parse(R"({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})")),
+            ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(
+                parse(R"({"generationConfig":{"maxOutputTokens":8}})")),
+            ApiProtocol::GeminiGenerateContent);
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(
+                parse(R"({"system_instruction":{"parts":[{"text":"be terse"}]}})")),
+            ApiProtocol::GeminiGenerateContent);
+}
+
+TEST(DetectRequestPayloadTest, OpenAiResponses) {
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(R"({"model":"gpt-5","input":"hi"})")),
+            ApiProtocol::OpenAiResponses);
+}
+
+TEST(DetectRequestPayloadTest, AnthropicOnlyMarkers) {
+  const auto anthropic = [](const std::string& body) {
+    EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(body)),
+              ApiProtocol::AnthropicMessages)
+        << body;
+  };
+  anthropic(R"({"model":"m","messages":[],"system":"be terse"})");
+  anthropic(R"({"model":"m","messages":[],"stop_sequences":["END"]})");
+  anthropic(R"({"model":"m","messages":[],"top_k":5})");
+  anthropic(R"({"model":"m","messages":[],"thinking":{"type":"enabled"}})");
+  anthropic(R"({"model":"m","messages":[],"tools":[{"name":"t","input_schema":{}}]})");
+}
+
+TEST(DetectRequestPayloadTest, OpenAiOnlyMarkers) {
+  const auto openai = [](const std::string& body) {
+    EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(body)),
+              ApiProtocol::OpenAiChatCompletions)
+        << body;
+  };
+  openai(R"({"model":"m","messages":[],"max_completion_tokens":8})");
+  openai(R"({"model":"m","messages":[],"response_format":{"type":"json_object"}})");
+  openai(R"({"model":"m","messages":[],"frequency_penalty":0.1})");
+  openai(R"({"model":"m","messages":[],"stream_options":{"include_usage":true}})");
+  openai(R"({"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"t"}}]})");
+  // Anthropic admits only user and assistant turns.
+  openai(R"({"model":"m","messages":[{"role":"system","content":"be terse"}]})");
+  openai(R"({"model":"m","messages":[{"role":"tool","tool_call_id":"1","content":"ok"}]})");
+}
+
+// The most common payload in existence is valid under both dialects, so it is
+// left undetermined rather than guessed at.
+TEST(DetectRequestPayloadTest, MinimalPayloadIsAmbiguous) {
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(
+                parse(R"({"model":"m","messages":[{"role":"user","content":"hi"}]})")),
+            ApiProtocol::Unspecified);
+  // `max_tokens` is spelled the same way in both.
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(
+                R"({"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})")),
+            ApiProtocol::Unspecified);
+}
+
+TEST(DetectRequestPayloadTest, ConflictingMarkersDetectNothing) {
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(
+                parse(R"({"model":"m","messages":[],"top_k":5,"response_format":{}})")),
+            ApiProtocol::Unspecified);
+}
+
+TEST(DetectRequestPayloadTest, NonObjectAndEmptyDetectNothing) {
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(R"([1,2,3])")),
+            ApiProtocol::Unspecified);
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(R"({})")), ApiProtocol::Unspecified);
+  EXPECT_EQ(AdapterRegistry::detectFromRequestPayload(parse(R"({"model":"m"})")),
+            ApiProtocol::Unspecified);
 }
 
 TEST(DetectFormatTest, TypeMismatchedMarkersDoNotLock) {

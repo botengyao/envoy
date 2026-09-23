@@ -16,12 +16,15 @@ namespace AiProtocolManager {
 
 // The LLM wire protocol a request payload follows, named by a filter that knows
 // the caller rather than by the route that matched. The AI Protocol Manager
-// reads it in place of its route declaration where the route opted in; see
-// RouteConfig in filter.h.
+// takes it ahead of the route's own declaration; see RouteConfig in filter.h.
 //
 // A factory is registered under kFilterStateKey that builds the object from an
 // envoy.type.ai.v3.ApiProtocol enum-value name, so an extension that cannot link
 // this one -- set_filter_state, Lua, ext_proc -- can still set it.
+//
+// Serializes as that same name: the object holds one enum, so a string says
+// everything a proto would. Access logs therefore need ``:PLAIN`` or
+// ``:FIELD:api_protocol``, since ``%FILTER_STATE(key)%`` defaults to TYPED.
 class RequestLlmProtocol : public StreamInfo::FilterState::Object {
 public:
   static constexpr absl::string_view kFilterStateKey = "envoy.ai.llm_protocol.request";
@@ -31,7 +34,6 @@ public:
   ApiProtocol protocol() const { return protocol_; }
 
   // StreamInfo::FilterState::Object
-  ProtobufTypes::MessagePtr serializeAsProto() const override;
   std::optional<std::string> serializeAsString() const override;
   bool hasFieldSupport() const override { return true; }
   FieldType getField(absl::string_view field_name) const override;

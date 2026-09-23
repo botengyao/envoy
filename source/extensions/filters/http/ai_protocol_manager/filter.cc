@@ -231,10 +231,10 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
           Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(decoder_callbacks_);
       route_config != nullptr) {
     route_has_request_ = route_config->hasRequest();
-    route_request_protocol_ = resolveRequestProtocol(*route_config);
+    resolveRequestProtocol(*route_config, headers);
     if (route_has_request_) {
       ENVOY_LOG(debug, "ai_protocol_manager: AI endpoint with request API {}",
-                apiProtocolName(route_request_protocol_));
+                apiProtocolName(request_protocol_));
     }
   }
 
@@ -272,31 +272,42 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   return Http::FilterHeadersStatus::StopIteration;
 }
 
-ApiProtocol AiProtocolManagerFilter::resolveRequestProtocol(const RouteConfig& route_config) const {
-  // Looked up only where the route asked for it: every other stream would pay a
-  // filter state probe for a feature it does not use.
-  if (!route_config.requestProtocolFromFilterState()) {
-    return route_config.requestProtocol();
+void AiProtocolManagerFilter::resolveRequestProtocol(const RouteConfig& route_config,
+                                                     const Http::RequestHeaderMap& headers) {
+  // A filter that knows the caller outranks the route, which knows only the
+  // path. Naming no protocol is "I looked and did not know", and falls through.
+  if (const StreamInfo::FilterStateSharedPtr& filter_state =
+          decoder_callbacks_->streamInfo().filterState();
+      filter_state != nullptr) {
+    if (const auto* named =
+            filter_state->getDataReadOnly<RequestLlmProtocol>(RequestLlmProtocol::kFilterStateKey);
+        named != nullptr && named->protocol() != ApiProtocol::Unspecified) {
+      request_protocol_ = named->protocol();
+      request_protocol_source_ = ProtocolSource::FilterState;
+      config_->stats().request_protocol_from_filter_state_.inc();
+      return;
+    }
   }
 
-  const StreamInfo::FilterStateSharedPtr& filter_state =
-      decoder_callbacks_->streamInfo().filterState();
-  if (filter_state == nullptr) {
-    return route_config.requestProtocol();
+  if (route_config.requestProtocol() != ApiProtocol::Unspecified) {
+    request_protocol_ = route_config.requestProtocol();
+    request_protocol_source_ = ProtocolSource::Route;
+    return;
   }
 
-  const auto* declared =
-      filter_state->getDataReadOnly<RequestLlmProtocol>(RequestLlmProtocol::kFilterStateKey);
-  // An object naming no protocol is "I looked and did not know", which leaves
-  // the route's own declaration standing.
-  if (declared == nullptr || declared->protocol() == ApiProtocol::Unspecified) {
-    return route_config.requestProtocol();
+  // Nobody declared one. Inference only has a consumer on a declared endpoint,
+  // whose AI filters and payload schema are chosen by it.
+  if (!route_has_request_) {
+    return;
   }
 
-  config_->stats().request_protocol_from_filter_state_.inc();
-  ENVOY_LOG(debug, "ai_protocol_manager: filter state names request API {}",
-            apiProtocolName(declared->protocol()));
-  return declared->protocol();
+  if (const ApiProtocol detected = AdapterRegistry::detectFromRequestHeaders(headers);
+      detected != ApiProtocol::Unspecified) {
+    request_protocol_ = detected;
+    request_protocol_source_ = ProtocolSource::Headers;
+    config_->stats().request_protocol_detected_headers_.inc();
+  }
+  // Otherwise the payload's own shape gets a turn, once it has been parsed.
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
@@ -304,8 +315,7 @@ uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
   // schema may pin its own, because what has to stay inline for the payload to
   // validate is a property of the wire API, not of the deployment.
   if (isAiEndpoint()) {
-    if (const PayloadSchema* payload_schema =
-            AdapterRegistry::get(route_request_protocol_).schema();
+    if (const PayloadSchema* payload_schema = AdapterRegistry::get(request_protocol_).schema();
         payload_schema != nullptr) {
       if (const std::optional<uint32_t> pinned =
               payload_schema->requestInlineStringThresholdBytes();
@@ -354,11 +364,29 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
 
-    if (isAiEndpoint()) {
+    if (isAiEndpoint() && request_protocol_source_ == ProtocolSource::None) {
+      // Last resort, and necessarily after the parse: the payload's own shape.
+      // Too late to pin the parser's inline threshold, which is one more reason
+      // an inferred API is never validated.
+      if (const ApiProtocol detected =
+              AdapterRegistry::detectFromRequestPayload(request_json_.json());
+          detected != ApiProtocol::Unspecified) {
+        request_protocol_ = detected;
+        request_protocol_source_ = ProtocolSource::Payload;
+        config_->stats().request_protocol_detected_payload_.inc();
+      } else {
+        config_->stats().request_protocol_undetermined_.inc();
+      }
+      ENVOY_LOG(debug, "ai_protocol_manager: payload shape names request API {}",
+                apiProtocolName(request_protocol_));
+    }
+
+    // Only a contract someone declared is enforced; rejecting a request over an
+    // API the proxy merely guessed would fail valid traffic.
+    if (isAiEndpoint() && protocolIsDeclared()) {
       // TODO(penguingao): Support validating payload schema on the fly as the Wuffs parser
       // streams and parses chunks, rejecting invalid fields early before end_stream.
-      if (const PayloadSchema* payload_schema =
-              AdapterRegistry::get(route_request_protocol_).schema();
+      if (const PayloadSchema* payload_schema = AdapterRegistry::get(request_protocol_).schema();
           payload_schema != nullptr) {
         const absl::Status validation_status = payload_schema->validateRequest(request_json_);
         if (!validation_status.ok()) {
@@ -467,7 +495,7 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
   if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
     ASSERT(request_headers_ != nullptr);
     const AiFilterContext context{decoder_callbacks_->streamInfo(), *request_headers_,
-                                  route_request_protocol_};
+                                  request_protocol_};
     std::vector<AiFilterSharedPtr> filters;
     filters.reserve(config_->aiFilterFactories().size());
     for (const AiFilterFactoryCb& factory : config_->aiFilterFactories()) {

@@ -234,19 +234,6 @@ message RequestPerRoute {
   // will be added here once the transformation and its output contract
   // exist.]
   type.ai.v3.ApiProtocol api_protocol = 1 [(validate.rules).enum = {defined_only: true}];
-
-  // Take the wire API from the ``envoy.ai.llm_protocol.request`` filter state
-  // object -- :ref:`RequestLlmProtocol <envoy_v3_api_msg_data.ai.v3.RequestLlmProtocol>` --
-  // when a filter ahead of this one set it, falling back to ``api_protocol``
-  // when it did not or when it named no API. This is how a caller-aware filter,
-  // rather than the route table, decides which schema a payload is held to.
-  //
-  // Defaults to ``false``: which schema validates a payload is the route's
-  // decision, and an override is only as trustworthy as whatever set it.
-  //
-  // The object is read once, before the request body: the declared API
-  // configures the payload parser, so a value set later cannot be honored.
-  bool api_protocol_from_filter_state = 2;
 }
 
 // Per-route response-side behavior.

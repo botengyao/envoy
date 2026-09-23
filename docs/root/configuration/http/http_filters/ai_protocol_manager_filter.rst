@@ -57,8 +57,9 @@ enough that conversation content does not. A declared API whose payload schema
 pins its own threshold uses that instead.
 
 Upon stream completion, the parsed document is validated against the payload
-schema of the route's declared :ref:`wire API
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol>`,
+schema of the stream's :ref:`declared wire API
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol>`
+-- declared, not inferred; see `Resolving the request wire API`_ --
 for APIs with a defined schema (currently ``OPENAI_CHAT_COMPLETIONS``, ``ANTHROPIC_MESSAGES``
 and ``GEMINI_GENERATE_CONTENT``).
 Validation checks required fields, data types, enum values, and offload rules
@@ -132,34 +133,60 @@ declaration covers gateways whose response API differs from the request API,
 e.g. under protocol translation); when the response API is undeclared it
 falls back to the request API.
 
-Naming the wire API from filter state
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Resolving the request wire API
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On a declared AI endpoint the request wire API is resolved in this order, the
+first that yields one winning:
+
+#. The ``envoy.ai.llm_protocol.request`` filter state object, set by a filter
+   ahead of this one that knows the caller. An object naming
+   ``API_PROTOCOL_UNSPECIFIED`` says the writer looked and did not know, and
+   falls through.
+#. The route's own :ref:`api_protocol
+   <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol>`.
+#. The request path, matched against the URL contract each provider's REST API
+   defines -- ``/chat/completions``, ``/responses``, ``/v1/messages``,
+   ``:generateContent`` -- as a suffix, so mounting a provider under a gateway
+   prefix does not defeat it. The path is the API the client chose to call, so
+   it wins over the ``anthropic-version`` header, which is consulted only when
+   no path matched.
+#. The parsed payload's shape.
+
+The first two **declare** a contract; the last two **infer** one, and that
+difference decides what happens to a payload that does not match.
+
+Only a declared API is validated. A payload violating a declared API's payload
+schema is rejected with a 400. A payload violating an inferred API's schema is
+forwarded unchanged -- Envoy guessed the contract, and failing a request over a
+guess is not something the configuration asked for. An inferred API is still
+handed to the :ref:`AI filters
+<config_http_filters_ai_protocol_manager_ai_filters>`, which is what it is for.
+
+Inference from the payload is also necessarily late: the shape is only known
+once the body has been parsed, by which point the parser has been configured,
+so a schema pinning its own ``inline_string_threshold_bytes`` never got to
+apply. That is a second reason an inferred API is not enforced.
+
+Chat Completions and Anthropic Messages share the same ``messages[]`` request
+shape, so only keys exclusive to one of them separate the two. A payload
+carrying markers of both, or of neither -- including
+``{"model": ..., "messages": [{"role": "user", "content": ...}]}``, which is
+valid under either -- is left undetermined rather than guessed at. The
+``ai_protocol_manager.request_protocol_undetermined`` counter tracks that case.
 
 Where the wire API is a property of the caller rather than of the path -- one
-endpoint serving agents that each speak their own API -- the route table cannot
-express it without a route per caller. A route that sets
-:ref:`api_protocol_from_filter_state
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol_from_filter_state>`
-instead takes the request wire API from the ``envoy.ai.llm_protocol.request``
-filter state object -- :ref:`RequestLlmProtocol
-<envoy_v3_api_msg_data.ai.v3.RequestLlmProtocol>` -- set by a filter ahead of
-this one that recognizes the caller. It falls back to ``api_protocol`` when no
-object was set, or when the object names ``API_PROTOCOL_UNSPECIFIED``.
+endpoint serving agents that each speak their own API -- the filter state object
+is how a filter that recognizes the caller names it. It must be set before this
+filter's decode headers, because the API configures the payload parser before
+the first body byte; a filter that can only decide from the body is too late.
 
-The object has to be set before this filter's decode headers: the declared API
-configures the payload parser, so the filter that names it must decide from the
-request headers alone. A filter that can only decide from the body is too late.
-
-This is off by default. Which schema a payload is held to stays the route's
-decision, because an override is only as trustworthy as whatever set it; the
-``ai_protocol_manager.request_protocol_from_filter_state`` counter shows how
-often one took effect.
-
-Setting the object needs no dependency on this filter: it is registered with a
-filter state object factory that builds it from an :ref:`ApiProtocol
+Setting it needs no dependency on this filter: it is registered with a filter
+state object factory that builds it from an :ref:`ApiProtocol
 <envoy_v3_api_enum_type.ai.v3.ApiProtocol>` enum-value name, so
 :ref:`set_filter_state <config_http_filters_set_filter_state>`, Lua and ext_proc
-can all write it.
+can all write it. It serializes as that same name, so access logs read it with
+``%FILTER_STATE(envoy.ai.llm_protocol.request:PLAIN)%``.
 
 .. code-block:: yaml
 
@@ -180,20 +207,6 @@ can all write it.
 The example reads a request header, which is only safe for a header the edge
 strips from client requests: a caller that can set it picks the schema its own
 payload is validated against.
-
-.. code-block:: yaml
-
-  routes:
-  - match:
-      prefix: "/"
-    route:
-      cluster: llm
-    typed_per_filter_config:
-      envoy.filters.http.ai_protocol_manager:
-        "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
-        request:
-          api_protocol: OPENAI_CHAT_COMPLETIONS
-          api_protocol_from_filter_state: true
 
 Filter-level configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -251,8 +264,9 @@ tool counts as :ref:`envoy.data.ai.v3.RequestInfo
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
 
-Attributes are read according to the route's declared :ref:`wire API
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol>`:
+Attributes are read according to the stream's :ref:`wire API
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol>`,
+however it was resolved:
 
 .. csv-table::
   :header: Attribute, OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Gemini
@@ -564,7 +578,10 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   request_parse_error, Counter, A declared AI endpoint's payload was not well-formed JSON and was rejected with a 400.
   request_schema_invalid, Counter, "A declared AI endpoint's payload parsed but violated its API's payload schema, and was rejected with a 400."
   request_passthrough, Counter, "A payload on an unconfigured route failed to parse under :ref:`parse_unconfigured_routes <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>` and was forwarded unchanged; never a request failure."
-  request_protocol_from_filter_state, Counter, "A route that set :ref:`api_protocol_from_filter_state <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.api_protocol_from_filter_state>` took its request wire API from the ``envoy.ai.llm_protocol.request`` filter state object rather than from its own declaration."
+  request_protocol_from_filter_state, Counter, The request wire API was taken from the ``envoy.ai.llm_protocol.request`` filter state object rather than from the route's declaration.
+  request_protocol_detected_headers, Counter, "Neither filter state nor the route named a request wire API and one was inferred from the request path or headers; an inferred API is not validated."
+  request_protocol_detected_payload, Counter, "The path named no request wire API and one was inferred from the parsed payload's shape; an inferred API is not validated."
+  request_protocol_undetermined, Counter, "A declared AI endpoint's request wire API could not be resolved or inferred; the payload is parsed but held to no schema."
   request_external_buffer_error, Counter, The external buffer failed irrecoverably on the request path and the stream was answered with a 500.
   response_external_buffer_error, Counter, The external buffer failed irrecoverably on the response path and the stream was answered with a 500.
   token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).

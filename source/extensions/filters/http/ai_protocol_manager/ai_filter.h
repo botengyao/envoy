@@ -121,7 +121,8 @@ using AiFilterSharedPtr = std::shared_ptr<AiFilter>;
 struct AiFilterContext {
   StreamInfo::StreamInfo& stream_info;
   const Http::RequestHeaderMap& request_headers;
-  // Route-declared request wire API; Unspecified when the route named none.
+  // The stream's request wire API: declared by a filter state object or the
+  // route, else inferred from the request; Unspecified when none of them knew.
   ApiProtocol request_protocol;
 };
 

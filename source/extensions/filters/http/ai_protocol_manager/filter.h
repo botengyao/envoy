@@ -88,7 +88,6 @@ public:
   explicit RouteConfig(const PerRouteProto& proto)
       : has_request_(proto.has_request()),
         request_protocol_(protocolFromProto(proto.request().api_protocol())),
-        request_protocol_from_filter_state_(proto.request().api_protocol_from_filter_state()),
         response_protocol_(protocolFromProto(proto.response().api_protocol())) {}
 
   // Whether the route hands its request payload to the filter to hold and
@@ -96,10 +95,6 @@ public:
   bool hasRequest() const { return has_request_; }
   ApiProtocol requestProtocol() const { return request_protocol_; }
   ApiProtocol responseProtocol() const { return response_protocol_; }
-
-  // Whether a RequestLlmProtocol filter state object, when one is set, names
-  // the request wire API in place of requestProtocol().
-  bool requestProtocolFromFilterState() const { return request_protocol_from_filter_state_; }
 
   // The wire API for response extraction on this route: the declared response
   // API, falling back to the declared request API.
@@ -110,9 +105,14 @@ public:
 private:
   const bool has_request_ = false;
   const ApiProtocol request_protocol_ = ApiProtocol::Unspecified;
-  const bool request_protocol_from_filter_state_ = false;
   const ApiProtocol response_protocol_ = ApiProtocol::Unspecified;
 };
+
+// Where a stream's request wire API came from, in the order it is resolved: a
+// filter state object, then the route's declaration, then the request headers,
+// then the parsed payload's shape. Only a declared contract is validated -- an
+// inferred one informs the AI filter chain and never fails a request.
+enum class ProtocolSource { None, FilterState, Route, Headers, Payload };
 
 // AI Protocol Manager HTTP filter (alpha).
 //
@@ -194,9 +194,16 @@ public:
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap& trailers) override;
 
 private:
-  // The request wire API for this stream: what the route declared, or what a
-  // RequestLlmProtocol filter state object named where the route opted in.
-  ApiProtocol resolveRequestProtocol(const RouteConfig& route_config) const;
+  // Resolves request_protocol_ and its source; see ProtocolSource.
+  void resolveRequestProtocol(const RouteConfig& route_config,
+                              const Http::RequestHeaderMap& headers);
+
+  // Whether the wire API was declared rather than inferred, which is what makes
+  // a payload schema violation fatal.
+  bool protocolIsDeclared() const {
+    return request_protocol_source_ == ProtocolSource::FilterState ||
+           request_protocol_source_ == ProtocolSource::Route;
+  }
 
   // Feeds one body frame to the parser in place. Returns false only if the
   // payload was rejected, in which case the caller must not offload or replay
@@ -245,7 +252,8 @@ private:
   // can be re-resolved mid-stream, which would leave a cached pointer dangling,
   // and these are two scalars.
   bool route_has_request_{false};
-  ApiProtocol route_request_protocol_{ApiProtocol::Unspecified};
+  ApiProtocol request_protocol_{ApiProtocol::Unspecified};
+  ProtocolSource request_protocol_source_{ProtocolSource::None};
 
   JsonWithExtBuf request_json_;
   // Cleared once parsing is done with, whether it completed, was abandoned, or

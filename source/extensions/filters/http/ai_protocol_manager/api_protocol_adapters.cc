@@ -233,6 +233,51 @@ protected:
   }
 };
 
+const Http::LowerCaseString& anthropicVersionHeader() {
+  CONSTRUCT_ON_FIRST_USE(Http::LowerCaseString, "anthropic-version");
+}
+
+bool hasAnyKey(const nlohmann::json& json, std::initializer_list<absl::string_view> keys) {
+  for (const absl::string_view key : keys) {
+    if (json.find(key) != json.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether any declared tool carries `key`. This is where the two `messages[]`
+// dialects differ: Anthropic puts the schema inline as `input_schema`, OpenAI
+// nests the whole declaration under `function`.
+bool toolsCarry(const nlohmann::json& json, absl::string_view key) {
+  const auto tools = json.find(Keys::Tools);
+  if (tools == json.end() || !tools->is_array()) {
+    return false;
+  }
+  for (const nlohmann::json& tool : *tools) {
+    if (tool.is_object() && tool.find(key) != tool.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Roles Chat Completions defines that Anthropic Messages rejects: it admits
+// only `user` and `assistant`, and carries its system prompt out of band.
+bool hasOpenAiOnlyRole(const nlohmann::json& messages) {
+  if (!messages.is_array()) {
+    return false;
+  }
+  for (const nlohmann::json& message : messages) {
+    const auto role = readString(message, Keys::Role);
+    if (role.has_value() &&
+        (role.value() == "system" || role.value() == "developer" || role.value() == "tool")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 const ApiProtocolAdapter& AdapterRegistry::get(ApiProtocol protocol) {
@@ -319,6 +364,76 @@ ApiProtocol AdapterRegistry::detect(const nlohmann::json& json) {
   }
 
   return ApiProtocol::Unspecified;
+}
+
+ApiProtocol AdapterRegistry::detectFromRequestHeaders(const Http::RequestHeaderMap& headers) {
+  absl::string_view path = headers.getPathValue();
+  // Gateways prefix-rewrite, so the provider's path is matched as a suffix; the
+  // query goes first, since Gemini's streaming form carries `?alt=sse`.
+  if (const size_t query = path.find('?'); query != absl::string_view::npos) {
+    path = path.substr(0, query);
+  }
+
+  if (absl::EndsWith(path, "/chat/completions")) {
+    return ApiProtocol::OpenAiChatCompletions;
+  }
+  if (absl::EndsWith(path, "/responses")) {
+    return ApiProtocol::OpenAiResponses;
+  }
+  if (absl::EndsWith(path, "/v1/messages")) {
+    return ApiProtocol::AnthropicMessages;
+  }
+  // Gemini addresses the model in the path, so only the verb is fixed.
+  if (absl::EndsWith(path, ":generateContent") || absl::EndsWith(path, ":streamGenerateContent")) {
+    return ApiProtocol::GeminiGenerateContent;
+  }
+
+  // Only once the path has decided nothing: Anthropic requires this header and
+  // no other dialect defines it.
+  if (!headers.get(anthropicVersionHeader()).empty()) {
+    return ApiProtocol::AnthropicMessages;
+  }
+  return ApiProtocol::Unspecified;
+}
+
+ApiProtocol AdapterRegistry::detectFromRequestPayload(const nlohmann::json& json) {
+  if (!json.is_object()) {
+    return ApiProtocol::Unspecified;
+  }
+
+  // Gemini names its turns `contents` and carries no top-level `model` at all,
+  // so it is structurally distinct from both `messages[]` dialects.
+  if (const auto it = json.find(Keys::Contents);
+      it != json.end() && it->is_array() && !it->empty() && it->front().is_object()) {
+    return ApiProtocol::GeminiGenerateContent;
+  }
+  if (hasAnyKey(json, {Keys::SystemInstruction, Keys::SystemInstructionSnake,
+                       Keys::GenerationConfig, Keys::GenerationConfigSnake})) {
+    return ApiProtocol::GeminiGenerateContent;
+  }
+
+  const auto messages = json.find(Keys::Messages);
+  if (messages == json.end()) {
+    // The Responses API replaces `messages` with `input`.
+    return json.find(Keys::Input) != json.end() ? ApiProtocol::OpenAiResponses
+                                                : ApiProtocol::Unspecified;
+  }
+
+  const bool anthropic =
+      hasAnyKey(json, {Keys::System, Keys::StopSequences, Keys::TopK, Keys::Thinking}) ||
+      toolsCarry(json, Keys::InputSchema);
+  const bool openai =
+      hasAnyKey(json, {Keys::MaxCompletionTokens, Keys::ResponseFormat, Keys::FrequencyPenalty,
+                       Keys::PresencePenalty, Keys::StreamOptions, Keys::LogitBias}) ||
+      toolsCarry(json, Keys::Function) || hasOpenAiOnlyRole(*messages);
+
+  // Markers of both dialects, or of neither: `{"model": ..., "messages":
+  // [{"role": "user", "content": ...}]}` is valid in either and cannot be told
+  // apart, so nothing is claimed.
+  if (anthropic == openai) {
+    return ApiProtocol::Unspecified;
+  }
+  return anthropic ? ApiProtocol::AnthropicMessages : ApiProtocol::OpenAiChatCompletions;
 }
 
 } // namespace AiProtocolManager

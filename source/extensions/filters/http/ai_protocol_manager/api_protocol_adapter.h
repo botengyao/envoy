@@ -1,6 +1,7 @@
 #pragma once
 
 #include "envoy/common/pure.h"
+#include "envoy/http/header_map.h"
 
 #include "source/extensions/filters/http/ai_protocol_manager/token_usage.h"
 
@@ -82,6 +83,19 @@ public:
   // markers decide; anything else stays Unspecified for a later document.
   // Marker checks are ordered from most to least structurally distinctive.
   static ApiProtocol detect(const nlohmann::json& json);
+
+  // Detect a request's API from the URL contract the provider's REST API
+  // defines, plus a marker header where the path alone does not decide. The
+  // path wins, so a translating gateway's /chat/completions route still reads
+  // as the API the client called rather than the one it is routed to.
+  static ApiProtocol detectFromRequestHeaders(const Http::RequestHeaderMap& headers);
+
+  // Detect a request's API from its parsed payload's shape, for a request whose
+  // path named nothing. Chat Completions and Anthropic Messages share
+  // `messages[]`, so only keys exclusive to one of them separate the two: a
+  // payload carrying markers of both, or of neither, stays Unspecified rather
+  // than guessing between them.
+  static ApiProtocol detectFromRequestPayload(const nlohmann::json& json);
 };
 
 // Canonicalizes a finalized accumulation with its own protocol's adapter --
