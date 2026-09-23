@@ -1028,6 +1028,255 @@ TEST(TranscodingEngineTest, VerifierTracksOffloadableFieldProvenanceAcrossMoveAn
   EXPECT_EQ(unwrapped_multi_status.code(), absl::StatusCode::kInvalidArgument);
 }
 
+nlohmann::json parseJson(absl::string_view text) {
+  nlohmann::json parsed = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+  EXPECT_FALSE(parsed.is_discarded()) << text;
+  return parsed;
+}
+
+TEST(TranscodingEngineTest, PackReturnsTheRegisteredPack) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  for (LLMProtocol protocol : {LLMProtocol::OpenAiChatCompletions, LLMProtocol::AnthropicMessages,
+                               LLMProtocol::GeminiGenerateContent}) {
+    const DialectTranscodePack* pack = engine_or->pack(protocol);
+    ASSERT_NE(pack, nullptr);
+    EXPECT_EQ(pack->protocol, protocol);
+    EXPECT_EQ(pack->dialect_schema, AdapterRegistry::get(protocol).schema());
+  }
+  EXPECT_EQ(engine_or->pack(LLMProtocol::OpenAiResponses), nullptr);
+  EXPECT_EQ(engine_or->pack(LLMProtocol::Unspecified), nullptr);
+  EXPECT_EQ(TranscodingEngine().pack(LLMProtocol::OpenAiChatCompletions), nullptr);
+}
+
+// Regression: the Anthropic SDKs send a client tool's optional `type` as `custom`, which the IR
+// schema rejects because only `function` tools exist there.
+TEST(TranscodingEngineTest, MapsAnthropicCustomToolTypeToFunction) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "What time is it?"}],
+    "tools": [
+      {"type": "custom", "name": "now", "input_schema": {"type": "object"}},
+      {"name": "get_weather", "input_schema": {"type": "object"}}
+    ]
+  })");
+  ASSERT_THAT(engine_or->transcodeToIr(LLMProtocol::AnthropicMessages, payload), IsOk());
+  EXPECT_EQ(payload["tools"], parseJson(R"([
+    {"type": "function", "function": {"name": "now", "parameters": {"type": "object"}}},
+    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+  ])"));
+  EXPECT_THAT(engine_or->transcodeFromIr(TranscodingEngine::kIrProtocol, payload), IsOk());
+}
+
+// Regression: Anthropic's end-user id stayed under `metadata`, where the IR keeps OpenAI's
+// free-form stored-completion tags, instead of reaching the IR's `user`.
+TEST(TranscodingEngineTest, MapsAnthropicMetadataUserIdToIrUser) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 64,
+    "metadata": {"user_id": "user-42"},
+    "messages": [{"role": "user", "content": "Hi"}]
+  })");
+  ASSERT_THAT(engine_or->transcodeToIr(LLMProtocol::AnthropicMessages, payload), IsOk());
+  EXPECT_EQ(payload["user"], "user-42");
+  EXPECT_FALSE(payload.contains("metadata"));
+}
+
+// Regression: `candidateCount`, `seed` and the penalties have direct IR equivalents but were
+// dropped with the rest of `generationConfig`.
+TEST(TranscodingEngineTest, HoistsGeminiSamplingFieldsIntoTheIr) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  const PayloadSchema* ir_schema = AdapterRegistry::get(TranscodingEngine::kIrProtocol).schema();
+  ASSERT_NE(ir_schema, nullptr);
+
+  nlohmann::json camel = parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+    "generationConfig": {"candidateCount": 2, "seed": "42", "presencePenalty": 0.5,
+                         "frequencyPenalty": "-0.5", "topK": 40}
+  })");
+  ASSERT_THAT(engine_or->transcodeToIr(LLMProtocol::GeminiGenerateContent, camel), IsOk());
+  EXPECT_EQ(camel, parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "user", "content": "Hi"}],
+    "n": 2,
+    "seed": 42,
+    "presence_penalty": 0.5,
+    "frequency_penalty": -0.5
+  })"));
+  EXPECT_THAT(ir_schema->validateRequest(camel), IsOk());
+
+  nlohmann::json snake = parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "system_instruction": {"parts": [{"text": "Be brief."}]},
+    "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+    "generation_config": {"candidate_count": "1", "seed": 7, "presence_penalty": "0.25",
+                          "frequency_penalty": 0.75, "max_output_tokens": 16}
+  })");
+  ASSERT_THAT(engine_or->transcodeToIr(LLMProtocol::GeminiGenerateContent, snake), IsOk());
+  EXPECT_EQ(snake, parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
+    "max_completion_tokens": 16,
+    "n": 1,
+    "seed": 7,
+    "presence_penalty": 0.25,
+    "frequency_penalty": 0.75
+  })"));
+  EXPECT_THAT(ir_schema->validateRequest(snake), IsOk());
+}
+
+// Regression: the JSON mapping's "NaN" and "Infinity" became non-finite doubles, which pass every
+// range check and then serialize as null.
+TEST(TranscodingEngineTest, LeavesNonFiniteGeminiNumbersForValidationToReject) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+    "generationConfig": {"temperature": "NaN", "topP": "Infinity", "presencePenalty": "-inf",
+                         "frequencyPenalty": "0.5"}
+  })");
+  ASSERT_THAT(engine_or->transcodeToIr(LLMProtocol::GeminiGenerateContent, payload), IsOk());
+  EXPECT_EQ(payload["temperature"], "NaN");
+  EXPECT_EQ(payload["top_p"], "Infinity");
+  EXPECT_EQ(payload["presence_penalty"], "-inf");
+  EXPECT_EQ(payload["frequency_penalty"], 0.5);
+  EXPECT_EQ(engine_or->transcodeFromIr(LLMProtocol::AnthropicMessages, payload).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+// Regression: a system message with null content was concatenated with the other system prompts
+// as a text block with null text, which Anthropic's schema rejects.
+TEST(TranscodingEngineTest, SkipsNullSystemContentWhenCollectingSystemPrompts) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {"role": "system", "content": null},
+      {"role": "developer", "content": "Be brief."},
+      {"role": "user", "content": "Hi"}
+    ]
+  })");
+  ASSERT_THAT(engine_or->transcodeFromIr(LLMProtocol::AnthropicMessages, payload), IsOk());
+  EXPECT_EQ(payload["system"], "Be brief.");
+
+  nlohmann::json only_null = parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "messages": [{"role": "system", "content": null}, {"role": "user", "content": "Hi"}]
+  })");
+  ASSERT_THAT(engine_or->transcodeFromIr(LLMProtocol::GeminiGenerateContent, only_null), IsOk());
+  EXPECT_FALSE(only_null.contains("systemInstruction"));
+}
+
+// Regression: OpenAI lets a function without arguments omit `parameters`, but Anthropic requires
+// every custom tool to carry `input_schema` and rejected the converted request.
+TEST(TranscodingEngineTest, DefaultsAnthropicInputSchemaForFunctionsWithoutParameters) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "messages": [{"role": "user", "content": "What time is it?"}],
+    "tools": [
+      {"type": "function", "function": {"name": "now", "description": "Current time"}},
+      {"type": "function", "function": {"name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+    ],
+    "tool_choice": {"type": "function", "function": {"name": "now"}}
+  })");
+  ASSERT_THAT(engine_or->transcodeFromIr(LLMProtocol::AnthropicMessages, payload), IsOk());
+  EXPECT_EQ(payload["tools"], parseJson(R"([
+    {"name": "now", "description": "Current time", "input_schema": {"type": "object"}},
+    {"name": "get_weather",
+     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+  ])"));
+  EXPECT_EQ(payload["tool_choice"], parseJson(R"({"type": "tool", "name": "now"})"));
+}
+
+TEST(TranscodingEngineTest, TranscodesARealisticOpenAiConversationToAnthropic) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "messages": [
+      {"role": "system", "content": [{"type": "text", "text": "You are terse."}]},
+      {"role": "developer", "content": "Use metric units."},
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": [{"type": "text", "text": "Sunny, 21C."}]},
+      {"role": "user", "content": [{"type": "text", "text": "And tomorrow?"}]}
+    ],
+    "max_tokens": 300,
+    "stop": ["\n\n", "END"],
+    "temperature": 0.7,
+    "tool_choice": "auto",
+    "tools": [{"type": "function", "function": {"name": "forecast",
+                                                "parameters": {"type": "object"}}}]
+  })");
+  ASSERT_THAT(engine_or->transcodeFromIr(LLMProtocol::AnthropicMessages, payload), IsOk());
+  EXPECT_EQ(payload, parseJson(R"({
+    "model": "claude-sonnet-4-5",
+    "system": [
+      {"type": "text", "text": "You are terse."},
+      {"type": "text", "text": "Use metric units."}
+    ],
+    "messages": [
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": [{"type": "text", "text": "Sunny, 21C."}]},
+      {"role": "user", "content": [{"type": "text", "text": "And tomorrow?"}]}
+    ],
+    "max_tokens": 300,
+    "stop_sequences": ["\n\n", "END"],
+    "temperature": 0.7,
+    "tool_choice": {"type": "auto"},
+    "tools": [{"name": "forecast", "input_schema": {"type": "object"}}]
+  })"));
+}
+
+TEST(TranscodingEngineTest, TranscodesARealisticOpenAiConversationToGemini) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+
+  nlohmann::json payload = parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {"role": "system", "content": [{"type": "text", "text": "You are terse."},
+                                     {"type": "text", "text": "Answer in French."}]},
+      {"role": "user", "content": "Hi"},
+      {"role": "assistant", "content": "Bonjour."},
+      {"role": "user", "content": [{"type": "text", "text": "Weather?"}]}
+    ],
+    "max_completion_tokens": 50,
+    "stop": "END",
+    "top_p": 0.5,
+    "tool_choice": "required"
+  })");
+  ASSERT_THAT(engine_or->transcodeFromIr(LLMProtocol::GeminiGenerateContent, payload), IsOk());
+  EXPECT_EQ(payload, parseJson(R"({
+    "model": "gemini-2.5-flash",
+    "systemInstruction": {"parts": [{"text": "You are terse."}, {"text": "Answer in French."}]},
+    "contents": [
+      {"role": "user", "parts": [{"text": "Hi"}]},
+      {"role": "model", "parts": [{"text": "Bonjour."}]},
+      {"role": "user", "parts": [{"text": "Weather?"}]}
+    ],
+    "generationConfig": {"maxOutputTokens": 50, "stopSequences": ["END"], "topP": 0.5},
+    "toolConfig": {"functionCallingConfig": {"mode": "ANY"}}
+  })"));
+}
+
 TEST(TranscodingEngineTest, CoversAllRuleAndEngineEdgeCases) {
   // 1. Exercise `TranscodeRule` introspection accessors and `std::vector<TranscodeRule>` rule set.
   TranscodeRule rule = TranscodeRule::valueMap("role", {{"bot", "assistant"}},

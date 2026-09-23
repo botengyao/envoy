@@ -58,7 +58,19 @@ message AiProtocolManager {
 // has its payload held, offloaded, and parsed strictly: a body that is not
 // well-formed JSON is rejected with a 400 rather than forwarded for the
 // upstream to interpret differently.
+// [#next-free-field: 5]
 message RequestHandling {
+  // When the request body is written back out after the AI filters finish.
+  enum BodyReserialization {
+    // Only when an AI filter modified the request; otherwise the body is forwarded exactly as
+    // received.
+    IF_MODIFIED = 0;
+
+    // Always: the body the upstream receives is the parsed document re-serialized as compact
+    // JSON, whether or not an AI filter modified it.
+    ALWAYS = 1;
+  }
+
   // Attempt best-effort JSON parsing on routes without a per-route
   // configuration.
   //
@@ -76,6 +88,16 @@ message RequestHandling {
 
   // Request-path parsing limits. Defaults apply when unset.
   RequestParsingLimits limits = 2;
+
+  // Publish the request's internal representation, when an AI filter has set one (the
+  // :ref:`transcoder's internal leg
+  // <envoy_v3_api_field_extensions.http.ai_filters.transcoder.v3.Transcoder.internal>`), under the
+  // ``envoy.ai.request_ir`` filter state key once the AI filters finish and before the request
+  // headers continue. Later HTTP filters, route matchers and access logs can then read it, for
+  // example ``%FILTER_STATE(envoy.ai.request_ir:FIELD:model)%`` to route on the model.
+  bool publish_request_ir = 3;
+
+  BodyReserialization reserialize_body = 4 [(validate.rules).enum = {defined_only: true}];
 }
 
 // Per-stream limits for request payload parsing.

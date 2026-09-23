@@ -306,6 +306,9 @@ public:
   }
   absl::Status transcodeFromIr(LLMProtocol target_protocol, nlohmann::json& json) const;
 
+  // The pack registered for `protocol`, or nullptr when there is none.
+  const DialectTranscodePack* pack(LLMProtocol protocol) const;
+
 private:
   absl::flat_hash_map<LLMProtocol, DialectTranscodePack> packs_;
 };

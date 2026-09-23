@@ -34,6 +34,62 @@ absl::StatusOr<std::string> dumpJson(const nlohmann::json& node) noexcept {
   return absl::InternalError("unexpected flow in dumpJson");
 }
 
+nlohmann::json emptyContainerFor(const FieldPathSegment& child_segment) {
+  return absl::holds_alternative<std::string>(child_segment) ? nlohmann::json::object()
+                                                             : nlohmann::json::array();
+}
+
+// Adds a null child at `segment`, which must name a new key or the next index of `container`.
+absl::StatusOr<nlohmann::json*> appendChild(nlohmann::json& container,
+                                            const FieldPathSegment& segment, size_t field_index) {
+  if (container.is_object()) {
+    if (!absl::holds_alternative<std::string>(segment)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("ai json: field ", field_index, " indexes an object as an array"));
+    }
+    auto [it, inserted] =
+        container.get_ref<nlohmann::json::object_t&>().try_emplace(absl::get<std::string>(segment));
+    if (!inserted) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("ai json: field ", field_index, " repeats an object key"));
+    }
+    return &it->second;
+  }
+  ASSERT(container.is_array());
+  if (!absl::holds_alternative<size_t>(segment)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("ai json: field ", field_index, " keys into an array"));
+  }
+  nlohmann::json::array_t& array = container.get_ref<nlohmann::json::array_t&>();
+  if (absl::get<size_t>(segment) != array.size()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("ai json: field ", field_index, " skips or revisits an array index"));
+  }
+  return &array.emplace_back();
+}
+
+void flattenInto(const nlohmann::json& node, std::vector<FieldPathSegment>& path,
+                 std::vector<FlattenJsonField>& fields) {
+  if (node.is_object() && !node.empty()) {
+    for (const auto& [key, child] : node.get_ref<const nlohmann::json::object_t&>()) {
+      path.emplace_back(key);
+      flattenInto(child, path, fields);
+      path.pop_back();
+    }
+    return;
+  }
+  if (node.is_array() && !node.empty()) {
+    size_t index = 0;
+    for (const nlohmann::json& child : node.get_ref<const nlohmann::json::array_t&>()) {
+      path.emplace_back(index++);
+      flattenInto(child, path, fields);
+      path.pop_back();
+    }
+    return;
+  }
+  fields.emplace_back(path, node);
+}
+
 } // namespace
 
 uint64_t FlattenJsonField::byteSize() const {
@@ -395,6 +451,94 @@ Coroutine::Task<absl::Status> FlatteningJsonSerializer::flushBuffer() {
     CO_RETURN_IF_ERROR(co_await ReplayAwaitable(out_, small_buf_));
   }
   co_return absl::OkStatus();
+}
+
+absl::StatusOr<nlohmann::json> unflattenJson(absl::Span<const FlattenJsonField> fields) {
+  if (fields.empty()) {
+    return absl::InvalidArgumentError("ai json: no fields to unflatten");
+  }
+  nlohmann::json root;
+  // containers[k] holds segment k of the previous field's path.
+  std::vector<nlohmann::json*> containers;
+  // The string a partial chunk left open for the next chunk.
+  nlohmann::json* open_string = nullptr;
+
+  for (size_t i = 0; i < fields.size(); ++i) {
+    const FlattenJsonField& field = fields[i];
+    const FieldPath path = field.field_path();
+    const nlohmann::json& node = field.node();
+
+    if (open_string != nullptr) {
+      const FieldPath previous = fields[i - 1].field_path();
+      if (!node.is_string() ||
+          !std::equal(path.begin(), path.end(), previous.begin(), previous.end())) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("ai json: field ", i, " interrupts a partial string"));
+      }
+      open_string->get_ref<std::string&>().append(node.get_ref<const std::string&>());
+      if (!field.is_partial()) {
+        open_string = nullptr;
+      }
+      continue;
+    }
+    if (node.is_structured() && !node.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("ai json: field ", i, " is a non-empty container, not a leaf"));
+    }
+    if (field.is_partial() && !node.is_string()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("ai json: field ", i, " is a partial chunk of a non-string"));
+    }
+
+    size_t depth = 0;
+    if (i == 0) {
+      if (!path.empty()) {
+        root = emptyContainerFor(path[0]);
+        containers.push_back(&root);
+      }
+    } else {
+      const FieldPath previous = fields[i - 1].field_path();
+      const size_t max_common = std::min(path.size(), previous.size());
+      while (depth < max_common && path[depth] == previous[depth]) {
+        ++depth;
+      }
+      // Each leaf after the first branches off the previous one inside a container both share.
+      if (depth == path.size() || depth == previous.size()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("ai json: field ", i, " overlaps the field before it"));
+      }
+      containers.resize(depth + 1);
+    }
+
+    nlohmann::json* leaf = &root;
+    for (; depth < path.size(); ++depth) {
+      absl::StatusOr<nlohmann::json*> child = appendChild(*containers[depth], path[depth], i);
+      if (!child.ok()) {
+        return child.status();
+      }
+      leaf = *child;
+      if (depth + 1 < path.size()) {
+        *leaf = emptyContainerFor(path[depth + 1]);
+        containers.push_back(leaf);
+      }
+    }
+    *leaf = node;
+    if (field.is_partial()) {
+      open_string = leaf;
+    }
+  }
+
+  if (open_string != nullptr) {
+    return absl::InvalidArgumentError("ai json: fields end inside a partial string");
+  }
+  return root;
+}
+
+std::vector<FlattenJsonField> flattenJson(const nlohmann::json& doc) {
+  std::vector<FlattenJsonField> fields;
+  std::vector<FieldPathSegment> path;
+  flattenInto(doc, path, fields);
+  return fields;
 }
 
 } // namespace AiProtocolManager

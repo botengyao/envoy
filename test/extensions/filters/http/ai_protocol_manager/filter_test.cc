@@ -1304,13 +1304,14 @@ TEST_F(AiProtocolManagerFilterTest, ParsesDeclaredEndpointPayloadAndReplaysItVer
   EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
 
   const std::string payload =
-      R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":256})";
+      "{ \"stream\": true, \"model\": \"gpt-4\",\n"
+      "  \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"max_tokens\": 256 }\n";
   Buffer::OwnedImpl body(payload);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_EQ(nlohmann::json::parse(injected_.toString()), nlohmann::json::parse(payload));
+  EXPECT_EQ(injected_.toString(), payload);
   EXPECT_TRUE(injected_end_stream_);
   EXPECT_EQ(counterValue("request_parsed"), 1);
   EXPECT_EQ(counterValue("request_parse_error"), 0);
@@ -1335,7 +1336,7 @@ public:
     ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
     seen_.push_back({context_.request_protocol,
                      std::string(context_.request_headers.getPathValue()), &context_.stream_info});
-    request->json()["model"] = "rewritten";
+    request->mutableJson()["model"] = "rewritten";
     co_return co_await std::move(propagate_request)(std::move(request));
   }
 
@@ -1403,26 +1404,105 @@ TEST_F(AiProtocolManagerFilterTest, NullAiFilterIsSkipped) {
   EXPECT_TRUE(injected_end_stream_);
 }
 
-// Content-Length header is set to the recalculated length when the filter manager serializes the
-// payload.
-TEST_F(AiProtocolManagerFilterTest, SetsContentLengthOnReplay) {
+// An unmodified payload is replayed as received, so its Content-Length still holds.
+TEST_F(AiProtocolManagerFilterTest, KeepsContentLengthOfUnmodifiedPayload) {
   setRouteConfig();
-  request_headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"},
-                                                    {":path", "/chat/completions"},
-                                                    {"content-type", "application/json"},
-                                                    {"content-length", "999"}};
+  const std::string payload =
+      "{\"model\": \"gpt-4\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}";
+  request_headers_ =
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/chat/completions"},
+                                     {"content-type", "application/json"},
+                                     {"content-length", absl::StrCat(payload.size())}};
   ASSERT_EQ(filter_->decodeHeaders(request_headers_, /*end_stream=*/false),
             Http::FilterHeadersStatus::StopIteration);
-  EXPECT_EQ(request_headers_.getContentLengthValue(), "999");
 
-  const std::string payload = R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}]})";
   Buffer::OwnedImpl body(payload);
   EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
   EXPECT_EQ(local_reply_calls_, 0);
-  EXPECT_NE(request_headers_.ContentLength(), nullptr);
+  EXPECT_EQ(injected_.toString(), payload);
+  EXPECT_EQ(request_headers_.getContentLengthValue(), absl::StrCat(payload.size()));
+}
+
+// Content-Length header is set to the recalculated length when an AI filter modifies the payload
+// and the filter manager serializes it.
+TEST_F(AiProtocolManagerFilterTest, SetsContentLengthOnReplayOfModifiedPayload) {
+  std::vector<ContextRecordingAiFilter::Seen> seen;
+  createFilterWithAiFilters({[&](const AiFilterContext& context) -> AiFilterSharedPtr {
+    return std::make_unique<ContextRecordingAiFilter>(context, seen);
+  }});
+  setRouteConfig();
+  const std::string payload =
+      "{\"model\": \"gpt-4\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}";
+  request_headers_ =
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/chat/completions"},
+                                     {"content-type", "application/json"},
+                                     {"content-length", absl::StrCat(payload.size())}};
+  ASSERT_EQ(filter_->decodeHeaders(request_headers_, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl body(payload);
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  EXPECT_EQ(injected_.toString(),
+            R"({"messages":[{"content":"hi","role":"user"}],"model":"rewritten"})");
   EXPECT_EQ(request_headers_.getContentLengthValue(), absl::StrCat(injected_.length()));
+}
+
+// Stages a provider path and headers, the way an upstream transcoder does.
+class HeaderEditingAiFilter : public AiFilter {
+public:
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier) override {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
+    RequestHeaderEdits& edits = request->headerEdits();
+    edits.path = "/v1/publishers/google/models/gemini-2.5-flash:generateContent";
+    edits.set.emplace_back(Http::LowerCaseString("x-goog-user-project"), "p");
+    edits.remove.emplace_back("accept-encoding");
+    co_return co_await std::move(propagate_request)(std::move(request));
+  }
+};
+
+// The held headers are released by the first replayed body frame, and carry the staged edits by
+// then.
+TEST_F(AiProtocolManagerFilterTest, AppliesStagedHeaderEditsBeforeReleasingHeaders) {
+  createFilterWithAiFilters({[](const AiFilterContext&) -> AiFilterSharedPtr {
+    return std::make_unique<HeaderEditingAiFilter>();
+  }});
+  setRouteConfig();
+  request_headers_ = requestHeaders();
+  request_headers_.addCopy(Http::LowerCaseString("accept-encoding"), "gzip");
+  ASSERT_EQ(filter_->decodeHeaders(request_headers_, /*end_stream=*/false),
+            Http::FilterHeadersStatus::StopIteration);
+
+  std::optional<Http::TestRequestHeaderMapImpl> released;
+  ON_CALL(callbacks_, injectDecodedDataToFilterChain(testing::_, testing::_))
+      .WillByDefault(Invoke([this, &released](Buffer::Instance& data, bool end_stream) {
+        if (!released.has_value()) {
+          released = request_headers_;
+        }
+        injected_.add(data);
+        injected_end_stream_ = end_stream;
+      }));
+  const std::string payload = R"({"model":"gpt-4", "messages":[{"role":"user","content":"hi"}]})";
+  Buffer::OwnedImpl body(payload);
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 0);
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(released->getPathValue(),
+            "/v1/publishers/google/models/gemini-2.5-flash:generateContent");
+  EXPECT_EQ(released->get_("x-goog-user-project"), "p");
+  EXPECT_FALSE(released->has("accept-encoding"));
+  EXPECT_EQ(injected_.toString(), payload);
+  EXPECT_TRUE(injected_end_stream_);
 }
 
 // Content-Length header is not added if it was not previously present on request headers.

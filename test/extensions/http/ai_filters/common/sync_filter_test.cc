@@ -64,7 +64,7 @@ public:
   explicit TestSyncMutationFilter(std::string model) : model_(std::move(model)) {}
 
   absl::Status decodeSync(AiRequest& request, LocalReplier) override {
-    request.json()["model"] = model_;
+    request.mutableJson()["model"] = model_;
     return absl::OkStatus();
   }
 

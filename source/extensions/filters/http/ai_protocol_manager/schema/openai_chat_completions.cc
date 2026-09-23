@@ -102,6 +102,31 @@ PayloadSchema createPayloadSchema() {
                                       .nullable()},
               {"seed", Schema::integer().nullable()},
               {"service_tier", Schema::string().nullable()},
+              {"stream_options", Schema::object({
+                                     {"include_usage", Schema::boolean().nullable()},
+                                 })
+                                     .allowUnknownFields(true)
+                                     .nullable()},
+              {"parallel_tool_calls", Schema::boolean().nullable()},
+              {"logprobs", Schema::boolean().nullable()},
+              {"top_logprobs", Schema::integer().nullable()},
+              {"reasoning_effort", Schema::string().nullable()},
+              {"store", Schema::boolean().nullable()},
+              {"metadata", Schema::object({}).allowUnknownFields(true).nullable()},
+              {"modalities", Schema::array(Schema::string()).nullable()},
+              {"prediction", Schema::object({}).allowUnknownFields(true).nullable()},
+              {"audio", Schema::object({}).allowUnknownFields(true).nullable()},
+              {"web_search_options", Schema::object({}).allowUnknownFields(true).nullable()},
+              {"verbosity", Schema::string().nullable()},
+              {"prompt_cache_key", Schema::string().nullable()},
+              {"safety_identifier", Schema::string().nullable()},
+              // Deprecated forerunners of `tools` and `tool_choice`.
+              {"functions",
+               Schema::array(Schema::object({}).allowUnknownFields(true)).nullable()},
+              {"function_call", Schema::oneOf({
+                                    Schema::string(),
+                                    Schema::object({}).allowUnknownFields(true),
+                                }).nullable()},
           })
               .allowUnknownFields(true),
           /*streamable_field_order=*/{

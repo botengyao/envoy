@@ -1,6 +1,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/transcoding_engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -311,15 +312,19 @@ DialectTranscodePack createAnthropicTranscodePack() {
               // 2. Map Anthropic `max_tokens` and `stop_sequences` to IR (OpenAI Chat) names
               TranscodeRule::move("max_tokens", "max_completion_tokens"),
               TranscodeRule::move("stop_sequences", "stop"),
+              TranscodeRule::move("metadata.user_id", "user"),
               // 3. Map Anthropic `tools[]` (`{name, description, input_schema}`) to OpenAI
               //    `tools[]` (`{type: "function", function: {name, description, parameters}}`)
-              TranscodeRule::forEach("tools",
-                                     {
-                                         TranscodeRule::move("name", "function.name"),
-                                         TranscodeRule::move("description", "function.description"),
-                                         TranscodeRule::move("input_schema", "function.parameters"),
-                                         TranscodeRule::setDefault("type", "function"),
-                                     }),
+              TranscodeRule::forEach(
+                  "tools",
+                  {
+                      TranscodeRule::move("name", "function.name"),
+                      TranscodeRule::move("description", "function.description"),
+                      TranscodeRule::move("input_schema", "function.parameters"),
+                      TranscodeRule::setDefault("type", "function"),
+                      // Anthropic's SDK spells a client tool's optional type `custom`.
+                      TranscodeRule::valueMap("type", {{"custom", "function"}}),
+                  }),
               // 4. Convert Anthropic `tool_choice` (always an object) to OpenAI IR:
               //      {"type": "auto"|"none"}        -> "auto" | "none"
               //      {"type": "any"}                -> "required"
@@ -361,14 +366,19 @@ DialectTranscodePack createAnthropicTranscodePack() {
               TranscodeRule::move("stop", "stop_sequences"),
               // 5. Map OpenAI `tools[]` (`function.{name, description, parameters}`) to Anthropic
               //    `tools[]` (`{name, description, input_schema}`)
-              TranscodeRule::forEach("tools",
-                                     {
-                                         TranscodeRule::move("function.name", "name"),
-                                         TranscodeRule::move("function.description", "description"),
-                                         TranscodeRule::move("function.parameters", "input_schema"),
-                                         TranscodeRule::drop("type"),
-                                         TranscodeRule::drop("function"),
-                                     }),
+              TranscodeRule::forEach(
+                  "tools",
+                  {
+                      TranscodeRule::move("function.name", "name"),
+                      TranscodeRule::move("function.description", "description"),
+                      TranscodeRule::move("function.parameters", "input_schema"),
+                      // OpenAI lets a function without arguments omit `parameters`, while
+                      // Anthropic requires `input_schema`.
+                      TranscodeRule::setDefault("input_schema",
+                                                nlohmann::json::object({{"type", "object"}})),
+                      TranscodeRule::drop("type"),
+                      TranscodeRule::drop("function"),
+                  }),
               // 6. Map `tool_choice` into Anthropic's object-only form. The wrap turns the IR's
               //    bare `"auto"` / `"none"` / `"required"` into `{"type": ...}`; the pinned-tool
               //    object is already an object and passes through the wrap untouched.
@@ -431,9 +441,25 @@ DialectTranscodePack createGeminiTranscodePack() {
                   {"generationConfig.stopSequences", "generationConfig.stop_sequences",
                    "generation_config.stopSequences", "generation_config.stop_sequences"},
                   "stop"),
+              TranscodeRule::firstOf(
+                  {"generationConfig.candidateCount", "generationConfig.candidate_count",
+                   "generation_config.candidateCount", "generation_config.candidate_count"},
+                  "n"),
+              TranscodeRule::toInteger("n"),
+              TranscodeRule::firstOf({"generationConfig.seed", "generation_config.seed"}, "seed"),
+              TranscodeRule::toInteger("seed"),
+              TranscodeRule::firstOf(
+                  {"generationConfig.presencePenalty", "generationConfig.presence_penalty",
+                   "generation_config.presencePenalty", "generation_config.presence_penalty"},
+                  "presence_penalty"),
+              TranscodeRule::toNumber("presence_penalty"),
+              TranscodeRule::firstOf(
+                  {"generationConfig.frequencyPenalty", "generationConfig.frequency_penalty",
+                   "generation_config.frequencyPenalty", "generation_config.frequency_penalty"},
+                  "frequency_penalty"),
+              TranscodeRule::toNumber("frequency_penalty"),
               // Dropping the rest of `generationConfig` also masks a latent version of the
-              // coercion above: `candidateCount`, `topK`, `seed`, `presencePenalty`,
-              // `frequencyPenalty`, `logprobs` and `thinkingConfig.thinkingBudget` are all
+              // coercion above: `topK`, `logprobs` and `thinkingConfig.thinkingBudget` are all
               // declared number-or-string too. Whoever makes the IR lossless must coerce them
               // on the way through, or they reach the destination quoted.
               TranscodeRule::drop("generationConfig"),
@@ -771,7 +797,8 @@ absl::Status TranscodeRule::apply(nlohmann::json& json) const {
       return absl::OkStatus();
     }
     double parsed = 0;
-    if (!absl::SimpleAtod(text, &parsed)) {
+    // A non-finite number would serialize as null; left a string, the destination rejects it.
+    if (!absl::SimpleAtod(text, &parsed) || !std::isfinite(parsed)) {
       return absl::OkStatus();
     }
     *node = parsed;
@@ -847,8 +874,9 @@ absl::Status TranscodeRule::apply(nlohmann::json& json) const {
         }
       }
       if (matched) {
+        // A null would become a block with null text once concatenated with other matches.
         if (std::optional<nlohmann::json> sub = extractNodeByPath(elem, extract_subpath_segments_);
-            sub.has_value()) {
+            sub.has_value() && !sub->is_null()) {
           extracted.push_back(std::move(*sub));
         }
       } else {
@@ -1107,6 +1135,11 @@ absl::Status TranscodingEngine::transcodeFromIr(LLMProtocol target_protocol,
     return it->second.dialect_schema->validateRequest(json);
   }
   return absl::OkStatus();
+}
+
+const DialectTranscodePack* TranscodingEngine::pack(LLMProtocol protocol) const {
+  auto it = packs_.find(protocol);
+  return it == packs_.end() ? nullptr : &it->second;
 }
 
 } // namespace AiProtocolManager

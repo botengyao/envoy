@@ -10,6 +10,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/flattening_json_codec.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 
 #include "test/extensions/filters/http/ai_protocol_manager/fake_bridge.h"
 #include "test/test_common/status_utility.h"
@@ -87,6 +88,23 @@ public:
     }
     RETURN_IF_NOT_OK(serializeBatches(batches));
     return bridge_.injected_.toString();
+  }
+
+  // Decodes `input` in `chunk_size` pieces (0 for one piece) into one sequence of fields.
+  static absl::StatusOr<std::vector<FlattenJsonField>> decodeFields(absl::string_view input,
+                                                                    size_t chunk_size) {
+    FlatteningJsonDecoder decoder;
+    std::vector<FlattenJsonField> fields;
+    const size_t step = chunk_size == 0 ? input.size() : chunk_size;
+    for (size_t offset = 0; offset < input.size(); offset += step) {
+      Buffer::OwnedImpl buf(input.substr(offset, step));
+      auto batch_or = decoder.onData(buf, /*end_stream=*/offset + step >= input.size());
+      RETURN_IF_NOT_OK(batch_or.status());
+      for (FlattenJsonField& field : *batch_or) {
+        fields.push_back(std::move(field));
+      }
+    }
+    return fields;
   }
 
   Api::ApiPtr api_;
@@ -294,6 +312,148 @@ TEST_F(FlatteningJsonCodecTest, SerializerHandlesEmptyStreamAndRejectsConflictin
       FlattenJsonField({FieldPathSegment{"a"}, FieldPathSegment{size_t{0}}}, nlohmann::json(2)),
   };
   EXPECT_THAT(serializeBatches({conflicting}), HasStatusCode(absl::StatusCode::kInvalidArgument));
+}
+
+FlattenJsonField field(std::vector<FieldPathSegment> path, nlohmann::json node,
+                       bool is_partial = false) {
+  return FlattenJsonField(std::move(path), std::move(node), is_partial);
+}
+
+// Documents covering nesting, empty containers at every depth, root scalars, unicode and number
+// edge cases, plus a trimmed Vertex AI Gemini response.
+std::vector<std::string> codecDocuments() {
+  return {
+      R"({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}]},"finishReason":"STOP","avgLogprobs":-0.013967220485210419}],"usageMetadata":{"promptTokenCount":19,"candidatesTokenCount":5,"totalTokenCount":24,"promptTokensDetails":[{"modality":"TEXT","tokenCount":19}]},"modelVersion":"gemini-2.5-flash","responseId":"OBm0atnIFMuSsbwPiefy0Qk"})",
+      R"({"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"Hello!\nHow can I help?","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]},"finish_reason":"stop"}]})",
+      "[[1,2],[3,[4,[]]],[]]",
+      R"({"a":[{"b":[{}]},[[{"c":null}]]],"d":{"e":{"f":[]}},"g":[[],{}]})",
+      "{}",
+      "[]",
+      "[[]]",
+      "[{}]",
+      R"("root string")",
+      "12345",
+      "-3.25",
+      "true",
+      "null",
+      R"({"text":"caf\u00e9 \ud83d\ude00 \u4e2d\u6587 ok","raw":"déjà vu 😀","esc":"line\nbreak\t\"q\" \\ /"})",
+      R"({"big":18446744073709551615,"neg":-9223372036854775808,"f":1.5e10,"g":0.1,"z":0})",
+  };
+}
+
+TEST_F(FlatteningJsonCodecTest, UnflattenRebuildsDecodedDocuments) {
+  for (const std::string& doc : codecDocuments()) {
+    for (size_t chunk_size : {size_t{0}, size_t{1}, size_t{7}}) {
+      auto fields = decodeFields(doc, chunk_size);
+      ASSERT_THAT(fields.status(), IsOk()) << doc;
+      auto rebuilt = unflattenJson(*fields);
+      ASSERT_THAT(rebuilt.status(), IsOk()) << doc << " in chunks of " << chunk_size;
+      EXPECT_EQ(*rebuilt, nlohmann::json::parse(doc)) << doc << " in chunks of " << chunk_size;
+    }
+  }
+}
+
+// Chunk boundaries can fall inside an escape or a multi-byte character.
+TEST_F(FlatteningJsonCodecTest, DecodedChunksReserializeToTheSameDocument) {
+  for (const std::string& doc : codecDocuments()) {
+    for (size_t chunk_size : {size_t{1}, size_t{7}}) {
+      auto out = roundTrip(doc, chunk_size);
+      ASSERT_THAT(out.status(), IsOk()) << doc << " in chunks of " << chunk_size;
+      EXPECT_EQ(nlohmann::json::parse(*out), nlohmann::json::parse(doc))
+          << doc << " in chunks of " << chunk_size;
+    }
+  }
+}
+
+TEST_F(FlatteningJsonCodecTest, FlattenedDocumentsSerializeToTheirCompactDump) {
+  for (const std::string& doc : codecDocuments()) {
+    const nlohmann::json parsed = nlohmann::json::parse(doc);
+    bridge_.injected_.drain(bridge_.injected_.length());
+    ASSERT_THAT(serializeBatches({flattenJson(parsed)}), IsOk()) << doc;
+    EXPECT_EQ(bridge_.injected_.toString(), parsed.dump()) << doc;
+  }
+}
+
+TEST_F(FlatteningJsonCodecTest, FlattenAndUnflattenAreInverses) {
+  for (const std::string& doc : codecDocuments()) {
+    const nlohmann::json parsed = nlohmann::json::parse(doc);
+    auto rebuilt = unflattenJson(flattenJson(parsed));
+    ASSERT_THAT(rebuilt.status(), IsOk()) << doc;
+    EXPECT_EQ(*rebuilt, parsed) << doc;
+  }
+
+  // External references are leaves like any other and survive the trip.
+  const nlohmann::json with_ref = {
+      {"prompt", JsonWithExtBuf::makeExternalRef({/*offset=*/3, /*length=*/9})}};
+  auto rebuilt = unflattenJson(flattenJson(with_ref));
+  ASSERT_THAT(rebuilt.status(), IsOk());
+  EXPECT_EQ(*rebuilt, with_ref);
+}
+
+TEST_F(FlatteningJsonCodecTest, FlattenEmitsLeavesInDocumentOrder) {
+  const nlohmann::json doc = nlohmann::json::parse(R"({"b":[[],{"c":1}],"a":{},"d":[["x"]]})");
+  const std::vector<FlattenJsonField> expected = {
+      field({"a"}, nlohmann::json::object()),
+      field({"b", size_t{0}}, nlohmann::json::array()),
+      field({"b", size_t{1}, "c"}, 1),
+      field({"d", size_t{0}, size_t{0}}, "x"),
+  };
+  EXPECT_EQ(flattenJson(doc), expected);
+
+  EXPECT_EQ(flattenJson(nlohmann::json(42)), std::vector<FlattenJsonField>{field({}, 42)});
+  EXPECT_EQ(flattenJson(nlohmann::json::object()),
+            std::vector<FlattenJsonField>{field({}, nlohmann::json::object())});
+}
+
+TEST_F(FlatteningJsonCodecTest, UnflattenConcatenatesPartialStringChunks) {
+  const std::vector<FlattenJsonField> fields = {
+      field({"a", size_t{0}}, "caf", /*is_partial=*/true),
+      field({"a", size_t{0}}, "\xc3", /*is_partial=*/true),
+      field({"a", size_t{0}}, "\xa9!", /*is_partial=*/true),
+      field({"a", size_t{0}}, ""),
+      field({"a", size_t{1}}, "whole"),
+      field({"b"}, "x", /*is_partial=*/true),
+      field({"b"}, "y"),
+  };
+  auto rebuilt = unflattenJson(fields);
+  ASSERT_THAT(rebuilt.status(), IsOk());
+  EXPECT_EQ(*rebuilt, nlohmann::json::parse(R"({"a":["café!","whole"],"b":"xy"})"));
+
+  auto root = unflattenJson(
+      std::vector<FlattenJsonField>{field({}, "ro", /*is_partial=*/true), field({}, "ot")});
+  ASSERT_THAT(root.status(), IsOk());
+  EXPECT_EQ(*root, "root");
+}
+
+TEST_F(FlatteningJsonCodecTest, UnflattenRejectsInconsistentSequences) {
+  const nlohmann::json empty_object = nlohmann::json::object();
+  const std::vector<std::pair<std::string, std::vector<FlattenJsonField>>> cases = {
+      {"no fields", {}},
+      {"two roots", {field({}, 1), field({}, 2)}},
+      {"field after a root scalar", {field({}, 1), field({"a"}, 2)}},
+      {"repeated leaf", {field({"a"}, 1), field({"a"}, 2)}},
+      {"repeated key", {field({"a"}, 1), field({"b"}, 2), field({"a"}, 3)}},
+      {"child of a leaf", {field({"a"}, 1), field({"a", "b"}, 2)}},
+      {"child of an empty container", {field({"a"}, empty_object), field({"a", "b"}, 2)}},
+      {"leaf over a container", {field({"a", "b"}, 1), field({"a"}, 2)}},
+      {"array not starting at 0", {field({size_t{1}}, 1)}},
+      {"skipped index", {field({size_t{0}}, 1), field({size_t{2}}, 2)}},
+      {"revisited index",
+       {field({size_t{0}, "x"}, 1), field({size_t{1}}, 2), field({size_t{0}, "y"}, 3)}},
+      {"key into an array", {field({size_t{0}}, 1), field({"a"}, 2)}},
+      {"index into an object", {field({"a"}, 1), field({size_t{0}}, 2)}},
+      {"non-empty container leaf", {field({"a"}, nlohmann::json{{"b", 1}})}},
+      {"partial non-string", {field({"a"}, 1, /*is_partial=*/true), field({"a"}, "x")}},
+      {"partial interrupted by another path",
+       {field({"a"}, "x", /*is_partial=*/true), field({"b"}, "y")}},
+      {"partial interrupted by a non-string",
+       {field({"a"}, "x", /*is_partial=*/true), field({"a"}, 1)}},
+      {"trailing partial", {field({"a"}, "x", /*is_partial=*/true)}},
+  };
+  for (const auto& [name, fields] : cases) {
+    EXPECT_THAT(unflattenJson(fields).status(), HasStatusCode(absl::StatusCode::kInvalidArgument))
+        << name;
+  }
 }
 
 } // namespace

@@ -210,6 +210,7 @@ envoy_extension_cc_test(
     deps = [
         "//source/extensions/filters/http/ai_protocol_manager:ai_request_lib",
         "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
         "@nlohmann_json//:json",
     ],
 )
@@ -228,6 +229,7 @@ envoy_extension_cc_test(
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:flattening_json_codec_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",
         "@nlohmann_json//:json",
@@ -247,9 +249,11 @@ envoy_extension_cc_test(
         "//source/common/coroutine:launch_lib",
         "//source/common/coroutine:status_macros_lib",
         "//source/common/stream_info:stream_info_lib",
+        "//source/extensions/common/ai:request_ir_lib",
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_parser_lib",
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//test/test_common:status_utility_lib",
         "//test/test_common:utility_lib",

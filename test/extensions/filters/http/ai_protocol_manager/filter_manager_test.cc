@@ -1,5 +1,7 @@
 #include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "source/common/buffer/buffer_impl.h"
@@ -8,12 +10,14 @@
 #include "source/common/coroutine/launch.h"
 #include "source/common/coroutine/status_macros.h"
 #include "source/common/stream_info/stream_info_impl.h"
+#include "source/extensions/common/ai/request_ir.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 
 #include "test/extensions/filters/http/ai_protocol_manager/fake_bridge.h"
@@ -44,6 +48,23 @@ public:
     }
   }
 
+  // Stores `body` as the received request, as the filter does, and returns its parsed index.
+  JsonWithExtBuf receive(absl::string_view body,
+                         uint32_t inline_string_threshold_bytes =
+                             JsonWithExtBufParser::kDefaultInlineStringThresholdBytes) {
+    Buffer::OwnedImpl data(body);
+    buffer_manager_.onData(data);
+    buffer_manager_.endStream();
+    JsonWithExtBufParser parser(JsonWithExtBufParser::Config{inline_string_threshold_bytes});
+    EXPECT_OK(parser.feed(body, /*end_stream=*/true));
+    return parser.takeDocument();
+  }
+
+  const APMRequestPayloadIndex* publishedIndex() {
+    return stream_info_.filterState()->getDataReadOnly<APMRequestPayloadIndex>(
+        APMRequestPayloadIndex::kFilterStateKey);
+  }
+
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
@@ -53,10 +74,116 @@ public:
   StreamInfo::StreamInfoImpl stream_info_;
 };
 
+class TestMutationFilter : public AiFilter {
+public:
+  explicit TestMutationFilter(std::string target_model) : target_model_(std::move(target_model)) {}
+
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier) override {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
+    req->mutableJson()["model"] = target_model_;
+    co_return co_await std::move(propagate_request)(std::move(req));
+  }
+
+private:
+  std::string target_model_;
+};
+
+// Attaches an IR, as the transcoder's internal leg does.
+class TestIrAttachingFilter : public AiFilter {
+public:
+  explicit TestIrAttachingFilter(std::string model) : model_(std::move(model)) {}
+
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier) override {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
+    req->setIr(std::make_shared<RequestIr>(LLMProtocol::OpenAiChatCompletions, model_, std::nullopt,
+                                           std::nullopt));
+    co_return co_await std::move(propagate_request)(std::move(req));
+  }
+
+private:
+  const std::string model_;
+};
+
+class FilterManagerSinkOptionsTest : public FilterManagerTest {
+protected:
+  // Runs `filters` over `body` and returns what was forwarded.
+  std::string run(std::vector<AiFilterSharedPtr> filters, RequestFilterManager::SinkOptions options,
+                  absl::string_view body = R"({ "model" : "gpt-4" })") {
+    FilterManager manager(std::move(filters));
+    headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                              {":path", "/v1/chat/completions"},
+                                              {"content-length", absl::StrCat(body.size())}};
+    absl::Status status = absl::UnknownError("never completed");
+    manager.startRequest(
+        receive(body), &buffer_manager_, *dispatcher_, stream_info_,
+        [&status](absl::Status s) { status = std::move(s); }, &headers_, nullptr, options);
+    drain();
+    EXPECT_OK(status);
+    return bridge_.injected_.toString();
+  }
+
+  const RequestIr* publishedIr() {
+    return stream_info_.filterState()->getDataReadOnly<RequestIr>(RequestIr::FilterStateKey);
+  }
+
+  static std::vector<AiFilterSharedPtr> attaching(std::string model) {
+    return {std::make_shared<TestIrAttachingFilter>(std::move(model))};
+  }
+
+  Http::TestRequestHeaderMapImpl headers_;
+};
+
+TEST_F(FilterManagerSinkOptionsTest, PublishesTheAttachedIrWhenConfigured) {
+  run(attaching("m1"), {.publish_request_ir = true});
+  ASSERT_NE(publishedIr(), nullptr);
+  EXPECT_EQ(publishedIr()->model(), "m1");
+}
+
+TEST_F(FilterManagerSinkOptionsTest, DoesNotPublishUnlessConfigured) {
+  run(attaching("m1"), {.publish_request_ir = false});
+  EXPECT_EQ(publishedIr(), nullptr);
+}
+
+TEST_F(FilterManagerSinkOptionsTest, HasNothingToPublishWithoutAnIr) {
+  run({}, {.publish_request_ir = true});
+  EXPECT_EQ(publishedIr(), nullptr);
+}
+
+TEST_F(FilterManagerSinkOptionsTest, KeepsAnEarlierPublication) {
+  stream_info_.filterState()->setData(RequestIr::FilterStateKey,
+                                      std::make_shared<RequestIr>(LLMProtocol::AnthropicMessages,
+                                                                  "first", std::nullopt,
+                                                                  std::nullopt),
+                                      StreamInfo::FilterState::LifeSpan::FilterChain);
+  run(attaching("second"), {.publish_request_ir = true});
+  EXPECT_EQ(publishedIr()->model(), "first");
+}
+
+TEST_F(FilterManagerSinkOptionsTest, AnEditAfterTheIrDropsIt) {
+  std::vector<AiFilterSharedPtr> filters = attaching("m1");
+  filters.push_back(std::make_shared<TestMutationFilter>("gpt-5"));
+  run(std::move(filters), {.publish_request_ir = true});
+  EXPECT_EQ(publishedIr(), nullptr);
+}
+
+TEST_F(FilterManagerSinkOptionsTest, ForwardsTheReceivedBodyByDefault) {
+  const std::string body = R"({ "model" : "gpt-4" })";
+  EXPECT_EQ(run({}, {}, body), body);
+}
+
+TEST_F(FilterManagerSinkOptionsTest, AlwaysSerializeRewritesAnUnmodifiedBody) {
+  const std::string forwarded = run({}, {.always_serialize = true}, R"({ "model" : "gpt-4" })");
+  EXPECT_EQ(forwarded, R"({"model":"gpt-4"})");
+  EXPECT_EQ(headers_.getContentLengthValue(), absl::StrCat(forwarded.size()));
+}
+
 // 0-filter pass-through
 TEST_F(FilterManagerTest, ZeroFilterPassThrough) {
-  JsonWithExtBuf doc;
-  doc.setJson(nlohmann::json{{"model", "gpt-4"}});
+  const std::string body = R"({ "model": "gpt-4" })";
 
   std::vector<AiFilterSharedPtr> filters;
   FilterManager manager(std::move(filters));
@@ -64,7 +191,7 @@ TEST_F(FilterManagerTest, ZeroFilterPassThrough) {
   absl::Status status;
   bool completed = false;
 
-  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+  manager.startRequest(receive(body), &buffer_manager_, *dispatcher_, stream_info_,
                        [&status, &completed](absl::Status s) {
                          status = std::move(s);
                          completed = true;
@@ -74,30 +201,198 @@ TEST_F(FilterManagerTest, ZeroFilterPassThrough) {
   EXPECT_TRUE(completed);
   ASSERT_OK(status);
 
-  auto parsed = nlohmann::json::parse(bridge_.injected_.toString());
-  EXPECT_EQ(parsed["model"], "gpt-4");
+  EXPECT_EQ(bridge_.injected_.toString(), body);
 
-  auto* fs = stream_info_.filterState()->getDataReadOnly<APMRequestPayloadIndex>(
-      APMRequestPayloadIndex::kFilterStateKey);
+  auto* fs = publishedIndex();
   ASSERT_NE(fs, nullptr);
   EXPECT_EQ(fs->index().json()["model"], "gpt-4");
 }
 
-class TestMutationFilter : public AiFilter {
+class TestReadOnlyFilter : public AiFilter {
 public:
-  explicit TestMutationFilter(std::string target_model) : target_model_(std::move(target_model)) {}
+  explicit TestReadOnlyFilter(std::string& seen_model) : seen_model_(seen_model) {}
 
   Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
                                        AiRequestPropagator propagate_request,
                                        LocalReplier) override {
     ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
-    req->json()["model"] = target_model_;
+    seen_model_ = req->json().value("model", "");
     co_return co_await std::move(propagate_request)(std::move(req));
   }
 
 private:
-  std::string target_model_;
+  std::string& seen_model_;
 };
+
+// Whitespace, key order and escapes that any re-serialization would normalize, around a value
+// large enough to be offloaded.
+std::string unnormalizedBody(const std::string& content) {
+  return absl::StrCat("{\n  \"stream\" : false,\n  \"model\":\"gpt-4\",\n",
+                      "  \"messages\": [ { \"role\": \"user\", \"content\": \"", content,
+                      "\" } ],\n  \"note\": \"caf\\u00e9\"\n}\n");
+}
+
+TEST_F(FilterManagerTest, UnmodifiedRequestIsForwardedAsReceived) {
+  const std::string content(64, 'c');
+  const std::string body = unnormalizedBody(content);
+  ASSERT_NE(body, nlohmann::json::parse(body).dump());
+
+  std::string seen_model;
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<TestReadOnlyFilter>(seen_model));
+  FilterManager manager(std::move(filters));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/chat/completions"},
+                                         {"content-length", absl::StrCat(body.size())}};
+  absl::Status status;
+  bool completed = false;
+  manager.startRequest(
+      receive(body, /*inline_string_threshold_bytes=*/16), &buffer_manager_, *dispatcher_,
+      stream_info_,
+      [&status, &completed](absl::Status s) {
+        status = std::move(s);
+        completed = true;
+      },
+      &headers);
+  drain();
+
+  EXPECT_TRUE(completed);
+  ASSERT_OK(status);
+  EXPECT_EQ(seen_model, "gpt-4");
+  const std::string output = bridge_.injected_.toString();
+  EXPECT_EQ(output, body);
+  EXPECT_EQ(headers.getContentLengthValue(), absl::StrCat(body.size()));
+
+  // The published index is the request's own: its reference locates the value in these bytes.
+  const APMRequestPayloadIndex* published = publishedIndex();
+  ASSERT_NE(published, nullptr);
+  const nlohmann::json& index = published->index().json();
+  EXPECT_EQ(index.value("model", ""), "gpt-4");
+  ASSERT_TRUE(index.contains("messages"));
+  const nlohmann::json& message = index.at("messages").at(0);
+  ASSERT_TRUE(JsonWithExtBuf::isExternalRef(message.at("content")));
+  const absl::StatusOr<JsonWithExtBuf::ExternalRef> ref =
+      JsonWithExtBuf::externalRef(message.at("content"));
+  ASSERT_OK(ref);
+  EXPECT_EQ(output.substr(ref->offset, ref->length), content);
+}
+
+TEST_F(FilterManagerTest, ModifiedRequestIsSerializedWithUpdatedContentLength) {
+  const std::string content(64, 'c');
+  const std::string body = unnormalizedBody(content);
+
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<TestMutationFilter>("gpt-4o"));
+  FilterManager manager(std::move(filters));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/chat/completions"},
+                                         {"content-length", absl::StrCat(body.size())}};
+  absl::Status status;
+  bool completed = false;
+  manager.startRequest(
+      receive(body, /*inline_string_threshold_bytes=*/16), &buffer_manager_, *dispatcher_,
+      stream_info_,
+      [&status, &completed](absl::Status s) {
+        status = std::move(s);
+        completed = true;
+      },
+      &headers);
+  drain();
+
+  EXPECT_TRUE(completed);
+  ASSERT_OK(status);
+  nlohmann::json expected = nlohmann::json::parse(body);
+  expected["model"] = "gpt-4o";
+  const std::string output = bridge_.injected_.toString();
+  EXPECT_EQ(output, expected.dump());
+  EXPECT_EQ(headers.getContentLengthValue(), absl::StrCat(output.size()));
+
+  // The published index is re-based onto the serialized output.
+  const APMRequestPayloadIndex* published = publishedIndex();
+  ASSERT_NE(published, nullptr);
+  const nlohmann::json& message = published->index().json().at("messages").at(0);
+  const absl::StatusOr<JsonWithExtBuf::ExternalRef> ref =
+      JsonWithExtBuf::externalRef(message.at("content"));
+  ASSERT_OK(ref);
+  EXPECT_EQ(output.substr(ref->offset, ref->length), content);
+}
+
+// Replaces the request with one it builds instead of editing the one it received.
+class TestRequestBuildingFilter : public AiFilter {
+public:
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier) override {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr received, co_await std::move(receive_request)());
+    JsonWithExtBuf index;
+    index.setJson(nlohmann::json{{"model", "built"}});
+    auto built = std::make_unique<AiRequest>(std::move(index));
+    built->headerEdits() = received->headerEdits();
+    co_return co_await std::move(propagate_request)(std::move(built));
+  }
+};
+
+TEST_F(FilterManagerTest, RequestBuiltByAFilterIsSerialized) {
+  const std::string body = unnormalizedBody("hi");
+
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<TestRequestBuildingFilter>());
+  FilterManager manager(std::move(filters));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/chat/completions"},
+                                         {"content-length", absl::StrCat(body.size())}};
+  absl::Status status;
+  bool completed = false;
+  manager.startRequest(
+      receive(body), &buffer_manager_, *dispatcher_, stream_info_,
+      [&status, &completed](absl::Status s) {
+        status = std::move(s);
+        completed = true;
+      },
+      &headers);
+  drain();
+
+  EXPECT_TRUE(completed);
+  ASSERT_OK(status);
+  EXPECT_EQ(bridge_.injected_.toString(), R"({"model":"built"})");
+  EXPECT_EQ(headers.getContentLengthValue(), absl::StrCat(bridge_.injected_.length()));
+}
+
+TEST_F(FilterManagerTest, MissingBufferManagerFailsTheRequest) {
+  std::vector<AiFilterSharedPtr> filters;
+  FilterManager manager(std::move(filters));
+
+  JsonWithExtBuf doc;
+  doc.setJson(nlohmann::json{{"model", "gpt-4"}});
+  absl::Status status;
+  bool completed = false;
+  manager.startRequest(std::move(doc), /*buffer_manager=*/nullptr, *dispatcher_, stream_info_,
+                       [&status, &completed](absl::Status s) {
+                         status = std::move(s);
+                         completed = true;
+                       });
+  drain();
+
+  EXPECT_TRUE(completed);
+  EXPECT_THAT(status, HasStatusCode(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_F(FilterManagerTest, CancelStopsForwardingTheReceivedBody) {
+  std::vector<AiFilterSharedPtr> filters;
+  auto manager = std::make_unique<FilterManager>(std::move(filters));
+  bool completed = false;
+  manager->startRequest(receive(R"({"model":"gpt-4"})"), &buffer_manager_, *dispatcher_,
+                        stream_info_, [&completed](absl::Status) { completed = true; });
+
+  manager->cancel();
+  drain();
+
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(bridge_.injected_.length(), 0);
+}
 
 TEST_F(FilterManagerTest, SingleFilterMutation) {
   JsonWithExtBuf doc;
@@ -130,7 +425,7 @@ public:
                                        AiRequestPropagator propagate_request,
                                        LocalReplier) override {
     ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
-    req->json()["temperature"] = 0.5;
+    req->mutableJson()["temperature"] = 0.5;
     co_return co_await std::move(propagate_request)(std::move(req));
   }
 };
@@ -141,8 +436,9 @@ public:
                                        AiRequestPropagator propagate_request,
                                        LocalReplier) override {
     ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
-    EXPECT_DOUBLE_EQ(req->json()["temperature"].get<double>(), 0.5);
-    req->json()["temperature"] = 0.9;
+    nlohmann::json& json = req->mutableJson();
+    EXPECT_DOUBLE_EQ(json["temperature"].get<double>(), 0.5);
+    json["temperature"] = 0.9;
     co_return co_await std::move(propagate_request)(std::move(req));
   }
 };
@@ -640,40 +936,9 @@ TEST_F(FilterManagerTest, FilterNullPropagationFails) {
       "cannot propagate null AiRequestPtr");
 }
 
-TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeaders) {
-  JsonWithExtBuf doc;
-  doc.setJson(nlohmann::json{{"model", "gpt-4"}});
-
-  Http::TestRequestHeaderMapImpl headers{
-      {":method", "POST"}, {":path", "/chat/completions"}, {"content-length", "1000"}};
-
-  std::vector<AiFilterSharedPtr> filters;
-  FilterManager manager(std::move(filters));
-
-  absl::Status status;
-  bool completed = false;
-  manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
-      [&status, &completed](absl::Status s) {
-        status = std::move(s);
-        completed = true;
-      },
-      &headers);
-
-  drain();
-  EXPECT_TRUE(completed);
-  ASSERT_OK(status);
-
-  std::string output = bridge_.injected_.toString();
-  EXPECT_EQ(headers.getContentLengthValue(), absl::StrCat(output.size()));
-}
-
 TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeadersAfterMutation) {
-  JsonWithExtBuf doc;
-  doc.setJson(nlohmann::json{{"model", "gpt-3.5"}});
-
   Http::TestRequestHeaderMapImpl headers{
-      {":method", "POST"}, {":path", "/chat/completions"}, {"content-length", "10"}};
+      {":method", "POST"}, {":path", "/chat/completions"}, {"content-length", "19"}};
 
   std::vector<AiFilterSharedPtr> filters;
   filters.push_back(std::make_unique<TestMutationFilter>("gpt-4-turbo-extra-long"));
@@ -683,7 +948,7 @@ TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeadersAfterMutation) {
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      receive(R"({"model":"gpt-3.5"})"), &buffer_manager_, *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -695,22 +960,21 @@ TEST_F(FilterManagerTest, SetsContentLengthOnRequestHeadersAfterMutation) {
   ASSERT_OK(status);
 
   std::string output = bridge_.injected_.toString();
+  EXPECT_EQ(output, R"({"model":"gpt-4-turbo-extra-long"})");
   EXPECT_EQ(headers.getContentLengthValue(), absl::StrCat(output.size()));
 }
 
 TEST_F(FilterManagerTest, DoesNotSetContentLengthWhenNotPreviouslyPresent) {
-  JsonWithExtBuf doc;
-  doc.setJson(nlohmann::json{{"model", "gpt-4"}});
-
   Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/chat/completions"}};
 
   std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_unique<TestMutationFilter>("gpt-4-turbo"));
   FilterManager manager(std::move(filters));
 
   absl::Status status;
   bool completed = false;
   manager.startRequest(
-      std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+      receive(R"({"model":"gpt-4"})"), &buffer_manager_, *dispatcher_, stream_info_,
       [&status, &completed](absl::Status s) {
         status = std::move(s);
         completed = true;
@@ -721,7 +985,216 @@ TEST_F(FilterManagerTest, DoesNotSetContentLengthWhenNotPreviouslyPresent) {
   EXPECT_TRUE(completed);
   ASSERT_OK(status);
 
+  EXPECT_EQ(bridge_.injected_.toString(), R"({"model":"gpt-4-turbo"})");
   EXPECT_EQ(headers.ContentLength(), nullptr);
+}
+
+// Stages header edits and optionally modifies the body.
+class TestHeaderEditingFilter : public AiFilter {
+public:
+  TestHeaderEditingFilter(bool modify_body, RequestHeaderEdits edits)
+      : modify_body_(modify_body), edits_(std::move(edits)) {}
+
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
+                                       AiRequestPropagator propagate_request,
+                                       LocalReplier) override {
+    ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
+    if (modify_body_) {
+      req->mutableJson()["model"] = "gpt-4o";
+    }
+    req->headerEdits() = edits_;
+    co_return co_await std::move(propagate_request)(std::move(req));
+  }
+
+private:
+  const bool modify_body_;
+  const RequestHeaderEdits edits_;
+};
+
+RequestHeaderEdits providerEdits() {
+  RequestHeaderEdits edits;
+  edits.path = "/v1/projects/p/locations/global/publishers/google/models/m:generateContent";
+  edits.set = {{Http::LowerCaseString("x-provider"), "vertex"}};
+  edits.remove = {Http::LowerCaseString("accept-encoding")};
+  return edits;
+}
+
+class FilterManagerHeaderEditsTest : public FilterManagerTest,
+                                     public testing::WithParamInterface<bool> {
+public:
+  // Runs one TestHeaderEditingFilter and returns the headers as they were when the first body
+  // bytes reached the chain, which is what releases them.
+  Http::TestRequestHeaderMapImpl run(absl::string_view body, bool modify_body,
+                                     RequestHeaderEdits edits) {
+    std::vector<AiFilterSharedPtr> filters;
+    filters.push_back(std::make_shared<TestHeaderEditingFilter>(modify_body, std::move(edits)));
+    FilterManager manager(std::move(filters));
+
+    std::optional<Http::TestRequestHeaderMapImpl> at_first_byte;
+    bridge_.on_inject_ = [this, &at_first_byte]() {
+      if (!at_first_byte.has_value()) {
+        at_first_byte = headers_;
+      }
+    };
+    absl::Status status;
+    bool completed = false;
+    manager.startRequest(
+        receive(body), &buffer_manager_, *dispatcher_, stream_info_,
+        [&status, &completed](absl::Status s) {
+          status = std::move(s);
+          completed = true;
+        },
+        &headers_);
+    drain();
+    bridge_.on_inject_ = nullptr;
+
+    EXPECT_TRUE(completed);
+    EXPECT_OK(status);
+    EXPECT_TRUE(at_first_byte.has_value());
+    return at_first_byte.value_or(Http::TestRequestHeaderMapImpl{});
+  }
+
+  Http::TestRequestHeaderMapImpl headers_{{":method", "POST"},
+                                          {":path", "/v1/chat/completions"},
+                                          {"accept-encoding", "gzip, deflate"},
+                                          {"x-provider", "stale"},
+                                          {"content-length", "19"}};
+};
+
+INSTANTIATE_TEST_SUITE_P(BodyModified, FilterManagerHeaderEditsTest, testing::Bool());
+
+TEST_P(FilterManagerHeaderEditsTest, AppliedBeforeTheFirstBodyByte) {
+  const bool modify_body = GetParam();
+  const std::string body = R"({"model": "gpt-4"})";
+  headers_.setContentLength(body.size());
+
+  const Http::TestRequestHeaderMapImpl seen = run(body, modify_body, providerEdits());
+
+  EXPECT_EQ(seen.getPathValue(),
+            "/v1/projects/p/locations/global/publishers/google/models/m:generateContent");
+  EXPECT_EQ(seen.get_("x-provider"), "vertex");
+  EXPECT_FALSE(seen.has("accept-encoding"));
+  const std::string output = bridge_.injected_.toString();
+  EXPECT_EQ(output, modify_body ? R"({"model":"gpt-4o"})" : body);
+  EXPECT_EQ(seen.getContentLengthValue(), absl::StrCat(output.size()));
+}
+
+// An edit that drops content-length is honored even when the body is re-serialized.
+TEST_P(FilterManagerHeaderEditsTest, RemovedContentLengthStaysRemoved) {
+  RequestHeaderEdits edits;
+  edits.remove = {Http::LowerCaseString("content-length")};
+
+  const Http::TestRequestHeaderMapImpl seen = run(R"({"model":"gpt-4"})", GetParam(), edits);
+
+  EXPECT_EQ(seen.ContentLength(), nullptr);
+  EXPECT_EQ(headers_.ContentLength(), nullptr);
+}
+
+TEST_P(FilterManagerHeaderEditsTest, EditsWithoutHeadersAreDropped) {
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<TestHeaderEditingFilter>(GetParam(), providerEdits()));
+  FilterManager manager(std::move(filters));
+
+  absl::Status status;
+  bool completed = false;
+  manager.startRequest(receive(R"({"model":"gpt-4"})"), &buffer_manager_, *dispatcher_,
+                       stream_info_, [&status, &completed](absl::Status s) {
+                         status = std::move(s);
+                         completed = true;
+                       });
+  drain();
+
+  EXPECT_TRUE(completed);
+  ASSERT_OK(status);
+  EXPECT_FALSE(bridge_.injected_.toString().empty());
+}
+
+// An edit cannot leave a content-length that disagrees with the body sent.
+TEST_P(FilterManagerHeaderEditsTest, ContentLengthAlwaysStatesTheBodySent) {
+  RequestHeaderEdits edits;
+  edits.set = {{Http::LowerCaseString("content-length"), "1"}};
+  const std::string body = R"({"model": "gpt-4"})";
+  headers_.setContentLength(body.size());
+
+  const Http::TestRequestHeaderMapImpl seen = run(body, GetParam(), edits);
+
+  EXPECT_EQ(seen.getContentLengthValue(), absl::StrCat(bridge_.injected_.length()));
+}
+
+class FilterManagerInvalidHeaderEditsTest
+    : public FilterManagerTest,
+      public testing::WithParamInterface<std::tuple<bool, std::string>> {};
+
+RequestHeaderEdits invalidEdits(absl::string_view name) {
+  RequestHeaderEdits edits;
+  if (name == "path_with_space") {
+    edits.path = "/v1/models/a b:generateContent";
+  } else if (name == "path_with_crlf") {
+    edits.path = "/v1\r\nx-injected: 1";
+  } else if (name == "relative_path") {
+    edits.path = "v1/models";
+  } else if (name == "empty_path") {
+    edits.path = "";
+  } else if (name == "value_with_crlf") {
+    edits.set = {{Http::LowerCaseString("x-provider"), "vertex\r\nx-injected: 1"}};
+  } else if (name == "value_with_nul") {
+    edits.set = {{Http::LowerCaseString("x-provider"), std::string("a\0b", 3)}};
+  } else if (name == "name_with_space") {
+    edits.set = {{Http::LowerCaseString("x provider"), "v"}};
+  } else if (name == "empty_name") {
+    edits.set = {{Http::LowerCaseString(""), "v"}};
+  } else if (name == "set_pseudo_header") {
+    edits.set = {{Http::LowerCaseString(":authority"), "evil.example.com"}};
+  } else if (name == "set_host") {
+    edits.set = {{Http::LowerCaseString("host"), "evil.example.com"}};
+  } else if (name == "remove_pseudo_header") {
+    edits.remove = {Http::LowerCaseString(":method")};
+  } else if (name == "remove_empty_name") {
+    edits.remove = {Http::LowerCaseString("")};
+  }
+  return edits;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Edits, FilterManagerInvalidHeaderEditsTest,
+    testing::Combine(testing::Bool(),
+                     testing::Values("path_with_space", "path_with_crlf", "relative_path",
+                                     "empty_path", "value_with_crlf", "value_with_nul",
+                                     "name_with_space", "empty_name", "set_pseudo_header",
+                                     "set_host", "remove_pseudo_header", "remove_empty_name")),
+    [](const testing::TestParamInfo<std::tuple<bool, std::string>>& info) {
+      return absl::StrCat(std::get<1>(info.param), std::get<0>(info.param) ? "_modified" : "");
+    });
+
+// Nothing reaches the chain and the held headers are left as received.
+TEST_P(FilterManagerInvalidHeaderEditsTest, FailsTheRequest) {
+  const auto& [modify_body, name] = GetParam();
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<TestHeaderEditingFilter>(modify_body, invalidEdits(name)));
+  FilterManager manager(std::move(filters));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {":path", "/v1/chat/completions"},
+                                         {":authority", "api.example.com"},
+                                         {"content-length", "17"}};
+  const Http::TestRequestHeaderMapImpl original = headers;
+  absl::Status status;
+  bool completed = false;
+  std::optional<Http::Code> local_reply;
+  manager.startRequest(
+      receive(R"({"model":"gpt-4"})"), &buffer_manager_, *dispatcher_, stream_info_,
+      [&status, &completed](absl::Status s) {
+        status = std::move(s);
+        completed = true;
+      },
+      &headers, [&local_reply](Http::Code code, std::string) { local_reply = code; });
+  drain();
+
+  EXPECT_TRUE(completed);
+  EXPECT_THAT(status, HasStatusCode(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(local_reply, Http::Code::BadGateway);
+  EXPECT_EQ(bridge_.injected_.length(), 0);
+  EXPECT_EQ(headers, original);
 }
 
 // Suspends after propagating, so its coroutine resumes only after the manager is gone.
@@ -782,7 +1255,7 @@ public:
                                        LocalReplier) override {
     ASSIGN_OR_CO_RETURN(AiRequestPtr req, co_await std::move(receive_request)());
     trace_.push_back("decode:" + name_);
-    seen_request_model_ = req->json()["model"].get<std::string>();
+    seen_request_model_ = req->json().value("model", "");
     co_return co_await std::move(propagate_request)(std::move(req));
   }
 

@@ -6,6 +6,7 @@
 #include "envoy/data/ai/v3/request_info.pb.h"
 #include "envoy/extensions/http/ai_filters/request_info/v3/request_info.pb.h"
 
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
@@ -61,6 +62,9 @@ public:
                   RequestInfoFilterConfigSharedPtr config = nullptr) {
     request_headers_ =
         Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", std::string(path)}};
+    Buffer::OwnedImpl body(payload);
+    buffer_manager_.onData(body);
+    buffer_manager_.endStream();
     JsonWithExtBuf doc;
     doc.setJson(nlohmann::json::parse(payload));
     std::vector<AiFilterSharedPtr> filters;
@@ -118,7 +122,7 @@ TEST_F(RequestInfoFilterTest, PublishesTypedRecordAndForwardsPayloadUnchanged) {
           "messages":[{"role":"user","content":"hi"}],
           "tools":[{"type":"function","function":{"name":"f"}}]})";
   const std::string replayed = run(payload, LLMProtocol::OpenAiChatCompletions);
-  EXPECT_EQ(nlohmann::json::parse(replayed), nlohmann::json::parse(payload));
+  EXPECT_EQ(replayed, payload);
 
   const auto record = published();
   ASSERT_TRUE(record.has_value());

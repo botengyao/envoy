@@ -163,6 +163,14 @@ private:
   bool root_emitted_{false};
 };
 
+// Rebuilds the document a sequence of flattened fields describes. Consecutive partial chunks
+// of one string are concatenated. InvalidArgument for an inconsistent sequence.
+absl::StatusOr<nlohmann::json> unflattenJson(absl::Span<const FlattenJsonField> fields);
+
+// Flattens `doc` into leaf fields in document order, the order FlatteningJsonSerializer
+// requires. Empty objects and arrays are emitted as leaves; the root may be any JSON value.
+std::vector<FlattenJsonField> flattenJson(const nlohmann::json& doc);
+
 } // namespace AiProtocolManager
 } // namespace HttpFilters
 } // namespace Extensions

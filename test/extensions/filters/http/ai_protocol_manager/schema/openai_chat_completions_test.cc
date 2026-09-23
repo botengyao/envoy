@@ -1,8 +1,13 @@
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/openai_chat_completions.h"
 
 #include "test/test_common/status_utility.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "nlohmann/json.hpp"
 
@@ -348,6 +353,22 @@ TEST(OpenAiChatCompletionsTest, NullableFieldsValidation) {
       {"response_format", nullptr},
       {"seed", nullptr},
       {"service_tier", nullptr},
+      {"stream_options", nullptr},
+      {"parallel_tool_calls", nullptr},
+      {"logprobs", nullptr},
+      {"top_logprobs", nullptr},
+      {"reasoning_effort", nullptr},
+      {"store", nullptr},
+      {"metadata", nullptr},
+      {"modalities", nullptr},
+      {"prediction", nullptr},
+      {"audio", nullptr},
+      {"web_search_options", nullptr},
+      {"verbosity", nullptr},
+      {"prompt_cache_key", nullptr},
+      {"safety_identifier", nullptr},
+      {"functions", nullptr},
+      {"function_call", nullptr},
   };
   EXPECT_THAT(payload_schema.validateRequest(null_fields_req), IsOk());
 
@@ -376,6 +397,84 @@ TEST(OpenAiChatCompletionsTest, NullableFieldsValidation) {
   };
   EXPECT_THAT(payload_schema.validateRequest(null_role),
               StatusCodeIs(absl::StatusCode::kInvalidArgument));
+}
+
+// A transcoder prunes a request to the fields its target declares, so every well-known request
+// parameter must be declared here or a conversion to OpenAI would drop it.
+TEST(OpenAiChatCompletionsTest, WellKnownRequestParameters) {
+  PayloadSchema payload_schema = createPayloadSchema();
+
+  nlohmann::json request = nlohmann::json::parse(R"({
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hi"}],
+    "stream": true,
+    "stream_options": {"include_usage": true, "include_obfuscation": false},
+    "parallel_tool_calls": false,
+    "logprobs": true,
+    "top_logprobs": 3,
+    "reasoning_effort": "low",
+    "store": true,
+    "metadata": {"purpose": "eval"},
+    "modalities": ["text", "audio"],
+    "prediction": {"type": "content", "content": "draft"},
+    "audio": {"voice": "alloy", "format": "mp3"},
+    "web_search_options": {"search_context_size": "low"},
+    "verbosity": "medium",
+    "prompt_cache_key": "cache-1",
+    "safety_identifier": "user-hash",
+    "functions": [{"name": "f", "parameters": {"type": "object"}}],
+    "function_call": {"name": "f"}
+  })",
+                                                 nullptr, /*allow_exceptions=*/false);
+  ASSERT_FALSE(request.is_discarded());
+  EXPECT_THAT(payload_schema.validateRequest(request), IsOk());
+
+  request["function_call"] = "auto";
+  EXPECT_THAT(payload_schema.validateRequest(request), IsOk());
+
+  std::vector<std::string> declared;
+  for (const Schema::Property& property :
+       payload_schema.requestSchema().rootSchema().properties()) {
+    declared.push_back(property.name);
+  }
+  for (const auto& [key, value] : request.items()) {
+    EXPECT_THAT(declared, testing::Contains(key));
+  }
+}
+
+TEST(OpenAiChatCompletionsTest, WellKnownRequestParametersAreTypeChecked) {
+  PayloadSchema payload_schema = createPayloadSchema();
+
+  const std::vector<std::pair<std::string, nlohmann::json>> invalid = {
+      {"stream_options", "include_usage"},
+      {"stream_options", {{"include_usage", "yes"}}},
+      {"parallel_tool_calls", "false"},
+      {"logprobs", 1},
+      {"top_logprobs", "3"},
+      {"reasoning_effort", 1},
+      {"store", "true"},
+      {"metadata", nlohmann::json::array()},
+      {"modalities", nlohmann::json::array({"text", 1})},
+      {"prediction", "draft"},
+      {"audio", "alloy"},
+      {"web_search_options", true},
+      {"verbosity", 2},
+      {"prompt_cache_key", 3},
+      {"safety_identifier", nlohmann::json::object()},
+      {"functions", nlohmann::json::object()},
+      {"functions", nlohmann::json::array({"f"})},
+      {"function_call", 1},
+  };
+  for (const auto& [field, value] : invalid) {
+    nlohmann::json request = {
+        {"model", "gpt-4o"},
+        {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "Hi"}}})},
+    };
+    request[field] = value;
+    EXPECT_THAT(payload_schema.validateRequest(request),
+                StatusCodeIs(absl::StatusCode::kInvalidArgument))
+        << field << ": " << value.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+  }
 }
 
 } // namespace

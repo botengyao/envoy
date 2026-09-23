@@ -23,21 +23,32 @@ namespace Extensions {
 namespace HttpFilters {
 namespace AiProtocolManager {
 
+// What the request sink does once the AI filters finish.
+struct RequestSinkOptions {
+  // Publish the IR an AI filter attached to the request under envoy.ai.request_ir.
+  bool publish_request_ir{false};
+  // Serialize the document even when no AI filter modified it, rather than forwarding the received
+  // body.
+  bool always_serialize{false};
+};
+
 // Runs the configured AI filters over a request payload index.
 //
 // Owned and managed by FilterManager for the decode path. Filters execute in forward order
-// (0..N-1). Once all filters propagate the request index, the sink serializes the resulting
-// payload index back into the stream's BufferManager.
+// (0..N-1). Once all filters propagate the request, the sink applies its staged header edits and
+// writes the body out through the stream's BufferManager: the received body unchanged, or the
+// re-serialized document when a filter modified it.
 class RequestFilterManager : public Logger::Loggable<Logger::Id::ai_protocol_manager> {
 public:
   using LocalReplyFn = absl::AnyInvocable<void(Http::Code code, std::string details)>;
   using OnCompleteFn = absl::AnyInvocable<void(absl::Status)>;
+  using SinkOptions = RequestSinkOptions;
 
   RequestFilterManager(std::vector<AiFilterSharedPtr> filters, JsonWithExtBuf payload_index,
                        BufferManager* buffer_manager, Event::Dispatcher& dispatcher,
                        StreamInfo::StreamInfo& stream_info, OnCompleteFn on_complete,
                        Http::RequestHeaderMap* request_headers = nullptr,
-                       LocalReplyFn local_reply_fn = nullptr);
+                       LocalReplyFn local_reply_fn = nullptr, SinkOptions sink_options = {});
   ~RequestFilterManager();
 
   // Starts the request filter pipeline and sink coroutines.

@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package envoy.extensions.http.ai_filters.transcoder.v3;
+
+import "envoy/type/ai/v3/llm_protocol.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.http.ai_filters.transcoder.v3";
+option java_outer_classname = "TranscoderProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/http/ai_filters/transcoder/v3;transcoderv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: Transcoder AI filter]
+// Transcoder AI filter :ref:`configuration overview
+// <config_http_filters_ai_protocol_manager_ai_filters>`.
+// [#extension: envoy.http.ai_filters.transcoder]
+
+// Bridges LLM protocols. The client's request is the source of truth: it is converted from the
+// client's protocol directly, never from the internal representation (IR), which is a read-only
+// view. The route's declared request protocol is the client's protocol.
+message Transcoder {
+  oneof leg {
+    option (validate.required) = true;
+
+    // Attaches the request's IR, currently OpenAI Chat Completions, for the AI filters after it
+    // to read, so place it first. The AI Protocol Manager publishes it under the
+    // ``envoy.ai.request_ir`` filter state key when its :ref:`request handling
+    // <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.RequestHandling>` is
+    // configured to. The request is not changed.
+    Internal internal = 1;
+
+    // Converts the request from the client's protocol to the one the upstream serves, rewrites
+    // the URL, and converts the response back. A request whose protocol already matches passes
+    // through with only the endpoint's envelope changed.
+    Upstream upstream = 2;
+  }
+}
+
+// The downstream leg.
+message Internal {
+}
+
+// The upstream leg.
+// [#next-free-field: 9]
+message Upstream {
+  // How usage is reported on a converted OpenAI Chat Completions stream.
+  enum StreamUsage {
+    // In the trailing ``choices: []`` chunk when the client set
+    // ``stream_options.include_usage``, otherwise on the chunk carrying ``finish_reason``, so
+    // token accounting always sees a count.
+    ALWAYS = 0;
+
+    // Only when the client set ``stream_options.include_usage``, as OpenAI does.
+    IF_REQUESTED = 1;
+  }
+
+  // What to do with a request field the upstream's protocol cannot express.
+  enum UnsupportedFields {
+    // Drop it.
+    DROP = 0;
+
+    // Reject the request with a 400 naming the field.
+    REJECT = 1;
+  }
+
+  // The protocol the upstream serves. Required.
+  type.ai.v3.LLMProtocol llm_protocol = 1 [(validate.rules).enum = {defined_only: true}];
+
+  // Where the upstream serves it, which determines the request path and the envelope fields the
+  // endpoint adds to the protocol.
+  oneof endpoint {
+    option (validate.required) = true;
+
+    // Vertex AI.
+    VertexAi vertex_ai = 2;
+
+    // The protocol owner's own API.
+    Native native = 3;
+  }
+
+  // Replaces the request's model on this upstream. When empty, the model comes from the
+  // ``envoy.ai.upstream_model`` filter state if set, otherwise from the request.
+  string model = 4;
+
+  // Output-token cap sent to an upstream that requires one (Anthropic Messages) when the request
+  // sets none. Defaults to 4096.
+  google.protobuf.UInt32Value default_max_output_tokens = 5 [(validate.rules).uint32 = {gt: 0}];
+
+  // Largest unary response body held for conversion; a larger one fails with a 502. Defaults to
+  // 4MiB.
+  google.protobuf.UInt32Value max_response_bytes = 6 [(validate.rules).uint32 = {gt: 0}];
+
+  StreamUsage stream_usage = 7 [(validate.rules).enum = {defined_only: true}];
+
+  UnsupportedFields unsupported_fields = 8 [(validate.rules).enum = {defined_only: true}];
+}
+
+// Vertex AI publisher-model endpoints. The publisher follows from ``llm_protocol``: ``google`` for
+// Gemini and ``anthropic`` for Anthropic Messages; OpenAI Chat Completions uses Vertex's
+// OpenAI-compatible endpoint.
+message VertexAi {
+  // Google Cloud project. Leave it and ``location`` empty for Vertex AI express mode, whose
+  // paths carry neither; express mode serves only Gemini.
+  string project = 1;
+
+  // A region such as ``us-east5``, or ``global``.
+  string location = 2;
+
+  // ``anthropic_version`` sent to Anthropic models. Defaults to ``vertex-2023-10-16``.
+  string anthropic_version = 3;
+}
+
+// The protocol owner's own API.
+message Native {
+  // Replaces the API version prefix of the path: ``/v1`` for OpenAI and Anthropic, ``/v1beta`` for
+  // Gemini.
+  string path_prefix = 1 [(validate.rules).string = {pattern: "^(/[^/?#]+)*$"}];
+}

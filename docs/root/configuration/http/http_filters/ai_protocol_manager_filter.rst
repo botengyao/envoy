@@ -163,6 +163,12 @@ may read or modify the document, or reject the request with a local reply.
 Routes without a per-route request declaration, and requests without a body,
 run no AI filters.
 
+Once the AI filters finish, the body the client sent is forwarded byte for byte unless an AI
+filter modified the request, in which case the parsed document is serialized. Set
+:ref:`reserialize_body
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.reserialize_body>`
+to ``ALWAYS`` to serialize it every time.
+
 Request info
 ~~~~~~~~~~~~
 
@@ -217,6 +223,53 @@ receives it through typed namespace forwarding:
 
 Only typed metadata is published. If the namespace already holds a record for
 the stream, the new one is skipped and counted by ``request_info.duplicate``.
+
+Transcoder
+~~~~~~~~~~
+
+The :ref:`transcoder filter
+<envoy_v3_api_msg_extensions.http.ai_filters.transcoder.v3.Transcoder>` lets clients and
+upstreams speak different protocols. It converts from the client's protocol, the route's
+declared request API, and never from an intermediate form, so a request whose protocol the
+upstream already speaks passes through with only the endpoint's envelope changed. It has two
+legs:
+
+* :ref:`internal <envoy_v3_api_field_extensions.http.ai_filters.transcoder.v3.Transcoder.internal>`,
+  first in a downstream AI filter chain, attaches a read-only view of the request in the internal
+  representation (OpenAI Chat Completions) for the AI filters after it, whatever protocol the
+  client speaks. With :ref:`publish_request_ir
+  <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.publish_request_ir>`
+  set, the filter publishes that view under the ``envoy.ai.request_ir`` filter state key once the
+  AI filters finish, before the request headers continue. Its ``model``, ``stream`` and
+  ``client_protocol`` fields can be read with ``%FILTER_STATE(envoy.ai.request_ir:FIELD:model)%``,
+  for example to route on the model. The request body is forwarded as received.
+* :ref:`upstream <envoy_v3_api_field_extensions.http.ai_filters.transcoder.v3.Transcoder.upstream>`,
+  typically in a cluster's upstream filter chain, converts the request to the protocol the
+  upstream serves, rewrites the path for its endpoint (for example Vertex AI's
+  ``.../publishers/google/models/{model}:generateContent``), removes ``accept-encoding`` so the
+  response can be converted, and converts the JSON or SSE response back to the client's protocol.
+  The model sent upstream is the configured
+  :ref:`model <envoy_v3_api_field_extensions.http.ai_filters.transcoder.v3.Upstream.model>`, else
+  the ``envoy.ai.upstream_model`` filter state, else the request's.
+
+.. code-block:: yaml
+
+  # In the cluster's HttpProtocolOptions.http_filters, before envoy.filters.http.upstream_codec.
+  - name: envoy.filters.http.ai_protocol_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+      request_handling: {}
+      filters:
+      - name: envoy.http.ai_filters.transcoder
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+          upstream:
+            llm_protocol: GEMINI_GENERATE_CONTENT
+            vertex_ai: {project: my-project, location: global}
+
+A request the upstream protocol cannot express is rejected with a 400, and a protocol pair the
+filter cannot convert with a 501, before anything is sent. Statistics are emitted under
+``ai_protocol_manager.transcoder.``.
 
 Response token-usage extraction
 -------------------------------

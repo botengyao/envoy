@@ -201,6 +201,8 @@ envoy_cc_library(
     hdrs = ["ai_request.h"],
     deps = [
         ":json_with_ext_buf_lib",
+        "//envoy/http:header_map_interface",
+        "//source/extensions/common/ai:request_ir_lib",
         "@nlohmann_json//:json",
     ],
 )
@@ -360,6 +362,7 @@ envoy_cc_library(
         ":buffer_manager_lib",
         ":filter_pipeline_lib",
         ":json_with_ext_buf_lib",
+        ":replay_awaitable_lib",
         ":serializer_lib",
         ":task_group_lib",
         "//envoy/event:dispatcher_interface",
@@ -370,9 +373,11 @@ envoy_cc_library(
         "//source/common/common:logger_lib",
         "//source/common/coroutine:status_macros_lib",
         "//source/common/coroutine:task_lib",
+        "//source/common/http:header_utility_lib",
         "@abseil-cpp//absl/functional:any_invocable",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
     ],
 )
 

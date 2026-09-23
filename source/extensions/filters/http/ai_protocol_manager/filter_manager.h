@@ -42,7 +42,8 @@ public:
   void startRequest(JsonWithExtBuf payload_index, BufferManager* buffer_manager,
                     Event::Dispatcher& dispatcher, StreamInfo::StreamInfo& stream_info,
                     OnCompleteFn on_complete, Http::RequestHeaderMap* request_headers = nullptr,
-                    LocalReplyFn local_reply_fn = nullptr);
+                    LocalReplyFn local_reply_fn = nullptr,
+                    RequestFilterManager::SinkOptions sink_options = {});
 
   // Starts the SSE response filter chain in reverse filter order (N-1..0).
   void startSseResponse(ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge,

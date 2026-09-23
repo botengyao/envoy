@@ -228,6 +228,8 @@ public:
   // left none behind. Offsets are relative to this store, which holds only this frame.
   BufferManager* payload_store() const { return payload_store_.get(); }
   void set_payload_store(BufferManagerPtr store) { payload_store_ = std::move(store); }
+  // For a filter that moves this frame's references into a frame of its own.
+  BufferManagerPtr release_payload_store() { return std::move(payload_store_); }
 
   // The frame's comment lines and field lines that this codec does not model, verbatim and in
   // arrival order, terminators included; null when the frame carried none. The store holds nothing
