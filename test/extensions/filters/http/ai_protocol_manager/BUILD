@@ -81,6 +81,33 @@ envoy_extension_cc_test(
         "//source/extensions/filters/http/ai_protocol_manager:llm_protocol_adapters_lib",
         "//source/extensions/filters/http/ai_protocol_manager:transcoding_engine_lib",
         "//test/test_common:status_utility_lib",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "transcoding_request_test",
+    srcs = ["transcoding_request_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:transcoding_engine_lib",
+        "//test/test_common:status_utility_lib",
+        "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "transcoding_response_test",
+    srcs = ["transcoding_response_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:transcoding_engine_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/transcoding:anthropic_messages_lib",
+        "//test/test_common:status_utility_lib",
+        "@nlohmann_json//:json",
     ],
 )
 

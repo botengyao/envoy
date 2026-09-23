@@ -1,4 +1,4 @@
-#include "source/extensions/http/ai_filters/transcoder/response/gemini.h"
+#include "source/extensions/filters/http/ai_protocol_manager/transcoding/gemini_generate_content.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
+
 #include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -17,8 +19,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace AiFilters {
-namespace Transcoder {
+namespace HttpFilters {
+namespace AiProtocolManager {
 namespace {
 
 using json = nlohmann::json;
@@ -291,7 +293,7 @@ absl::StatusOr<json> openAiChoice(json& candidate, uint64_t position, uint64_t& 
   return choice;
 }
 
-class GeminiToOpenAiStream : public StreamConverter {
+class GeminiToOpenAiStream : public ResponseStreamTranscoder {
 public:
   explicit GeminiToOpenAiStream(const ResponseContext& context) : context_(context) {}
 
@@ -456,31 +458,27 @@ const char* geminiFinishReason(absl::string_view reason) {
 // A tool call cut off at the token limit has partial arguments, and Gemini has no partial calls.
 bool dropsUnparsableCalls(absl::string_view finish_reason) { return finish_reason == "length"; }
 
-json geminiUsage(const json& usage) {
-  std::optional<uint64_t> reasoning;
-  std::optional<uint64_t> cached;
-  if (const json* details = objectMember(usage, "completion_tokens_details"); details != nullptr) {
-    reasoning = readCount(*details, "reasoning_tokens");
-  }
-  if (const json* details = objectMember(usage, "prompt_tokens_details"); details != nullptr) {
-    cached = readCount(*details, "cached_tokens");
-  }
+TokenUsage readOpenAiUsage(const json& document) {
+  return AdapterRegistry::get(LLMProtocol::OpenAiChatCompletions).extractUsage(document).usage;
+}
+
+json geminiUsage(const TokenUsage& usage) {
   json metadata = json::object();
-  if (const std::optional<uint64_t> prompt = readCount(usage, "prompt_tokens"); prompt) {
-    metadata["promptTokenCount"] = *prompt;
+  if (usage.input_tokens) {
+    metadata["promptTokenCount"] = *usage.input_tokens;
   }
-  if (const std::optional<uint64_t> completion = readCount(usage, "completion_tokens");
-      completion) {
-    metadata["candidatesTokenCount"] = *completion - std::min(*completion, reasoning.value_or(0));
+  if (usage.output_tokens) {
+    metadata["candidatesTokenCount"] =
+        *usage.output_tokens - std::min(*usage.output_tokens, usage.reasoning_tokens.value_or(0));
   }
-  if (const std::optional<uint64_t> total = readCount(usage, "total_tokens"); total) {
-    metadata["totalTokenCount"] = *total;
+  if (usage.total_tokens) {
+    metadata["totalTokenCount"] = *usage.total_tokens;
   }
-  if (reasoning) {
-    metadata["thoughtsTokenCount"] = *reasoning;
+  if (usage.reasoning_tokens) {
+    metadata["thoughtsTokenCount"] = *usage.reasoning_tokens;
   }
-  if (cached) {
-    metadata["cachedContentTokenCount"] = *cached;
+  if (usage.cached_input_tokens) {
+    metadata["cachedContentTokenCount"] = *usage.cached_input_tokens;
   }
   return metadata;
 }
@@ -569,7 +567,7 @@ absl::StatusOr<json> geminiCandidate(json& choice, uint64_t position) {
   return candidate;
 }
 
-class OpenAiToGeminiStream : public StreamConverter {
+class OpenAiToGeminiStream : public ResponseStreamTranscoder {
 public:
   explicit OpenAiToGeminiStream(const ResponseContext& context) : model_(context.model) {}
 
@@ -591,8 +589,9 @@ public:
     }
     response_id_ = stringMember(chunk, "id", response_id_);
     model_ = stringMember(chunk, "model", model_);
-    if (const json* usage = objectMember(chunk, "usage"); usage != nullptr) {
-      usage_ = *usage;
+    // Each usage object replaces the last one whole.
+    if (objectMember(chunk, "usage") != nullptr) {
+      usage_ = readOpenAiUsage(chunk);
     }
     json* choices = arrayMember(chunk, "choices");
     if (choices == nullptr) {
@@ -702,19 +701,19 @@ private:
   std::string model_;
   std::string response_id_;
   std::optional<std::string> finish_reason_;
-  std::optional<json> usage_;
+  std::optional<TokenUsage> usage_;
   std::map<uint64_t, PendingCall> calls_;
   bool done_{false};
 };
 
 } // namespace
 
-StreamConverterPtr createGeminiToOpenAiStreamConverter(const ResponseContext& context) {
+ResponseStreamTranscoderPtr createGeminiToOpenAiStreamTranscoder(const ResponseContext& context) {
   return std::make_unique<GeminiToOpenAiStream>(context);
 }
 
-absl::StatusOr<nlohmann::json> convertGeminiToOpenAiUnary(nlohmann::json body,
-                                                          const ResponseContext& context) {
+absl::StatusOr<nlohmann::json> transcodeGeminiToOpenAiUnary(nlohmann::json body,
+                                                            const ResponseContext& context) {
   if (!body.is_object()) {
     return absl::InvalidArgumentError("Gemini response is not a JSON object");
   }
@@ -750,12 +749,12 @@ absl::StatusOr<nlohmann::json> convertGeminiToOpenAiUnary(nlohmann::json body,
   return response;
 }
 
-StreamConverterPtr createOpenAiToGeminiStreamConverter(const ResponseContext& context) {
+ResponseStreamTranscoderPtr createOpenAiToGeminiStreamTranscoder(const ResponseContext& context) {
   return std::make_unique<OpenAiToGeminiStream>(context);
 }
 
-absl::StatusOr<nlohmann::json> convertOpenAiToGeminiUnary(nlohmann::json body,
-                                                          const ResponseContext& context) {
+absl::StatusOr<nlohmann::json> transcodeOpenAiToGeminiUnary(nlohmann::json body,
+                                                            const ResponseContext& context) {
   if (!body.is_object()) {
     return absl::InvalidArgumentError("OpenAI response is not a JSON object");
   }
@@ -774,8 +773,8 @@ absl::StatusOr<nlohmann::json> convertOpenAiToGeminiUnary(nlohmann::json body,
   }
   json response = json::object();
   response["candidates"] = std::move(candidates);
-  if (const json* usage = objectMember(body, "usage"); usage != nullptr) {
-    response["usageMetadata"] = geminiUsage(*usage);
+  if (objectMember(body, "usage") != nullptr) {
+    response["usageMetadata"] = geminiUsage(readOpenAiUsage(body));
   }
   response["modelVersion"] = stringMember(body, "model", context.model);
   if (const std::string id = stringMember(body, "id", ""); !id.empty()) {
@@ -784,7 +783,14 @@ absl::StatusOr<nlohmann::json> convertOpenAiToGeminiUnary(nlohmann::json body,
   return response;
 }
 
-} // namespace Transcoder
-} // namespace AiFilters
+const ResponseCodec& geminiGenerateContentResponseCodec() {
+  static constexpr ResponseCodec codec = {
+      createGeminiToOpenAiStreamTranscoder, createOpenAiToGeminiStreamTranscoder,
+      transcodeGeminiToOpenAiUnary, transcodeOpenAiToGeminiUnary};
+  return codec;
+}
+
+} // namespace AiProtocolManager
+} // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

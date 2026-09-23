@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "source/extensions/http/ai_filters/transcoder/response/gemini.h"
+#include "source/extensions/filters/http/ai_protocol_manager/transcoding/gemini_generate_content.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -16,8 +16,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace AiFilters {
-namespace Transcoder {
+namespace HttpFilters {
+namespace AiProtocolManager {
 namespace {
 
 using json = nlohmann::json;
@@ -108,27 +108,27 @@ json render(const std::vector<SseFrame>& frames) {
   return rendered;
 }
 
-json runStream(StreamConverter& converter, std::vector<SseFrame> frames) {
+json runStream(ResponseStreamTranscoder& transcoder, std::vector<SseFrame> frames) {
   std::vector<SseFrame> out;
   for (SseFrame& in : frames) {
-    const absl::Status status = converter.onFrame(std::move(in), out);
+    const absl::Status status = transcoder.onFrame(std::move(in), out);
     EXPECT_TRUE(status.ok()) << status;
   }
-  const absl::Status status = converter.onEnd(out);
+  const absl::Status status = transcoder.onEnd(out);
   EXPECT_TRUE(status.ok()) << status;
   return render(out);
 }
 
 json geminiToOpenAiStream(std::vector<SseFrame> frames,
                           const ResponseContext& context = testContext()) {
-  StreamConverterPtr converter = createGeminiToOpenAiStreamConverter(context);
-  return runStream(*converter, std::move(frames));
+  ResponseStreamTranscoderPtr transcoder = createGeminiToOpenAiStreamTranscoder(context);
+  return runStream(*transcoder, std::move(frames));
 }
 
 json openAiToGeminiStream(std::vector<SseFrame> frames,
                           const ResponseContext& context = testContext()) {
-  StreamConverterPtr converter = createOpenAiToGeminiStreamConverter(context);
-  return runStream(*converter, std::move(frames));
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToGeminiStreamTranscoder(context);
+  return runStream(*transcoder, std::move(frames));
 }
 
 json openAiChunk(const std::string& id, const std::string& model, json delta,
@@ -160,13 +160,13 @@ json usageChunk(const std::string& id, const std::string& model, json usage) {
 }
 
 json geminiUnaryToOpenAi(absl::string_view body) {
-  absl::StatusOr<json> converted = convertGeminiToOpenAiUnary(parse(body), testContext());
+  absl::StatusOr<json> converted = transcodeGeminiToOpenAiUnary(parse(body), testContext());
   EXPECT_TRUE(converted.ok()) << converted.status();
   return converted.ok() ? *converted : json();
 }
 
 json openAiUnaryToGemini(absl::string_view body) {
-  absl::StatusOr<json> converted = convertOpenAiToGeminiUnary(parse(body), testContext());
+  absl::StatusOr<json> converted = transcodeOpenAiToGeminiUnary(parse(body), testContext());
   EXPECT_TRUE(converted.ok()) << converted.status();
   return converted.ok() ? *converted : json();
 }
@@ -331,7 +331,7 @@ TEST(GeminiToOpenAiUnaryTest, UnusableCountsIgnored) {
 
   json signed_count = parse(R"json({"candidates": [], "usageMetadata": {}})json");
   signed_count["usageMetadata"]["promptTokenCount"] = int64_t{7};
-  absl::StatusOr<json> result = convertGeminiToOpenAiUnary(signed_count, testContext());
+  absl::StatusOr<json> result = transcodeGeminiToOpenAiUnary(signed_count, testContext());
   ASSERT_TRUE(result.ok());
   EXPECT_EQ((*result)["usage"],
             parse(R"({"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7})"));
@@ -371,7 +371,7 @@ TEST(GeminiToOpenAiUnaryTest, FinishReasons) {
     }
     json body = json::object();
     body["candidates"] = json::array({candidate});
-    absl::StatusOr<json> converted = convertGeminiToOpenAiUnary(body, testContext());
+    absl::StatusOr<json> converted = transcodeGeminiToOpenAiUnary(body, testContext());
     ASSERT_TRUE(converted.ok());
     EXPECT_EQ((*converted)["choices"][0]["finish_reason"], test_case.openai)
         << test_case.gemini.value_or("<missing>");
@@ -418,26 +418,26 @@ TEST(GeminiToOpenAiUnaryTest, ErrorBody) {
 }
 
 TEST(GeminiToOpenAiUnaryTest, NotAnObject) {
-  EXPECT_EQ(convertGeminiToOpenAiUnary(json::array(), testContext()).status().code(),
+  EXPECT_EQ(transcodeGeminiToOpenAiUnary(json::array(), testContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(convertGeminiToOpenAiUnary(json("text"), testContext()).status().code(),
+  EXPECT_EQ(transcodeGeminiToOpenAiUnary(json("text"), testContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
 
 TEST(GeminiToOpenAiUnaryTest, OffloadedValues) {
   json body = parse(R"({"candidates": [{"content": {"parts": [{"text": ""}]}}]})");
   body["candidates"][0]["content"]["parts"][0]["text"] = offloaded();
-  absl::StatusOr<json> converted = convertGeminiToOpenAiUnary(body, testContext());
+  absl::StatusOr<json> converted = transcodeGeminiToOpenAiUnary(body, testContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], offloaded());
 
   body["candidates"][0]["content"]["parts"].push_back({{"text", "tail"}});
-  EXPECT_EQ(convertGeminiToOpenAiUnary(body, testContext()).status().code(),
+  EXPECT_EQ(transcodeGeminiToOpenAiUnary(body, testContext()).status().code(),
             absl::StatusCode::kUnimplemented);
 
   json call = parse(R"({"candidates": [{"content": {"parts": [{"functionCall": {}}]}}]})");
   call["candidates"][0]["content"]["parts"][0]["functionCall"]["args"] = {{"text", offloaded()}};
-  EXPECT_EQ(convertGeminiToOpenAiUnary(call, testContext()).status().code(),
+  EXPECT_EQ(transcodeGeminiToOpenAiUnary(call, testContext()).status().code(),
             absl::StatusCode::kUnimplemented);
 }
 
@@ -611,9 +611,9 @@ TEST(GeminiToOpenAiStreamTest, OffloadedValues) {
   json body =
       parse(R"({"candidates": [{"content": {"parts": [{}, {"text": "a"}, {"text": "b"}]}}]})");
   body["candidates"][0]["content"]["parts"][0]["text"] = offloaded();
-  StreamConverterPtr converter = createGeminiToOpenAiStreamConverter(testContext());
+  ResponseStreamTranscoderPtr transcoder = createGeminiToOpenAiStreamTranscoder(testContext());
   std::vector<SseFrame> out;
-  ASSERT_TRUE(converter->onFrame(SseFrame::ofJson(body), out).ok());
+  ASSERT_TRUE(transcoder->onFrame(SseFrame::ofJson(body), out).ok());
   const std::string id = "chatcmpl-envoy";
   const std::string model = "requested-model";
   EXPECT_EQ(render(out), json::array({openAiChunk(id, model, roleDelta()),
@@ -624,7 +624,7 @@ TEST(GeminiToOpenAiStreamTest, OffloadedValues) {
       parse(R"({"candidates": [{"content": {"parts": [{"functionCall": {"name": "f"}}]}}]})");
   call["candidates"][0]["content"]["parts"][0]["functionCall"]["args"] = {
       {"list", json::array({offloaded()})}};
-  EXPECT_EQ(converter->onFrame(SseFrame::ofJson(call), out).code(),
+  EXPECT_EQ(transcoder->onFrame(SseFrame::ofJson(call), out).code(),
             absl::StatusCode::kUnimplemented);
 }
 
@@ -685,7 +685,7 @@ TEST(OpenAiToGeminiUnaryTest, FinishReasons) {
   };
   for (const auto& [openai, gemini] : cases) {
     json body = {{"choices", json::array({{{"finish_reason", openai}}})}};
-    absl::StatusOr<json> converted = convertOpenAiToGeminiUnary(body, testContext());
+    absl::StatusOr<json> converted = transcodeOpenAiToGeminiUnary(body, testContext());
     ASSERT_TRUE(converted.ok());
     EXPECT_EQ((*converted)["candidates"][0]["finishReason"], gemini) << openai;
   }
@@ -714,7 +714,7 @@ TEST(OpenAiToGeminiUnaryTest, Defaults) {
 TEST(OpenAiToGeminiUnaryTest, OffloadedContentIsCopied) {
   json body = parse(R"({"choices": [{"message": {"content": ""}}]})");
   body["choices"][0]["message"]["content"] = offloaded();
-  absl::StatusOr<json> converted = convertOpenAiToGeminiUnary(body, testContext());
+  absl::StatusOr<json> converted = transcodeOpenAiToGeminiUnary(body, testContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["candidates"][0]["content"]["parts"][0]["text"], offloaded());
 }
@@ -722,7 +722,7 @@ TEST(OpenAiToGeminiUnaryTest, OffloadedContentIsCopied) {
 TEST(OpenAiToGeminiUnaryTest, InvalidArguments) {
   for (const json& arguments :
        {json("{not json"), json("[1, 2]"), json("\"text\""), json(42), offloaded()}) {
-    EXPECT_EQ(convertOpenAiToGeminiUnary(toolCallBody(arguments), testContext()).status().code(),
+    EXPECT_EQ(transcodeOpenAiToGeminiUnary(toolCallBody(arguments), testContext()).status().code(),
               absl::StatusCode::kInvalidArgument)
         << arguments;
   }
@@ -751,7 +751,7 @@ TEST(OpenAiToGeminiUnaryTest, ToolCallCutOffAtLength) {
 TEST(OpenAiToGeminiUnaryTest, ArgumentsNestingIsBounded) {
   for (const std::string& arguments : {nestedObjects(101), nestedArrays(100)}) {
     absl::StatusOr<json> converted =
-        convertOpenAiToGeminiUnary(toolCallBody(arguments), testContext());
+        transcodeOpenAiToGeminiUnary(toolCallBody(arguments), testContext());
     ASSERT_TRUE(converted.ok()) << converted.status();
     EXPECT_EQ((*converted)["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
               parse(arguments));
@@ -759,7 +759,7 @@ TEST(OpenAiToGeminiUnaryTest, ArgumentsNestingIsBounded) {
   for (const std::string& arguments :
        {nestedObjects(102), nestedArrays(101), nestedObjects(100000), nestedArrays(100000)}) {
     absl::StatusOr<json> converted =
-        convertOpenAiToGeminiUnary(toolCallBody(arguments), testContext());
+        transcodeOpenAiToGeminiUnary(toolCallBody(arguments), testContext());
     EXPECT_EQ(converted.status().code(), absl::StatusCode::kInvalidArgument);
     EXPECT_EQ(converted.status().message(), "tool call 'f' arguments nest deeper than 100 levels");
   }
@@ -794,7 +794,7 @@ TEST(OpenAiToGeminiUnaryTest, ErrorBody) {
   };
   for (const auto& [type, status, code] : types) {
     json body = {{"error", {{"message", "m"}, {"type", type}}}};
-    absl::StatusOr<json> converted = convertOpenAiToGeminiUnary(body, testContext());
+    absl::StatusOr<json> converted = transcodeOpenAiToGeminiUnary(body, testContext());
     ASSERT_TRUE(converted.ok());
     EXPECT_EQ(*converted, json({{"error", {{"code", code}, {"message", "m"}, {"status", status}}}}))
         << type;
@@ -802,7 +802,7 @@ TEST(OpenAiToGeminiUnaryTest, ErrorBody) {
 }
 
 TEST(OpenAiToGeminiUnaryTest, NotAnObject) {
-  EXPECT_EQ(convertOpenAiToGeminiUnary(json::array(), testContext()).status().code(),
+  EXPECT_EQ(transcodeOpenAiToGeminiUnary(json::array(), testContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
 
@@ -952,19 +952,19 @@ TEST(OpenAiToGeminiStreamTest, IgnoredFrames) {
 }
 
 TEST(OpenAiToGeminiStreamTest, InvalidToolCallArguments) {
-  StreamConverterPtr converter = createOpenAiToGeminiStreamConverter(testContext());
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToGeminiStreamTranscoder(testContext());
   std::vector<SseFrame> out;
-  ASSERT_TRUE(converter
+  ASSERT_TRUE(transcoder
                   ->onFrame(frame(R"json({"choices": [{"index": 0, "delta": {"tool_calls": [
                     {"index": 0, "function": {"name": "f", "arguments": "{oops"}}]},
                     "finish_reason": "tool_calls"}]})json"),
                             out)
                   .ok());
-  EXPECT_EQ(converter->onFrame(SseFrame::ofData("[DONE]"), out).code(),
+  EXPECT_EQ(transcoder->onFrame(SseFrame::ofData("[DONE]"), out).code(),
             absl::StatusCode::kInvalidArgument);
   EXPECT_TRUE(out.empty());
 
-  StreamConverterPtr deep = createOpenAiToGeminiStreamConverter(testContext());
+  ResponseStreamTranscoderPtr deep = createOpenAiToGeminiStreamTranscoder(testContext());
   const std::string arguments = nestedObjects(100000);
   for (size_t offset = 0; offset < arguments.size(); offset += arguments.size() / 4 + 1) {
     json chunk = parse(R"json({"choices": [{"index": 0, "delta": {"tool_calls": [
@@ -977,7 +977,7 @@ TEST(OpenAiToGeminiStreamTest, InvalidToolCallArguments) {
             absl::StatusCode::kInvalidArgument);
   EXPECT_TRUE(out.empty());
 
-  StreamConverterPtr non_string = createOpenAiToGeminiStreamConverter(testContext());
+  ResponseStreamTranscoderPtr non_string = createOpenAiToGeminiStreamTranscoder(testContext());
   EXPECT_EQ(non_string
                 ->onFrame(frame(R"json({"choices": [{"index": 0, "delta": {"tool_calls": [
                   {"index": 0, "function": {"name": "f", "arguments": 5}}]}}]})json"),
@@ -999,16 +999,16 @@ TEST(GeminiRoundTripTest, Unary) {
               "prompt_tokens_details": {"cached_tokens": 4},
               "completion_tokens_details": {"reasoning_tokens": 20}}
   })json");
-  absl::StatusOr<json> gemini = convertOpenAiToGeminiUnary(original, testContext());
+  absl::StatusOr<json> gemini = transcodeOpenAiToGeminiUnary(original, testContext());
   ASSERT_TRUE(gemini.ok());
-  absl::StatusOr<json> openai = convertGeminiToOpenAiUnary(*gemini, testContext());
+  absl::StatusOr<json> openai = transcodeGeminiToOpenAiUnary(*gemini, testContext());
   ASSERT_TRUE(openai.ok());
   EXPECT_EQ(*openai, original);
 }
 
 TEST(GeminiRoundTripTest, Stream) {
-  StreamConverterPtr to_gemini = createOpenAiToGeminiStreamConverter(testContext());
-  StreamConverterPtr to_openai = createGeminiToOpenAiStreamConverter(testContext());
+  ResponseStreamTranscoderPtr to_gemini = createOpenAiToGeminiStreamTranscoder(testContext());
+  ResponseStreamTranscoderPtr to_openai = createGeminiToOpenAiStreamTranscoder(testContext());
   std::vector<SseFrame> frames = openAiTextStream();
   frames.insert(frames.begin() + 3, frame(R"json({"id": "chatcmpl-9", "model": "gpt-4o",
     "choices": [{"index": 0, "delta": {"tool_calls": [
@@ -1042,7 +1042,7 @@ TEST(GeminiRoundTripTest, Stream) {
 }
 
 } // namespace
-} // namespace Transcoder
-} // namespace AiFilters
+} // namespace AiProtocolManager
+} // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

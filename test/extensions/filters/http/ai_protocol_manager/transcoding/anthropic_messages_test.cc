@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "source/extensions/http/ai_filters/transcoder/response/anthropic.h"
+#include "source/extensions/filters/http/ai_protocol_manager/transcoding/anthropic_messages.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -18,8 +18,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace AiFilters {
-namespace Transcoder {
+namespace HttpFilters {
+namespace AiProtocolManager {
 namespace {
 
 constexpr int64_t kCreated = 1758650000;
@@ -74,25 +74,25 @@ std::vector<SseFrame> parseSse(absl::string_view transcript) {
   return frames;
 }
 
-std::vector<SseFrame> run(StreamConverter& converter, std::vector<SseFrame> frames) {
+std::vector<SseFrame> run(ResponseStreamTranscoder& transcoder, std::vector<SseFrame> frames) {
   std::vector<SseFrame> out;
   for (SseFrame& frame : frames) {
-    EXPECT_TRUE(converter.onFrame(std::move(frame), out).ok());
+    EXPECT_TRUE(transcoder.onFrame(std::move(frame), out).ok());
   }
-  EXPECT_TRUE(converter.onEnd(out).ok());
+  EXPECT_TRUE(transcoder.onEnd(out).ok());
   return out;
 }
 
 std::vector<SseFrame> anthropicToOpenAi(absl::string_view transcript,
                                         const ResponseContext& context = makeContext()) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(context);
-  return run(*converter, parseSse(transcript));
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(context);
+  return run(*transcoder, parseSse(transcript));
 }
 
 std::vector<SseFrame> openAiToAnthropic(absl::string_view transcript,
                                         const ResponseContext& context = makeContext()) {
-  StreamConverterPtr converter = createOpenAiToAnthropicStreamConverter(context);
-  return run(*converter, parseSse(transcript));
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToAnthropicStreamTranscoder(context);
+  return run(*transcoder, parseSse(transcript));
 }
 
 // OpenAI frames have no event name; "[DONE]" is kept as its raw data.
@@ -324,7 +324,7 @@ TEST(AnthropicToOpenAiUnaryTest, TextToolsAndThinking) {
               "cache_read_input_tokens": 500, "output_tokens": 503}
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok()) << converted.status();
   EXPECT_EQ(*converted, parse(R"({
     "id": "msg_01Aq9w938a90dw8q",
@@ -360,7 +360,7 @@ TEST(AnthropicToOpenAiUnaryTest, TextOnlyWithoutCacheFields) {
     "usage": {"input_tokens": 12, "output_tokens": 4}
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted, parse(R"({
     "id": "msg_1", "object": "chat.completion", "created": 1758650000,
@@ -380,7 +380,7 @@ TEST(AnthropicToOpenAiUnaryTest, ToolCallsWithoutTextHaveNullContent) {
     "stop_reason": "tool_use"
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   nlohmann::json& message = (*converted)["choices"][0]["message"];
   EXPECT_TRUE(message["content"].is_null());
@@ -391,7 +391,7 @@ TEST(AnthropicToOpenAiUnaryTest, ToolCallsWithoutTextHaveNullContent) {
 }
 
 TEST(AnthropicToOpenAiUnaryTest, NoContentIsEmptyString) {
-  absl::StatusOr<nlohmann::json> converted = convertAnthropicToOpenAiUnary(
+  absl::StatusOr<nlohmann::json> converted = transcodeAnthropicToOpenAiUnary(
       parse(R"({"content": [], "stop_reason": "max_tokens"})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted, parse(R"({
@@ -410,12 +410,13 @@ TEST(AnthropicToOpenAiUnaryTest, MalformedBlocksAreSkipped) {
                 {"type": "text", "text": "kept"}]
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"],
             parse(R"({"role":"assistant","content":"kept"})"));
 
-  converted = convertAnthropicToOpenAiUnary(parse(R"({"content": "not an array"})"), makeContext());
+  converted =
+      transcodeAnthropicToOpenAiUnary(parse(R"({"content": "not an array"})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], "");
 }
@@ -433,13 +434,13 @@ TEST(AnthropicToOpenAiUnaryTest, FinishReasons) {
       {"null", "stop"},
   };
   for (const auto& [stop_reason, finish_reason] : cases) {
-    absl::StatusOr<nlohmann::json> converted = convertAnthropicToOpenAiUnary(
+    absl::StatusOr<nlohmann::json> converted = transcodeAnthropicToOpenAiUnary(
         parse(absl::StrCat(R"({"content":[],"stop_reason":)", stop_reason, "}")), makeContext());
     ASSERT_TRUE(converted.ok());
     EXPECT_EQ((*converted)["choices"][0]["finish_reason"], finish_reason) << stop_reason;
   }
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(parse(R"({"content":[]})"), makeContext());
+      transcodeAnthropicToOpenAiUnary(parse(R"({"content":[]})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["finish_reason"], "stop");
 }
@@ -451,7 +452,7 @@ TEST(AnthropicToOpenAiUnaryTest, UsageIgnoresUnusableCounts) {
                            {"output_tokens", -1},
                            {"cache_creation_input_tokens", nullptr},
                            {"cache_read_input_tokens", "7"}}}};
-  absl::StatusOr<nlohmann::json> converted = convertAnthropicToOpenAiUnary(body, makeContext());
+  absl::StatusOr<nlohmann::json> converted = transcodeAnthropicToOpenAiUnary(body, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["usage"],
             parse(R"({"prompt_tokens": 3, "completion_tokens": 0, "total_tokens": 3})"));
@@ -464,12 +465,12 @@ TEST(AnthropicToOpenAiUnaryTest, ErrorBody) {
     "request_id": "req_011CSHoEeqs5C35K2UUqR7Fy"
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted,
             parse(R"({"error": {"message": "Overloaded", "type": "overloaded_error"}})"));
 
-  converted = convertAnthropicToOpenAiUnary(parse(R"({"type": "error"})"), makeContext());
+  converted = transcodeAnthropicToOpenAiUnary(parse(R"({"type": "error"})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted, parse(R"({"error": {"message": "", "type": "api_error"}})"));
 }
@@ -480,13 +481,13 @@ TEST(AnthropicToOpenAiUnaryTest, VertexErrorBody) {
               "status": "RESOURCE_EXHAUSTED"}
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertAnthropicToOpenAiUnary(std::move(body), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted, parse(R"({"error": {
     "message": "Quota exceeded for online_prediction_requests_per_base_model",
     "type": "RESOURCE_EXHAUSTED"}})"));
 
-  converted = convertAnthropicToOpenAiUnary(
+  converted = transcodeAnthropicToOpenAiUnary(
       parse(R"({"type": "message", "content": [{"type": "text", "text": "ok"}],
                 "error": {"message": "not an error"}})"),
       makeContext());
@@ -494,7 +495,7 @@ TEST(AnthropicToOpenAiUnaryTest, VertexErrorBody) {
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], "ok");
 
   converted =
-      convertAnthropicToOpenAiUnary(parse(R"({"error": "boom", "content": []})"), makeContext());
+      transcodeAnthropicToOpenAiUnary(parse(R"({"error": "boom", "content": []})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["object"], "chat.completion");
 }
@@ -502,7 +503,7 @@ TEST(AnthropicToOpenAiUnaryTest, VertexErrorBody) {
 TEST(AnthropicToOpenAiUnaryTest, OffloadedErrorMessageIsCopied) {
   nlohmann::json body = {{"type", "error"},
                          {"error", {{"type", "invalid_request_error"}, {"message", offloaded()}}}};
-  absl::StatusOr<nlohmann::json> converted = convertAnthropicToOpenAiUnary(body, makeContext());
+  absl::StatusOr<nlohmann::json> converted = transcodeAnthropicToOpenAiUnary(body, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(
       *converted,
@@ -510,35 +511,35 @@ TEST(AnthropicToOpenAiUnaryTest, OffloadedErrorMessageIsCopied) {
 }
 
 TEST(AnthropicToOpenAiUnaryTest, NotAnObject) {
-  EXPECT_EQ(convertAnthropicToOpenAiUnary(parse("[]"), makeContext()).status().code(),
+  EXPECT_EQ(transcodeAnthropicToOpenAiUnary(parse("[]"), makeContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(convertAnthropicToOpenAiUnary(parse(R"("text")"), makeContext()).status().code(),
+  EXPECT_EQ(transcodeAnthropicToOpenAiUnary(parse(R"("text")"), makeContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
 
 TEST(AnthropicToOpenAiUnaryTest, OffloadedValues) {
   nlohmann::json single = {
       {"content", nlohmann::json::array({{{"type", "text"}, {"text", offloaded()}}})}};
-  absl::StatusOr<nlohmann::json> converted = convertAnthropicToOpenAiUnary(single, makeContext());
+  absl::StatusOr<nlohmann::json> converted = transcodeAnthropicToOpenAiUnary(single, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], offloaded());
 
   nlohmann::json with_tool = single;
   with_tool["content"].push_back(
       nlohmann::json{{"type", "tool_use"}, {"id", "toolu_1"}, {"name", "f"}, {"input", {}}});
-  converted = convertAnthropicToOpenAiUnary(with_tool, makeContext());
+  converted = transcodeAnthropicToOpenAiUnary(with_tool, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], offloaded());
 
   nlohmann::json with_empty = single;
   with_empty["content"].push_back(nlohmann::json{{"type", "text"}, {"text", ""}});
-  converted = convertAnthropicToOpenAiUnary(with_empty, makeContext());
+  converted = transcodeAnthropicToOpenAiUnary(with_empty, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["choices"][0]["message"]["content"], offloaded());
 
   nlohmann::json two = single;
   two["content"].push_back(nlohmann::json{{"type", "text"}, {"text", "more"}});
-  EXPECT_EQ(convertAnthropicToOpenAiUnary(two, makeContext()).status().code(),
+  EXPECT_EQ(transcodeAnthropicToOpenAiUnary(two, makeContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 
   nlohmann::json tool = {
@@ -546,7 +547,7 @@ TEST(AnthropicToOpenAiUnaryTest, OffloadedValues) {
                                           {"id", "toolu_1"},
                                           {"name", "write_file"},
                                           {"input", {{"body", {{"text", offloaded()}}}}}}})}};
-  EXPECT_EQ(convertAnthropicToOpenAiUnary(tool, makeContext()).status().code(),
+  EXPECT_EQ(transcodeAnthropicToOpenAiUnary(tool, makeContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
 
@@ -711,22 +712,22 @@ TEST(AnthropicToOpenAiStreamTest, ErrorEndsStream) {
 }
 
 TEST(AnthropicToOpenAiStreamTest, ErrorByEventNameWithoutDetails) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson(nlohmann::json::object(), "error"));
-  EXPECT_EQ(openAiPayloads(run(*converter, std::move(frames))),
+  EXPECT_EQ(openAiPayloads(run(*transcoder, std::move(frames))),
             parse(R"([{"error": {"message": "", "type": "api_error"}}])"));
 }
 
 TEST(AnthropicToOpenAiStreamTest, ErrorEventWithoutAnthropicPayload) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson(
       parse(R"({"type":"message_start","message":{"id":"msg_1","model":"m"}})"), "message_start"));
   frames.push_back(SseFrame::ofData("upstream connect error", "error"));
   frames.push_back(SseFrame::ofJson(parse(
       R"({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})")));
-  EXPECT_EQ(openAiPayloads(run(*converter, std::move(frames))),
+  EXPECT_EQ(openAiPayloads(run(*transcoder, std::move(frames))),
             nlohmann::json::array({
                 chunk("msg_1", "m", {{"role", "assistant"}, {"content", ""}}),
                 parse(R"({"error": {"message": "upstream connect error", "type": "api_error"}})"),
@@ -736,10 +737,10 @@ TEST(AnthropicToOpenAiStreamTest, ErrorEventWithoutAnthropicPayload) {
            {nlohmann::json("Overloaded"), "Overloaded"},
            {nlohmann::json(42), ""},
            {nlohmann::json::array({"a"}), ""}}) {
-    converter = createAnthropicToOpenAiStreamConverter(makeContext());
+    transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
     frames.clear();
     frames.push_back(SseFrame::ofJson(payload, "error"));
-    nlohmann::json payloads = openAiPayloads(run(*converter, std::move(frames)));
+    nlohmann::json payloads = openAiPayloads(run(*transcoder, std::move(frames)));
     ASSERT_EQ(payloads.size(), 1U) << payload;
     EXPECT_EQ(payloads[0],
               nlohmann::json({{"error", {{"message", message}, {"type", "api_error"}}}}))
@@ -824,7 +825,7 @@ TEST(AnthropicToOpenAiStreamTest, ServerToolBlocksAreDropped) {
 }
 
 TEST(AnthropicToOpenAiStreamTest, UnusableFramesAreDropped) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofData("not json", "content_block_delta"));
   frames.push_back(SseFrame::ofJson(parse("[1, 2]"), "content_block_delta"));
@@ -843,11 +844,11 @@ TEST(AnthropicToOpenAiStreamTest, UnusableFramesAreDropped) {
   frames.push_back(SseFrame::ofJson(parse(R"({"type": "content_block_stop", "index": 0})")));
   frames.push_back(SseFrame::ofJson(parse(R"({"type": "content_block_stop"})")));
   frames.push_back(SseFrame::ofJson(parse(R"({"type": "ping"})")));
-  EXPECT_TRUE(run(*converter, std::move(frames)).empty());
+  EXPECT_TRUE(run(*transcoder, std::move(frames)).empty());
 }
 
 TEST(AnthropicToOpenAiStreamTest, EventNameFallbackAndStartText) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson(nlohmann::json::object(), "message_start"));
   frames.push_back(
@@ -856,7 +857,7 @@ TEST(AnthropicToOpenAiStreamTest, EventNameFallbackAndStartText) {
   frames.push_back(
       SseFrame::ofJson(parse(R"({"index": 0, "delta": {"type": "text_delta", "text": " there"}})"),
                        "content_block_delta"));
-  EXPECT_EQ(openAiPayloads(run(*converter, std::move(frames))),
+  EXPECT_EQ(openAiPayloads(run(*transcoder, std::move(frames))),
             nlohmann::json::array({
                 chunk("", "requested-model", {{"role", "assistant"}, {"content", ""}}),
                 chunk("", "requested-model", {{"content", "Hi"}}),
@@ -884,7 +885,7 @@ TEST(AnthropicToOpenAiStreamTest, FramesAfterMessageStopAreIgnored) {
 }
 
 TEST(AnthropicToOpenAiStreamTest, OffloadedValuesAreCopied) {
-  StreamConverterPtr converter = createAnthropicToOpenAiStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createAnthropicToOpenAiStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson({{"type", "content_block_delta"},
                                      {"index", 0},
@@ -896,7 +897,7 @@ TEST(AnthropicToOpenAiStreamTest, OffloadedValuesAreCopied) {
                         {"index", 1},
                         {"delta", {{"type", "input_json_delta"}, {"partial_json", offloaded()}}}}));
   frames.push_back(SseFrame::ofJson(parse(R"({"type":"content_block_stop","index":1})")));
-  nlohmann::json payloads = openAiPayloads(run(*converter, std::move(frames)));
+  nlohmann::json payloads = openAiPayloads(run(*transcoder, std::move(frames)));
   ASSERT_EQ(payloads.size(), 3U);
   EXPECT_EQ(payloads[0]["choices"][0]["delta"]["content"], offloaded());
   EXPECT_EQ(payloads[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
@@ -923,7 +924,7 @@ TEST(OpenAiToAnthropicUnaryTest, TextWithCachedUsage) {
     "system_fingerprint": "fp_fc9f1d7035"
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertOpenAiToAnthropicUnary(std::move(body), makeContext());
+      transcodeOpenAiToAnthropicUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok()) << converted.status();
   EXPECT_EQ(*converted, parse(R"({
     "id": "chatcmpl-B9MHDbslfkBeAs8l4bebGdFOJ6PeG",
@@ -960,7 +961,7 @@ TEST(OpenAiToAnthropicUnaryTest, ToolCalls) {
     "usage": {"prompt_tokens": 82, "completion_tokens": 17, "total_tokens": 99}
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertOpenAiToAnthropicUnary(std::move(body), makeContext());
+      transcodeOpenAiToAnthropicUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok()) << converted.status();
   EXPECT_EQ(*converted, parse(R"({
     "id": "chatcmpl-abc123",
@@ -994,7 +995,7 @@ TEST(OpenAiToAnthropicUnaryTest, InvalidToolArguments) {
                   nlohmann::json::array(
                       {{{"id", "call_1"},
                         {"function", {{"name", "f"}, {"arguments", arguments}}}}})}}}}})}};
-    EXPECT_EQ(convertOpenAiToAnthropicUnary(body, makeContext()).status().code(),
+    EXPECT_EQ(transcodeOpenAiToAnthropicUnary(body, makeContext()).status().code(),
               absl::StatusCode::kInvalidArgument)
         << body;
   }
@@ -1011,7 +1012,7 @@ TEST(OpenAiToAnthropicUnaryTest, FinishReasons) {
       {"null", "end_turn"},
   };
   for (const auto& [finish_reason, stop_reason] : cases) {
-    absl::StatusOr<nlohmann::json> converted = convertOpenAiToAnthropicUnary(
+    absl::StatusOr<nlohmann::json> converted = transcodeOpenAiToAnthropicUnary(
         parse(absl::StrCat(R"({"choices":[{"message":{"content":null},"finish_reason":)",
                            finish_reason, "}]}")),
         makeContext());
@@ -1030,7 +1031,7 @@ TEST(OpenAiToAnthropicUnaryTest, ToolCallsImplyToolUse) {
       {R"("content_filter")", "refusal"},
   };
   for (const auto& [finish_reason, stop_reason] : cases) {
-    absl::StatusOr<nlohmann::json> converted = convertOpenAiToAnthropicUnary(
+    absl::StatusOr<nlohmann::json> converted = transcodeOpenAiToAnthropicUnary(
         parse(absl::StrCat(R"({"choices":[{"message":{"content":null,"tool_calls":[)",
                            R"({"id":"call_1","type":"function",)",
                            R"("function":{"name":"extract","arguments":"{\"a\":1}"}}]},)",
@@ -1045,7 +1046,7 @@ TEST(OpenAiToAnthropicUnaryTest, MissingChoices) {
   for (absl::string_view body : {R"({})", R"({"choices": []})", R"({"choices": {}})",
                                  R"({"choices": [{"finish_reason": "stop"}]})"}) {
     absl::StatusOr<nlohmann::json> converted =
-        convertOpenAiToAnthropicUnary(parse(body), makeContext());
+        transcodeOpenAiToAnthropicUnary(parse(body), makeContext());
     ASSERT_TRUE(converted.ok());
     EXPECT_EQ(*converted, parse(R"({
       "id": "", "type": "message", "role": "assistant", "model": "requested-model",
@@ -1060,7 +1061,7 @@ TEST(OpenAiToAnthropicUnaryTest, CachedTokensAreClamped) {
   nlohmann::json body = parse(R"({"usage": {"prompt_tokens": 10, "completion_tokens": 2,
                                             "prompt_tokens_details": {"cached_tokens": 50}}})");
   absl::StatusOr<nlohmann::json> converted =
-      convertOpenAiToAnthropicUnary(std::move(body), makeContext());
+      transcodeOpenAiToAnthropicUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["usage"],
             parse(R"({"input_tokens": 0, "output_tokens": 2, "cache_read_input_tokens": 10})"));
@@ -1069,7 +1070,7 @@ TEST(OpenAiToAnthropicUnaryTest, CachedTokensAreClamped) {
 TEST(OpenAiToAnthropicUnaryTest, OffloadedContentIsCopied) {
   nlohmann::json body = {
       {"choices", nlohmann::json::array({{{"message", {{"content", offloaded()}}}}})}};
-  absl::StatusOr<nlohmann::json> converted = convertOpenAiToAnthropicUnary(body, makeContext());
+  absl::StatusOr<nlohmann::json> converted = transcodeOpenAiToAnthropicUnary(body, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ((*converted)["content"],
             nlohmann::json::array({{{"type", "text"}, {"text", offloaded()}}}));
@@ -1081,12 +1082,12 @@ TEST(OpenAiToAnthropicUnaryTest, ErrorBody) {
               "param": null, "code": "rate_limit_exceeded"}
   })");
   absl::StatusOr<nlohmann::json> converted =
-      convertOpenAiToAnthropicUnary(std::move(body), makeContext());
+      transcodeOpenAiToAnthropicUnary(std::move(body), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted, parse(R"({"type": "error",
       "error": {"type": "requests", "message": "Rate limit reached for gpt-4o"}})"));
 
-  converted = convertOpenAiToAnthropicUnary(
+  converted = transcodeOpenAiToAnthropicUnary(
       parse(R"({"error": {"message": "boom", "type": null}})"), makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(*converted,
@@ -1095,7 +1096,7 @@ TEST(OpenAiToAnthropicUnaryTest, ErrorBody) {
 
 TEST(OpenAiToAnthropicUnaryTest, OffloadedErrorMessageIsCopied) {
   nlohmann::json body = {{"error", {{"message", offloaded()}, {"type", "invalid_request_error"}}}};
-  absl::StatusOr<nlohmann::json> converted = convertOpenAiToAnthropicUnary(body, makeContext());
+  absl::StatusOr<nlohmann::json> converted = transcodeOpenAiToAnthropicUnary(body, makeContext());
   ASSERT_TRUE(converted.ok());
   EXPECT_EQ(
       *converted,
@@ -1104,7 +1105,7 @@ TEST(OpenAiToAnthropicUnaryTest, OffloadedErrorMessageIsCopied) {
 }
 
 TEST(OpenAiToAnthropicUnaryTest, NotAnObject) {
-  EXPECT_EQ(convertOpenAiToAnthropicUnary(parse("[]"), makeContext()).status().code(),
+  EXPECT_EQ(transcodeOpenAiToAnthropicUnary(parse("[]"), makeContext()).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
 
@@ -1250,10 +1251,10 @@ TEST(OpenAiToAnthropicStreamTest, ErrorEndsStream) {
 }
 
 TEST(OpenAiToAnthropicStreamTest, OffloadedErrorMessageIsCopied) {
-  StreamConverterPtr converter = createOpenAiToAnthropicStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToAnthropicStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson({{"error", {{"message", offloaded()}}}}));
-  nlohmann::json payloads = anthropicPayloads(run(*converter, std::move(frames)));
+  nlohmann::json payloads = anthropicPayloads(run(*transcoder, std::move(frames)));
   ASSERT_EQ(payloads.size(), 1U);
   EXPECT_EQ(payloads[0],
             nlohmann::json(
@@ -1293,7 +1294,7 @@ TEST(OpenAiToAnthropicStreamTest, DoneWithoutChunks) {
 }
 
 TEST(OpenAiToAnthropicStreamTest, UnusableFramesAreDroppedAndDoneIsFinal) {
-  StreamConverterPtr converter = createOpenAiToAnthropicStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToAnthropicStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofData("not json"));
   frames.push_back(SseFrame::ofJson(parse("[1]")));
@@ -1301,11 +1302,11 @@ TEST(OpenAiToAnthropicStreamTest, UnusableFramesAreDroppedAndDoneIsFinal) {
   frames.push_back(SseFrame::ofData("[DONE]"));
   frames.push_back(SseFrame::ofJson(parse(R"({"choices":[{"delta":{"content":"late"}}]})")));
   frames.push_back(SseFrame::ofData("[DONE]"));
-  EXPECT_EQ(anthropicPayloads(run(*converter, std::move(frames))).size(), 3U);
+  EXPECT_EQ(anthropicPayloads(run(*transcoder, std::move(frames))).size(), 3U);
 }
 
 TEST(OpenAiToAnthropicStreamTest, OffloadedValuesAreCopied) {
-  StreamConverterPtr converter = createOpenAiToAnthropicStreamConverter(makeContext());
+  ResponseStreamTranscoderPtr transcoder = createOpenAiToAnthropicStreamTranscoder(makeContext());
   std::vector<SseFrame> frames;
   frames.push_back(SseFrame::ofJson(
       {{"choices", nlohmann::json::array({{{"delta", {{"content", offloaded()}}}}})}}));
@@ -1318,7 +1319,7 @@ TEST(OpenAiToAnthropicStreamTest, OffloadedValuesAreCopied) {
                      {{{"index", 0},
                        {"id", "call_1"},
                        {"function", {{"name", "f"}, {"arguments", offloaded()}}}}})}}}}})}}));
-  nlohmann::json payloads = anthropicPayloads(run(*converter, std::move(frames)));
+  nlohmann::json payloads = anthropicPayloads(run(*transcoder, std::move(frames)));
   ASSERT_EQ(payloads.size(), 6U);
   EXPECT_EQ(payloads[2]["delta"]["text"], offloaded());
   EXPECT_EQ(payloads[5]["delta"]["partial_json"], offloaded());
@@ -1336,17 +1337,19 @@ TEST(RoundTripTest, UnaryOpenAiThroughAnthropic) {
     "usage": {"prompt_tokens": 50, "completion_tokens": 7, "total_tokens": 57,
               "prompt_tokens_details": {"cached_tokens": 20}}
   })");
-  absl::StatusOr<nlohmann::json> anthropic = convertOpenAiToAnthropicUnary(original, makeContext());
+  absl::StatusOr<nlohmann::json> anthropic =
+      transcodeOpenAiToAnthropicUnary(original, makeContext());
   ASSERT_TRUE(anthropic.ok());
   absl::StatusOr<nlohmann::json> back =
-      convertAnthropicToOpenAiUnary(std::move(*anthropic), makeContext());
+      transcodeAnthropicToOpenAiUnary(std::move(*anthropic), makeContext());
   ASSERT_TRUE(back.ok());
   EXPECT_EQ(*back, original);
 }
 
 TEST(RoundTripTest, StreamOpenAiThroughAnthropic) {
-  StreamConverterPtr to_anthropic = createOpenAiToAnthropicStreamConverter(makeContext());
-  StreamConverterPtr to_openai = createAnthropicToOpenAiStreamConverter(makeContext(true));
+  ResponseStreamTranscoderPtr to_anthropic = createOpenAiToAnthropicStreamTranscoder(makeContext());
+  ResponseStreamTranscoderPtr to_openai =
+      createAnthropicToOpenAiStreamTranscoder(makeContext(true));
   const std::vector<SseFrame> anthropic = run(*to_anthropic, parseSse(kOpenAiToolStream));
   const std::vector<SseFrame> back = run(*to_openai, anthropic);
   nlohmann::json expected = accumulateOpenAi(parseSse(kOpenAiToolStream));
@@ -1356,7 +1359,7 @@ TEST(RoundTripTest, StreamOpenAiThroughAnthropic) {
 }
 
 } // namespace
-} // namespace Transcoder
-} // namespace AiFilters
+} // namespace AiProtocolManager
+} // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

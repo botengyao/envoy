@@ -23,6 +23,7 @@ namespace {
 
 using HttpFilters::AiProtocolManager::AiFilterConfigFactory;
 using HttpFilters::AiProtocolManager::AiFilterContext;
+using HttpFilters::AiProtocolManager::UnsupportedFieldPolicy;
 using TranscoderProto = envoy::extensions::http::ai_filters::transcoder::v3::Transcoder;
 
 TranscoderProto parse(const std::string& yaml) {
@@ -69,8 +70,8 @@ upstream:
   ASSERT_TRUE(config.ok()) << config.status();
   EXPECT_FALSE((*config)->isInternalLeg());
   EXPECT_EQ((*config)->upstreamProtocol(), LLMProtocol::AnthropicMessages);
-  EXPECT_EQ((*config)->conversionOptions().default_max_output_tokens, 4096);
-  EXPECT_FALSE((*config)->conversionOptions().reject_unsupported_fields);
+  EXPECT_EQ((*config)->transcodeOptions().default_max_output_tokens, 4096);
+  EXPECT_EQ((*config)->transcodeOptions().unsupported_fields, UnsupportedFieldPolicy::Drop);
   EXPECT_EQ((*config)->maxResponseBytes(), 4 * 1024 * 1024);
   EXPECT_TRUE((*config)->alwaysReportUsage());
   EXPECT_TRUE((*config)->model().empty());
@@ -88,8 +89,8 @@ upstream:
                                     *stats_store.rootScope());
   ASSERT_TRUE(config.ok()) << config.status();
   EXPECT_EQ((*config)->model(), "gemini-2.5-pro");
-  EXPECT_EQ((*config)->conversionOptions().default_max_output_tokens, 128);
-  EXPECT_TRUE((*config)->conversionOptions().reject_unsupported_fields);
+  EXPECT_EQ((*config)->transcodeOptions().default_max_output_tokens, 128);
+  EXPECT_EQ((*config)->transcodeOptions().unsupported_fields, UnsupportedFieldPolicy::Reject);
   EXPECT_EQ((*config)->maxResponseBytes(), 1024);
   EXPECT_FALSE((*config)->alwaysReportUsage());
 }

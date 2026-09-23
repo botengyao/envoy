@@ -11,11 +11,9 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/transcoding/response_transcoder.h"
 #include "source/extensions/filters/http/ai_protocol_manager/transcoding_engine.h"
 #include "source/extensions/http/ai_filters/transcoder/endpoint/endpoint.h"
-#include "source/extensions/http/ai_filters/transcoder/request/client_request.h"
-#include "source/extensions/http/ai_filters/transcoder/request/request_converter.h"
-#include "source/extensions/http/ai_filters/transcoder/response/converter.h"
 
 #include "absl/status/statusor.h"
 
@@ -23,6 +21,8 @@ namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
 namespace Transcoder {
+
+using HttpFilters::AiProtocolManager::LLMProtocol;
 
 #define ALL_TRANSCODER_STATS(COUNTER)                                                              \
   COUNTER(ir_built)                                                                                \
@@ -50,7 +50,9 @@ public:
   const Endpoint& endpoint() const { return *endpoint_; }
   const std::string& model() const { return model_; }
   const HttpFilters::AiProtocolManager::TranscodingEngine& engine() const { return engine_; }
-  const RequestConversionOptions& conversionOptions() const { return conversion_options_; }
+  const HttpFilters::AiProtocolManager::TranscodeOptions& transcodeOptions() const {
+    return transcode_options_;
+  }
   uint64_t maxResponseBytes() const { return max_response_bytes_; }
   bool alwaysReportUsage() const { return always_report_usage_; }
   TranscoderStats& stats() const { return stats_; }
@@ -64,7 +66,7 @@ private:
   EndpointConstPtr endpoint_;
   LLMProtocol upstream_protocol_{LLMProtocol::Unspecified};
   std::string model_;
-  RequestConversionOptions conversion_options_;
+  HttpFilters::AiProtocolManager::TranscodeOptions transcode_options_;
   uint64_t max_response_bytes_{0};
   bool always_report_usage_{true};
 };
@@ -98,7 +100,7 @@ private:
   struct ResponsePlan {
     LLMProtocol from;
     LLMProtocol to;
-    ResponseContext context;
+    HttpFilters::AiProtocolManager::ResponseContext context;
   };
 
   void attachRequestIr(HttpFilters::AiProtocolManager::AiRequest& request);
@@ -111,7 +113,7 @@ private:
   std::optional<Rejection>
   prepareUpstreamRequest(HttpFilters::AiProtocolManager::AiRequest& request);
 
-  std::string resolveModel(const ClientRequest& client) const;
+  std::string resolveModel(const HttpFilters::AiProtocolManager::RequestEnvelope& client) const;
 
   TranscoderConfigSharedPtr config_;
   const HttpFilters::AiProtocolManager::AiFilterContext context_;

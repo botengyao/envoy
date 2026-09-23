@@ -16,7 +16,6 @@
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event.h"
 
-#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 
@@ -38,12 +37,18 @@ using HttpFilters::AiProtocolManager::BufferManagerPtr;
 using HttpFilters::AiProtocolManager::FlattenJsonField;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
 using HttpFilters::AiProtocolManager::LocalReplier;
+using HttpFilters::AiProtocolManager::RequestEnvelope;
 using HttpFilters::AiProtocolManager::RequestHeaderEdits;
+using HttpFilters::AiProtocolManager::ResponseContext;
+using HttpFilters::AiProtocolManager::ResponseStreamTranscoderPtr;
 using HttpFilters::AiProtocolManager::SseEvent;
 using HttpFilters::AiProtocolManager::SseEventPtr;
+using HttpFilters::AiProtocolManager::SseFrame;
 using HttpFilters::AiProtocolManager::SseStreamPropagator;
 using HttpFilters::AiProtocolManager::SseStreamReceiver;
+using HttpFilters::AiProtocolManager::TranscodeReport;
 using HttpFilters::AiProtocolManager::TranscodingEngine;
+using HttpFilters::AiProtocolManager::UnsupportedFieldPolicy;
 using TranscoderProto = envoy::extensions::http::ai_filters::transcoder::v3::Transcoder;
 using UpstreamProto = envoy::extensions::http::ai_filters::transcoder::v3::Upstream;
 
@@ -122,10 +127,11 @@ absl::StatusOr<TranscoderConfigSharedPtr> TranscoderConfig::create(const Transco
   config->upstream_protocol_ =
       HttpFilters::AiProtocolManager::protocolFromProto(upstream.llm_protocol());
   config->model_ = upstream.model();
-  config->conversion_options_.default_max_output_tokens =
+  config->transcode_options_.default_max_output_tokens =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(upstream, default_max_output_tokens, DefaultMaxOutputTokens);
-  config->conversion_options_.reject_unsupported_fields =
-      upstream.unsupported_fields() == UpstreamProto::REJECT;
+  config->transcode_options_.unsupported_fields =
+      upstream.unsupported_fields() == UpstreamProto::REJECT ? UnsupportedFieldPolicy::Reject
+                                                             : UnsupportedFieldPolicy::Drop;
   config->max_response_bytes_ =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(upstream, max_response_bytes, DefaultMaxResponseBytes);
   config->always_report_usage_ = upstream.stream_usage() == UpstreamProto::ALWAYS;
@@ -152,8 +158,8 @@ Coroutine::Task<absl::Status> TranscoderFilter::decode(AiRequestReceiver receive
 
 void TranscoderFilter::attachRequestIr(AiRequest& request) {
   const LLMProtocol protocol = context_.request_protocol;
-  absl::StatusOr<ClientRequest> client =
-      readClientRequest(protocol, request.json(), context_.request_headers.getPathValue());
+  absl::StatusOr<RequestEnvelope> client = TranscodingEngine::readRequestEnvelope(
+      protocol, request.json(), context_.request_headers.getPathValue());
   if (!client.ok()) {
     config_->stats().ir_incomplete_.inc();
     ENVOY_LOG(debug, "ai_transcoder: no IR for this request: {}", client.status().message());
@@ -161,7 +167,8 @@ void TranscoderFilter::attachRequestIr(AiRequest& request) {
   }
   nlohmann::json ir = request.json();
   std::optional<JsonWithExtBuf> document;
-  if (absl::Status status = convertRequestToIr(config_->engine(), protocol, ir, *client);
+  TranscodeReport report;
+  if (absl::Status status = config_->engine().transcodeToIr(protocol, ir, *client, report);
       status.ok()) {
     document.emplace();
     document->setJson(std::move(ir));
@@ -175,7 +182,7 @@ void TranscoderFilter::attachRequestIr(AiRequest& request) {
   config_->stats().ir_built_.inc();
 }
 
-std::string TranscoderFilter::resolveModel(const ClientRequest& client) const {
+std::string TranscoderFilter::resolveModel(const RequestEnvelope& client) const {
   if (!config_->model().empty()) {
     return config_->model();
   }
@@ -198,28 +205,26 @@ TranscoderFilter::prepareUpstreamRequest(AiRequest& request) {
     return Rejection{Http::Code::InternalServerError,
                      "ai_transcoder: the route declares no request protocol"};
   }
-  if (!responseConversionSupported(upstream_protocol, client_protocol)) {
+  if (!config_->engine().canTranscodeResponse(upstream_protocol, client_protocol)) {
     stats.unsupported_pair_.inc();
     return Rejection{Http::Code::NotImplemented,
                      absl::StrCat("ai_transcoder: cannot serve ", llmProtocolName(client_protocol),
                                   " from ", llmProtocolName(upstream_protocol))};
   }
-  const absl::string_view client_path = context_.request_headers.getPathValue();
-  absl::StatusOr<ClientRequest> client =
-      readClientRequest(client_protocol, request.json(), client_path);
+  absl::StatusOr<RequestEnvelope> client = TranscodingEngine::readRequestEnvelope(
+      client_protocol, request.json(), context_.request_headers.getPathValue());
   if (!client.ok()) {
     stats.request_rejected_.inc();
     return Rejection{Http::Code::BadRequest, std::string(client.status().message())};
   }
   // A Gemini stream without alt=sse is a JSON array, which the response side does not produce.
-  if (client_protocol == LLMProtocol::GeminiGenerateContent && client->stream &&
-      !absl::StrContains(client_path, "alt=sse")) {
+  if (client->stream && !client->sse) {
     stats.request_rejected_.inc();
     return Rejection{Http::Code::BadRequest,
                      "ai_transcoder: streamGenerateContent requires alt=sse"};
   }
 
-  ClientRequest resolved = client.value();
+  RequestEnvelope resolved = client.value();
   resolved.model = resolveModel(resolved);
   absl::StatusOr<UpstreamEnvelope> envelope;
   if (client_protocol == upstream_protocol) {
@@ -231,16 +236,18 @@ TranscoderFilter::prepareUpstreamRequest(AiRequest& request) {
     }
   } else {
     nlohmann::json& body = request.mutableJson();
-    std::vector<std::string> dropped;
-    if (absl::Status status = convertRequest(config_->engine(), client_protocol, upstream_protocol,
-                                             body, resolved, config_->conversionOptions(), dropped);
+    TranscodeReport report;
+    if (absl::Status status =
+            config_->engine().transcodeRequest(client_protocol, upstream_protocol, body, resolved,
+                                               config_->transcodeOptions(), report);
         !status.ok()) {
       stats.request_rejected_.inc();
       return Rejection{Http::Code::BadRequest, std::string(status.message())};
     }
-    if (!dropped.empty()) {
-      stats.request_field_dropped_.add(dropped.size());
-      ENVOY_LOG(debug, "ai_transcoder: dropped request fields {}", absl::StrJoin(dropped, ","));
+    if (!report.dropped.empty()) {
+      stats.request_field_dropped_.add(report.dropped.size());
+      ENVOY_LOG(debug, "ai_transcoder: dropped request fields {}",
+                absl::StrJoin(report.dropped, ","));
     }
     envelope = config_->endpoint().apply(body, resolved.model, resolved.stream);
   }
@@ -272,11 +279,12 @@ Coroutine::Task<absl::Status> TranscoderFilter::encodeSSE(SseStreamReceiver rece
   if (!response_plan_.has_value() || response_plan_->from == response_plan_->to) {
     co_return absl::OkStatus();
   }
-  absl::StatusOr<StreamConverterPtr> converter =
-      createStreamConverter(response_plan_->from, response_plan_->to, response_plan_->context);
-  if (!converter.ok()) {
+  absl::StatusOr<ResponseStreamTranscoderPtr> transcoder =
+      config_->engine().createResponseStreamTranscoder(response_plan_->from, response_plan_->to,
+                                                       response_plan_->context);
+  if (!transcoder.ok()) {
     config_->stats().response_failed_.inc();
-    co_return converter.status();
+    co_return transcoder.status();
   }
   config_->stats().response_converted_.inc();
   while (true) {
@@ -286,9 +294,9 @@ Coroutine::Task<absl::Status> TranscoderFilter::encodeSSE(SseStreamReceiver rece
     absl::Status status;
     if (event.has_value()) {
       store = (*event)->release_payload_store();
-      status = (*converter)->onFrame(toFrame(**event), frames);
+      status = (*transcoder)->onFrame(toFrame(**event), frames);
     } else {
-      status = (*converter)->onEnd(frames);
+      status = (*transcoder)->onEnd(frames);
     }
     if (!status.ok()) {
       config_->stats().response_failed_.inc();
@@ -335,8 +343,8 @@ TranscoderFilter::encodeUnary(AiResponseStreamReceiver receive_fields,
   }
   absl::StatusOr<nlohmann::json> body = HttpFilters::AiProtocolManager::unflattenJson(fields);
   if (body.ok()) {
-    body = convertUnaryResponse(response_plan_->from, response_plan_->to, std::move(body.value()),
-                                response_plan_->context);
+    body = config_->engine().transcodeUnaryResponse(
+        response_plan_->from, response_plan_->to, std::move(body.value()), response_plan_->context);
   }
   if (!body.ok()) {
     config_->stats().response_failed_.inc();

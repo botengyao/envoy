@@ -1,4 +1,4 @@
-#include "source/extensions/http/ai_filters/transcoder/response/anthropic.h"
+#include "source/extensions/filters/http/ai_protocol_manager/transcoding/anthropic_messages.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
+
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -15,8 +17,8 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace AiFilters {
-namespace Transcoder {
+namespace HttpFilters {
+namespace AiProtocolManager {
 
 namespace {
 
@@ -52,26 +54,6 @@ std::optional<int64_t> indexField(const nlohmann::json& object, const char* key)
     return std::nullopt;
   }
   return value->get<int64_t>();
-}
-
-std::optional<uint64_t> countField(const nlohmann::json& object, const char* key) {
-  const nlohmann::json* value = findField(object, key);
-  if (value == nullptr) {
-    return std::nullopt;
-  }
-  if (value->is_number_unsigned()) {
-    return value->get<uint64_t>();
-  }
-  if (value->is_number_integer() && value->get<int64_t>() >= 0) {
-    return static_cast<uint64_t>(value->get<int64_t>());
-  }
-  return std::nullopt;
-}
-
-void mergeCount(const nlohmann::json& usage, const char* key, std::optional<uint64_t>& count) {
-  if (std::optional<uint64_t> value = countField(usage, key); value.has_value()) {
-    count = value;
-  }
 }
 
 // Binary nodes are offloaded strings (ExternalRef): copyable, never readable here.
@@ -154,59 +136,35 @@ bool isAnthropicError(const nlohmann::json& body, absl::string_view type) {
   return type == "error" || (stringField(body, "type") == nullptr && errorObject(body) != nullptr);
 }
 
-struct AnthropicUsage {
-  std::optional<uint64_t> input_tokens;
-  std::optional<uint64_t> output_tokens;
-  std::optional<uint64_t> cache_creation_input_tokens;
-  std::optional<uint64_t> cache_read_input_tokens;
+void mergeUsage(LLMProtocol protocol, const nlohmann::json& document, TokenUsage& usage) {
+  usage.merge(AdapterRegistry::get(protocol).extractUsage(document).usage);
+}
 
-  void merge(const nlohmann::json& usage) {
-    mergeCount(usage, "input_tokens", input_tokens);
-    mergeCount(usage, "output_tokens", output_tokens);
-    mergeCount(usage, "cache_creation_input_tokens", cache_creation_input_tokens);
-    mergeCount(usage, "cache_read_input_tokens", cache_read_input_tokens);
+nlohmann::json openAiUsage(const TokenUsage& usage) {
+  const uint64_t prompt = usage.input_tokens.value_or(0) +
+                          usage.cache_creation_input_tokens.value_or(0) +
+                          usage.cached_input_tokens.value_or(0);
+  const uint64_t completion = usage.output_tokens.value_or(0);
+  nlohmann::json converted = {{"prompt_tokens", prompt},
+                              {"completion_tokens", completion},
+                              {"total_tokens", prompt + completion}};
+  if (usage.cached_input_tokens.has_value()) {
+    converted["prompt_tokens_details"] = {{"cached_tokens", *usage.cached_input_tokens}};
   }
+  return converted;
+}
 
-  nlohmann::json toOpenAi() const {
-    const uint64_t prompt = input_tokens.value_or(0) + cache_creation_input_tokens.value_or(0) +
-                            cache_read_input_tokens.value_or(0);
-    const uint64_t completion = output_tokens.value_or(0);
-    nlohmann::json usage = {{"prompt_tokens", prompt},
-                            {"completion_tokens", completion},
-                            {"total_tokens", prompt + completion}};
-    if (cache_read_input_tokens.has_value()) {
-      usage["prompt_tokens_details"] = {{"cached_tokens", *cache_read_input_tokens}};
-    }
-    return usage;
+// OpenAI's prompt_tokens includes cached reads; Anthropic's input_tokens excludes them.
+nlohmann::json anthropicUsage(const TokenUsage& usage) {
+  const uint64_t prompt = usage.input_tokens.value_or(0);
+  const uint64_t cached = std::min(usage.cached_input_tokens.value_or(0), prompt);
+  nlohmann::json converted = {{"input_tokens", prompt - cached},
+                              {"output_tokens", usage.output_tokens.value_or(0)}};
+  if (usage.cached_input_tokens.has_value()) {
+    converted["cache_read_input_tokens"] = cached;
   }
-};
-
-struct OpenAiUsage {
-  std::optional<uint64_t> prompt_tokens;
-  std::optional<uint64_t> completion_tokens;
-  std::optional<uint64_t> cached_tokens;
-
-  void merge(const nlohmann::json& usage) {
-    mergeCount(usage, "prompt_tokens", prompt_tokens);
-    mergeCount(usage, "completion_tokens", completion_tokens);
-    if (const nlohmann::json* details = findField(usage, "prompt_tokens_details");
-        details != nullptr) {
-      mergeCount(*details, "cached_tokens", cached_tokens);
-    }
-  }
-
-  // OpenAI's prompt_tokens includes cached reads; Anthropic's input_tokens excludes them.
-  nlohmann::json toAnthropic() const {
-    const uint64_t prompt = prompt_tokens.value_or(0);
-    const uint64_t cached = std::min(cached_tokens.value_or(0), prompt);
-    nlohmann::json usage = {{"input_tokens", prompt - cached},
-                            {"output_tokens", completion_tokens.value_or(0)}};
-    if (cached_tokens.has_value()) {
-      usage["cache_read_input_tokens"] = cached;
-    }
-    return usage;
-  }
-};
+  return converted;
+}
 
 // A lone node is moved as is, since it may be offloaded; offloaded nodes cannot be concatenated.
 absl::StatusOr<nlohmann::json> joinText(std::vector<nlohmann::json> parts) {
@@ -260,7 +218,7 @@ absl::StatusOr<nlohmann::json> anthropicToolUse(const nlohmann::json& call) {
                         {"input", std::move(input)}};
 }
 
-class AnthropicToOpenAiStream : public StreamConverter {
+class AnthropicToOpenAiStream : public ResponseStreamTranscoder {
 public:
   explicit AnthropicToOpenAiStream(const ResponseContext& context)
       : context_(context), model_(context.model) {}
@@ -315,9 +273,7 @@ private:
       if (const std::string* model = stringField(*message, "model"); model != nullptr) {
         model_ = *model;
       }
-      if (const nlohmann::json* usage = findField(*message, "usage"); usage != nullptr) {
-        usage_.merge(*usage);
-      }
+      mergeUsage(LLMProtocol::AnthropicMessages, *message, usage_);
     }
     emitDelta({{"role", "assistant"}, {"content", ""}}, out);
   }
@@ -381,12 +337,10 @@ private:
     const nlohmann::json* delta = findField(event, "delta");
     const char* finish_reason =
         openAiFinishReason(delta != nullptr ? findField(*delta, "stop_reason") : nullptr);
-    if (const nlohmann::json* usage = findField(event, "usage"); usage != nullptr) {
-      usage_.merge(*usage);
-    }
+    mergeUsage(LLMProtocol::AnthropicMessages, event, usage_);
     nlohmann::json chunk = choiceChunk(nlohmann::json::object(), finish_reason);
     if (context_.always_report_usage && !context_.include_usage) {
-      chunk["usage"] = usage_.toOpenAi();
+      chunk["usage"] = openAiUsage(usage_);
     }
     out.push_back(SseFrame::ofJson(std::move(chunk)));
   }
@@ -394,7 +348,7 @@ private:
   void onMessageStop(std::vector<SseFrame>& out) {
     if (context_.include_usage) {
       nlohmann::json chunk = makeChunk(nlohmann::json::array());
-      chunk["usage"] = usage_.toOpenAi();
+      chunk["usage"] = openAiUsage(usage_);
       out.push_back(SseFrame::ofJson(std::move(chunk)));
     }
     out.push_back(SseFrame::ofData("[DONE]"));
@@ -444,14 +398,14 @@ private:
   const ResponseContext context_;
   std::string id_;
   std::string model_;
-  AnthropicUsage usage_;
+  TokenUsage usage_;
   // Anthropic content block index -> OpenAI tool call index.
   std::map<int64_t, ToolBlock> tool_blocks_;
   int64_t next_tool_index_{0};
   bool done_{false};
 };
 
-class OpenAiToAnthropicStream : public StreamConverter {
+class OpenAiToAnthropicStream : public ResponseStreamTranscoder {
 public:
   explicit OpenAiToAnthropicStream(const ResponseContext& context) : context_(context) {}
 
@@ -475,9 +429,7 @@ public:
       return absl::OkStatus();
     }
     start(&chunk, out);
-    if (const nlohmann::json* usage = findField(chunk, "usage"); usage != nullptr) {
-      usage_.merge(*usage);
-    }
+    mergeUsage(LLMProtocol::OpenAiChatCompletions, chunk, usage_);
     if (nlohmann::json* choices = findField(chunk, "choices");
         choices != nullptr && choices->is_array()) {
       for (nlohmann::json& choice : *choices) {
@@ -593,7 +545,7 @@ private:
         {{"delta",
           {{"stop_reason", anthropicStopReason(finish_reason_.value_or(""), !tool_blocks_.empty())},
            {"stop_sequence", nullptr}}},
-         {"usage", usage_.toAnthropic()}},
+         {"usage", anthropicUsage(usage_)}},
         out);
     emit("message_stop", nlohmann::json::object(), out);
     done_ = true;
@@ -605,7 +557,7 @@ private:
   }
 
   const ResponseContext context_;
-  OpenAiUsage usage_;
+  TokenUsage usage_;
   std::optional<std::string> finish_reason_;
   // OpenAI tool call index -> Anthropic content block index.
   std::map<int64_t, int64_t> tool_blocks_;
@@ -618,12 +570,13 @@ private:
 
 } // namespace
 
-StreamConverterPtr createAnthropicToOpenAiStreamConverter(const ResponseContext& context) {
+ResponseStreamTranscoderPtr
+createAnthropicToOpenAiStreamTranscoder(const ResponseContext& context) {
   return std::make_unique<AnthropicToOpenAiStream>(context);
 }
 
-absl::StatusOr<nlohmann::json> convertAnthropicToOpenAiUnary(nlohmann::json body,
-                                                             const ResponseContext& context) {
+absl::StatusOr<nlohmann::json> transcodeAnthropicToOpenAiUnary(nlohmann::json body,
+                                                               const ResponseContext& context) {
   if (!body.is_object()) {
     return absl::InvalidArgumentError("Anthropic response is not a JSON object");
   }
@@ -664,10 +617,8 @@ absl::StatusOr<nlohmann::json> convertAnthropicToOpenAiUnary(nlohmann::json body
     }
     message["tool_calls"] = std::move(tool_calls);
   }
-  AnthropicUsage usage;
-  if (const nlohmann::json* reported = findField(body, "usage"); reported != nullptr) {
-    usage.merge(*reported);
-  }
+  TokenUsage usage;
+  mergeUsage(LLMProtocol::AnthropicMessages, body, usage);
   nlohmann::json choice = {{"index", 0},
                            {"message", std::move(message)},
                            {"finish_reason", openAiFinishReason(findField(body, "stop_reason"))},
@@ -677,15 +628,16 @@ absl::StatusOr<nlohmann::json> convertAnthropicToOpenAiUnary(nlohmann::json body
                         {"created", context.created},
                         {"model", stringOr(&body, "model", context.model)},
                         {"choices", nlohmann::json::array({std::move(choice)})},
-                        {"usage", usage.toOpenAi()}};
+                        {"usage", openAiUsage(usage)}};
 }
 
-StreamConverterPtr createOpenAiToAnthropicStreamConverter(const ResponseContext& context) {
+ResponseStreamTranscoderPtr
+createOpenAiToAnthropicStreamTranscoder(const ResponseContext& context) {
   return std::make_unique<OpenAiToAnthropicStream>(context);
 }
 
-absl::StatusOr<nlohmann::json> convertOpenAiToAnthropicUnary(nlohmann::json body,
-                                                             const ResponseContext& context) {
+absl::StatusOr<nlohmann::json> transcodeOpenAiToAnthropicUnary(nlohmann::json body,
+                                                               const ResponseContext& context) {
   if (!body.is_object()) {
     return absl::InvalidArgumentError("OpenAI response is not a JSON object");
   }
@@ -719,10 +671,8 @@ absl::StatusOr<nlohmann::json> convertOpenAiToAnthropicUnary(nlohmann::json body
       }
     }
   }
-  OpenAiUsage usage;
-  if (const nlohmann::json* reported = findField(body, "usage"); reported != nullptr) {
-    usage.merge(*reported);
-  }
+  TokenUsage usage;
+  mergeUsage(LLMProtocol::OpenAiChatCompletions, body, usage);
   return nlohmann::json{{"id", stringOr(&body, "id", "")},
                         {"type", "message"},
                         {"role", "assistant"},
@@ -730,10 +680,17 @@ absl::StatusOr<nlohmann::json> convertOpenAiToAnthropicUnary(nlohmann::json body
                         {"content", std::move(content)},
                         {"stop_reason", anthropicStopReason(finish_reason, has_tool_use)},
                         {"stop_sequence", nullptr},
-                        {"usage", usage.toAnthropic()}};
+                        {"usage", anthropicUsage(usage)}};
 }
 
-} // namespace Transcoder
-} // namespace AiFilters
+const ResponseCodec& anthropicMessagesResponseCodec() {
+  static constexpr ResponseCodec codec = {
+      createAnthropicToOpenAiStreamTranscoder, createOpenAiToAnthropicStreamTranscoder,
+      transcodeAnthropicToOpenAiUnary, transcodeOpenAiToAnthropicUnary};
+  return codec;
+}
+
+} // namespace AiProtocolManager
+} // namespace HttpFilters
 } // namespace Extensions
 } // namespace Envoy

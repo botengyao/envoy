@@ -272,6 +272,21 @@ TEST_F(TranscoderFilterTest, InternalLegNormalizesAnthropic) {
   EXPECT_EQ(doc["model"], "claude-sonnet-4-5");
 }
 
+TEST_F(TranscoderFilterTest, InternalLegDropsAnthropicThinkingFromTheView) {
+  const std::string body =
+      R"({"model":"claude-sonnet-4-5","max_tokens":64,"messages":[)"
+      R"({"role":"user","content":"hi"},)"
+      R"({"role":"assistant","content":[{"type":"thinking","thinking":"...","signature":"c2ln"},)"
+      R"({"type":"redacted_thinking","data":"b3Bh"},{"type":"text","text":"hello"}]},)"
+      R"({"role":"user","content":"again"}]})";
+  EXPECT_EQ(decode("internal: {}", LLMProtocol::AnthropicMessages, "/v1/messages", body), body);
+  const RequestIr* ir = requestIr();
+  ASSERT_NE(ir, nullptr);
+  ASSERT_NE(ir->document(), nullptr);
+  EXPECT_EQ(ir->document()->json()["messages"][1]["content"],
+            nlohmann::json::parse(R"([{"type":"text","text":"hello"}])"));
+}
+
 TEST_F(TranscoderFilterTest, InternalLegLiftsGeminiPathFields) {
   decode("internal: {}", LLMProtocol::GeminiGenerateContent,
          "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
