@@ -21,12 +21,9 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 
 // How a client speaks to the gateway.
 message DownstreamApi {
-  // The protocol of the client's request; the AI Protocol Manager parses the payload in it.
-  // Required: ``LLM_PROTOCOL_UNSPECIFIED`` is rejected.
-  LLMProtocol llm_protocol = 1 [(validate.rules).enum = {defined_only: true not_in: 0}];
+  // The protocol of the client's request. Unspecified means none is declared.
+  LLMProtocol llm_protocol = 1 [(validate.rules).enum = {defined_only: true}];
 
-  // Where the client puts the model and its streaming choice, and the response framing it expects.
-  // It must serve ``llm_protocol``. Unset: the protocol's default (model and stream in the body;
-  // Gemini: ``/models/{model}:{method}``).
+  // Where the client puts the model and its streaming choice. Unset: the protocol's default.
   Endpoint endpoint = 2;
 }

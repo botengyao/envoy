@@ -123,35 +123,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "endpoint_layout_lib",
-    srcs = ["endpoint_layout.cc"],
-    hdrs = ["endpoint_layout.h"],
-    deps = [
-        "//source/common/common:macros",
-        "//source/common/http:header_utility_lib",
-        "@abseil-cpp//absl/container:flat_hash_set",
-        "@abseil-cpp//absl/status",
-        "@abseil-cpp//absl/status:statusor",
-        "@abseil-cpp//absl/strings",
-        "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
-    ],
-)
-
-envoy_cc_library(
     name = "ai_filter_state_lib",
     srcs = ["ai_filter_state.cc"],
     hdrs = ["ai_filter_state.h"],
     deps = [
-        ":endpoint_layout_lib",
         ":llm_protocol_conversion_lib",
         ":token_usage_lib",
         "//envoy/registry",
         "//envoy/stream_info:filter_state_interface",
         "//source/common/common:logger_lib",
-        "//source/common/http:header_utility_lib",
         "//source/common/protobuf",
         "//source/common/protobuf:utility_lib",
-        "@abseil-cpp//absl/algorithm:container",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",

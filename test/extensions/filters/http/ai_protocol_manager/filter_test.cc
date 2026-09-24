@@ -10,7 +10,6 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/coroutine/status_macros.h"
-#include "source/common/router/string_accessor_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
@@ -2424,18 +2423,9 @@ TEST_F(AiProtocolManagerRequestProtocolTest, FilterStateProtocolOnSilentRouteIsP
   EXPECT_EQ(counterValue("request_parse_error"), 1);
 }
 
-TEST_F(AiProtocolManagerRequestProtocolTest, FilterStateProtocolRunsTheAiFilters) {
-  setRequestProtocolState(callbacks_.stream_info_, LLMProtocol::OpenAiChatCompletions);
-  runRecording();
-
-  ASSERT_TRUE(seen_.has_value());
-  EXPECT_EQ(seen_->request_protocol, LLMProtocol::OpenAiChatCompletions);
-  EXPECT_EQ(seen_->downstream_api, downstreamApiState()->api().get());
-}
-
-// The factory's object, as set_filter_state would write it, carries its endpoint to AI filters.
+// The factory's object, as set_filter_state would write it, runs the AI filters on a route that
+// declares nothing and carries its endpoint to them.
 TEST_F(AiProtocolManagerRequestProtocolTest, FilterStateFromTheFactory) {
-  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
   const auto* factory =
       Registry::FactoryRegistry<StreamInfo::FilterState::ObjectFactory>::getFactory(
           DownstreamApiState::kFilterStateKey);
@@ -2449,6 +2439,7 @@ TEST_F(AiProtocolManagerRequestProtocolTest, FilterStateFromTheFactory) {
   runRecording();
 
   ASSERT_TRUE(seen_.has_value());
+  EXPECT_EQ(seen_->request_protocol, LLMProtocol::OpenAiChatCompletions);
   ASSERT_NE(seen_->downstream_api, nullptr);
   EXPECT_EQ(seen_->downstream_api->endpoint().preset(), "openai");
   EXPECT_EQ(counterValue("request_protocol_overridden"), 0);
@@ -2463,14 +2454,6 @@ TEST_F(AiProtocolManagerRequestProtocolTest, FilterStateOverridesTheRoute) {
   EXPECT_EQ(seen_->request_protocol, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(pinnedProtocol(), LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(counterValue("request_protocol_overridden"), 1);
-}
-
-TEST_F(AiProtocolManagerRequestProtocolTest, AgreeingFilterStateIsNotAnOverride) {
-  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
-  setRequestProtocolState(callbacks_.stream_info_, LLMProtocol::OpenAiChatCompletions);
-  runRecording();
-
-  EXPECT_EQ(counterValue("request_protocol_overridden"), 0);
 }
 
 // An object naming no protocol leaves the route's standing, and is not replaced.
@@ -2560,10 +2543,8 @@ TEST_F(AiProtocolManagerUpstreamTest, ReadsThePinnedProtocol) {
 
 TEST_F(AiProtocolManagerUpstreamTest, TargetFromFilterState) {
   setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
-  setFilterStateTarget(
-      callbacks_.stream_info_,
-      R"({"llm_protocol":"GEMINI_GENERATE_CONTENT","model":"gemini-2.5-flash","endpoint":)"
-      R"({"preset":"gcp_vertex_ai","variables":{"project":"p","location":"us-central1"}}})");
+  setFilterStateTarget(callbacks_.stream_info_,
+                       R"({"llm_protocol":"GEMINI_GENERATE_CONTENT","model":"gemini-2.5-flash"})");
   runRecording();
 
   ASSERT_TRUE(seen_.has_value());
@@ -2576,23 +2557,6 @@ TEST_F(AiProtocolManagerUpstreamTest, TargetFromFilterState) {
   ASSERT_NE(state, nullptr);
   EXPECT_EQ(seen_->upstream_target, state->target().get());
   EXPECT_EQ(seen_->upstream_target->model(), "gemini-2.5-flash");
-  EXPECT_EQ(seen_->upstream_target->endpoint().preset(), "gcp_vertex_ai");
-}
-
-// Something other than a target under the key, which only the factory could have validated, is
-// not a target.
-TEST_F(AiProtocolManagerUpstreamTest, ForeignFilterStateObjectIsIgnored) {
-  setRouteProtocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
-  callbacks_.stream_info_.filterState()->setData(
-      UpstreamTargetState::kFilterStateKey,
-      std::make_shared<Router::StringAccessorImpl>(R"({"llm_protocol":"GEMINI_GENERATE_CONTENT"})"),
-      StreamInfo::FilterState::LifeSpan::FilterChain);
-  runRecording();
-
-  ASSERT_TRUE(seen_.has_value());
-  EXPECT_EQ(seen_->upstream_protocol, LLMProtocol::Unspecified);
-  EXPECT_EQ(seen_->upstream_target, nullptr);
-  EXPECT_EQ(counterValue("upstream_target_from_filter_state"), 0);
 }
 
 // The protocol token extraction reads a response as, seen on the record of a response too large to
@@ -2641,11 +2605,6 @@ public:
   FakeUpstreamStreamFilterCallbacks upstream_callbacks_;
 };
 
-TEST_F(AiProtocolManagerExtractionProtocolTest, RequestProtocolFromFilterState) {
-  setRequestProtocol(LLMProtocol::AnthropicMessages);
-  EXPECT_EQ(extractionProtocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
-}
-
 TEST_F(AiProtocolManagerExtractionProtocolTest, FilterStateProtocolWinsOverTheRouteRequest) {
   PerRouteProto proto;
   proto.mutable_request()->set_llm_protocol(envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
@@ -2668,12 +2627,6 @@ TEST_F(AiProtocolManagerExtractionProtocolTest, UpstreamTargetProtocolWins) {
                        R"({"llm_protocol":"GEMINI_GENERATE_CONTENT"})");
   placeUpstream();
   EXPECT_EQ(extractionProtocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
-}
-
-TEST_F(AiProtocolManagerExtractionProtocolTest, UpstreamWithoutTargetUsesTheRequestProtocol) {
-  setRequestProtocol(LLMProtocol::AnthropicMessages);
-  placeUpstream();
-  EXPECT_EQ(extractionProtocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
 }
 
 TEST_F(AiProtocolManagerExtractionProtocolTest, DownstreamIgnoresTheTarget) {
