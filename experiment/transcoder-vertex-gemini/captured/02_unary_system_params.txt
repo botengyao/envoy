@@ -1,0 +1,31 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You answer in upper case only."
+    },
+    {
+      "role": "user",
+      "content": "Name three primary colors, comma separated."
+    }
+  ],
+  "temperature": 0,
+  "top_p": 0.9,
+  "max_tokens": 512,
+  "stop": [
+    "END"
+  ],
+  "stream": false
+}
+
+== response 200
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"RED, YELLOW, BLUE","role":"assistant"}}],"id":"39u1auXTBrDWsbwP5_rz2A8","model":"gemini-2.5-flash","object":"chat.completion","usage":{"completion_tokens":44,"completion_tokens_details":{"reasoning_tokens":39},"prompt_tokens":15,"total_tokens":59}}
+
+== PASS
+RED, YELLOW, BLUE

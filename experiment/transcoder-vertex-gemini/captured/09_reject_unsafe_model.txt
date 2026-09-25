@@ -1,0 +1,20 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "../../evil:generateContent?key=x",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ]
+}
+
+== response 400
+content-type: text/plain
+content-length: 58
+
+transcoder: a Gemini target needs `model` to be a model id
+
+== PASS
+transcoder: a Gemini target needs `model` to be a model id

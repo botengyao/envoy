@@ -1,0 +1,28 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "My name is Ada. Remember it."
+    },
+    {
+      "role": "assistant",
+      "content": "Got it, Ada."
+    },
+    {
+      "role": "user",
+      "content": "What is my name? One word."
+    }
+  ]
+}
+
+== response 200
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Ada","role":"assistant"}}],"id":"39u1atnwL_eTsbwPr6nX0QM","model":"gemini-2.5-flash","object":"chat.completion","usage":{"completion_tokens":26,"completion_tokens_details":{"reasoning_tokens":25},"prompt_tokens":21,"total_tokens":47}}
+
+== PASS
+Ada

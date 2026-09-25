@@ -1,0 +1,29 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Count from 1 to 20, comma separated."
+    }
+  ],
+  "stream": true
+}
+
+== response 200
+content-type: text/event-stream
+transfer-encoding: chunked
+
+data: {"choices":[{"delta":{"content":"1, 2, 3,","role":"assistant"},"finish_reason":null,"index":0}],"id":"4Nu1avOUGcjbsbwP5YLyyQo","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 1","role":"assistant"},"finish_reason":null,"index":0}],"id":"4Nu1avOUGcjbsbwP5YLyyQo","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"4, 15, 16, 17, 18, 19, 20","role":"assistant"},"finish_reason":"stop","index":0}],"id":"4Nu1avOUGcjbsbwP5YLyyQo","model":"gemini-2.5-flash","object":"chat.completion.chunk","usage":{"completion_tokens":98,"completion_tokens_details":{"reasoning_tokens":29},"prompt_tokens":12,"total_tokens":110}}
+
+data: [DONE]
+
+
+
+== PASS
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20

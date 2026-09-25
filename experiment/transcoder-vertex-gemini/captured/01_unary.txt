@@ -1,0 +1,20 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with one word: the capital of France."
+    }
+  ]
+}
+
+== response 200
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Paris","role":"assistant"}}],"id":"3tu1as0MpN2xvA_bubvgAw","model":"gemini-2.5-flash","object":"chat.completion","usage":{"completion_tokens":49,"completion_tokens_details":{"reasoning_tokens":48},"prompt_tokens":10,"total_tokens":59}}
+
+== PASS
+Paris

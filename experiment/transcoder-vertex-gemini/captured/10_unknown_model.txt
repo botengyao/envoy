@@ -1,0 +1,30 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-does-not-exist",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ]
+}
+
+== response 404
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{
+  "error": {
+    "code": 404,
+    "message": "Publisher model `projects/my-project/locations/global/publishers/google/models/gemini-does-not-exist` was not found or your project does not have access to it. Ensure you are using a valid model name and that the model is available in the specified region. For more information, see: https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations.",
+    "status": "NOT_FOUND"
+  }
+}
+
+
+== PASS
+{
+  "error": {
+    "code": 404,
+    "message": "Publisher model `projects/my-project/locations/global/publishers/google/models/gemini-does-not-exist` was not found or your project does not

@@ -1,0 +1,45 @@
+== unary
+{
+  "id": "29u1arndMaTdsbwP27m74AM",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "Envoy is a high-performance, open-source edge and service proxy designed for cloud-native applications, providing advanced traffic management, observability, and reliability features.",
+        "refusal": null,
+        "role": "assistant",
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": null,
+  "model": "gemini-2.5-flash",
+  "object": "chat.completion",
+  "metadata": null,
+  "moderation": null,
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 62,
+    "prompt_tokens": 12,
+    "total_tokens": 74,
+    "completion_tokens_details": {
+      "accepted_prediction_tokens": null,
+      "audio_tokens": null,
+      "reasoning_tokens": 29,
+      "rejected_prediction_tokens": null,
+      "text_tokens": null
+    },
+    "prompt_tokens_details": null
+  }
+}
+
+== stream
+'1, 2, 3, 4, 5, ' None
+'6, 7, 8, 9, 10' stop
+usage: {"completion_tokens":53,"prompt_tokens":12,"total_tokens":65,"completion_tokens_details":{"accepted_prediction_tokens":null,"audio_tokens":null,"reasoning_tokens":24,"rejected_prediction_tokens":null,"text_tokens":null},"prompt_tokens_details":null}

@@ -1,0 +1,70 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write 25 numbered sentences, each about 30 words, describing what an HTTP proxy does."
+    }
+  ]
+}
+
+== response 200
+content-type: application/json; charset=UTF-8
+transfer-encoding: chunked
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Here are 25 numbered sentences describing what an HTTP proxy does:\n\n1.  An HTTP proxy acts as an intermediary, sitting between a user's web browser and the internet. It intercepts all outgoing web requests, becoming a crucial gateway for online communication.\n\n2.  When a client requests a webpage, the proxy receives this request first. It then forwards this request on behalf of the client to the intended web server across the internet.\n\n3.  Upon receiving a response from the web server, the proxy processes it. It then sends this fetched content back to the original client, completing the request-response cycle efficiently.\n\n4.  One key function is enhancing user anonymity by masking the client's original IP address. The web server sees the proxy's IP, safeguarding the user's identity online.\n\n5.  Proxies can improve network security by filtering malicious content and blocking access to known dangerous websites. This protects users from malware and phishing attacks effectively.\n\n6.  Caching frequently accessed web content is another vital role of an HTTP proxy. It stores copies locally to serve subsequent requests much faster, reducing server load.\n\n7.  By caching resources, the proxy significantly reduces the overall bandwidth usage for an organization. This efficiency leads to lower operational costs and faster network speeds.\n\n8.  HTTP proxies provide a central point for implementing internet access policies and controls. Administrators can define rules about which websites or content are permissible for users.\n\n9.  It can perform content filtering, blocking access to specific URLs, categories of sites, or keywords. This is often used for parental controls or workplace productivity enforcement.\n\n10. Some proxies are capable of modifying request or response headers, and even the body of HTTP messages. This allows for customized communication with web servers.\n\n11. A proxy can help users bypass geographical restrictions by making it appear they are browsing from a different location. This unlocks access to region-locked online services.\n\n12. Every web request passing through the proxy can be logged and audited. This provides valuable insights into user activity, network traffic patterns, and compliance monitoring.\n\n13. Many proxies support user authentication, requiring individuals to log in before they can access the internet. This adds an extra layer of security and accountability.\n\n14. For HTTPS traffic, an HTTP proxy can perform SSL/TLS inspection, acting as a man-in-the-middle. It decrypts, analyzes, and re-encrypts secure communication for security checks.\n\n15. It can enforce compliance with regulatory requirements by ensuring all web traffic adheres to predefined standards. This helps organizations maintain data integrity and security policies.\n\n16. Proxies often enhance network performance by reducing latency for subsequent requests to cached items. This directly translates to quicker webpage loading times for users.\n\n17. An HTTP proxy serves as a critical gateway, allowing an internal network to connect securely to the external internet. It manages all outbound web traffic from the internal system.\n\n18. Developers frequently use proxies for debugging web applications, inspecting the exact HTTP requests and responses. This helps identify and troubleshoot communication issues effectively.\n\n19. Proxies can facilitate parental controls by selectively blocking inappropriate or adult content. This creates a safer online environment for children using shared devices.\n\n20. Advanced proxies are capable of filtering out advertisements before they even reach the user's browser. This improves browsing speed and provides a less cluttered web experience.\n\n21. It can manage connection pooling, maintaining open connections to frequently accessed servers. This reduces the overhead of establishing new connections for each individual request.\n\n22. By centralizing web traffic, an HTTP proxy provides administrators with enhanced visibility into network usage. They can monitor who is accessing what, and when.\n\n23. A proxy can act as a single point of exit for all web traffic from an internal network. This simplifies network configuration and security management for IT departments.\n\n24. It helps in optimizing resource utilization by consolidating multiple client requests into fewer server connections. This efficiency contributes to better overall network stability.\n\n25. Ultimately, an HTTP proxy empowers organizations and individuals with greater control, security, and performance over their internet access and online interactions.","role":"assistant"}}],"id":"-tu1arxz6ZSxvA-Cz5_ZDA","model":"gemini-2.5-flash","object":"chat.completion","usage":{"completion_tokens":2300,"completion_tokens_details":{"reasoning_tokens":1444},"prompt_tokens":21,"total_tokens":2321}}
+
+== PASS
+Here are 25 numbered sentences describing what an HTTP proxy does:
+
+1.  An HTTP proxy acts as an intermediary, sitting between a user's web browser and the internet. It intercepts all outgoing web requests, becoming a crucial gateway for online communication.
+
+2.  When a client requests a webpage, the proxy receives this request first. It then forwards this request on behalf of the client to the intended web server across the internet.
+
+3.  Upon receiving a response from the web server, the proxy processes it. It then sends this fetched content back to the original client, completing the request-response cycle efficiently.
+
+4.  One key function is enhancing user anonymity by masking the client's original IP address. The web server sees the proxy's IP, safeguarding the user's identity online.
+
+5.  Proxies can improve network security by filtering malicious content and blocking access to known dangerous websites. This protects users from malware and phishing attacks effectively.
+
+6.  Caching frequently accessed web content is another vital role of an HTTP proxy. It stores copies locally to serve subsequent requests much faster, reducing server load.
+
+7.  By caching resources, the proxy significantly reduces the overall bandwidth usage for an organization. This efficiency leads to lower operational costs and faster network speeds.
+
+8.  HTTP proxies provide a central point for implementing internet access policies and controls. Administrators can define rules about which websites or content are permissible for users.
+
+9.  It can perform content filtering, blocking access to specific URLs, categories of sites, or keywords. This is often used for parental controls or workplace productivity enforcement.
+
+10. Some proxies are capable of modifying request or response headers, and even the body of HTTP messages. This allows for customized communication with web servers.
+
+11. A proxy can help users bypass geographical restrictions by making it appear they are browsing from a different location. This unlocks access to region-locked online services.
+
+12. Every web request passing through the proxy can be logged and audited. This provides valuable insights into user activity, network traffic patterns, and compliance monitoring.
+
+13. Many proxies support user authentication, requiring individuals to log in before they can access the internet. This adds an extra layer of security and accountability.
+
+14. For HTTPS traffic, an HTTP proxy can perform SSL/TLS inspection, acting as a man-in-the-middle. It decrypts, analyzes, and re-encrypts secure communication for security checks.
+
+15. It can enforce compliance with regulatory requirements by ensuring all web traffic adheres to predefined standards. This helps organizations maintain data integrity and security policies.
+
+16. Proxies often enhance network performance by reducing latency for subsequent requests to cached items. This directly translates to quicker webpage loading times for users.
+
+17. An HTTP proxy serves as a critical gateway, allowing an internal network to connect securely to the external internet. It manages all outbound web traffic from the internal system.
+
+18. Developers frequently use proxies for debugging web applications, inspecting the exact HTTP requests and responses. This helps identify and troubleshoot communication issues effectively.
+
+19. Proxies can facilitate parental controls by selectively blocking inappropriate or adult content. This creates a safer online environment for children using shared devices.
+
+20. Advanced proxies are capable of filtering out advertisements before they even reach the user's browser. This improves browsing speed and provides a less cluttered web experience.
+
+21. It can manage connection pooling, maintaining open connections to frequently accessed servers. This reduces the overhead of establishing new connections for each individual request.
+
+22. By centralizing web traffic, an HTTP proxy provides administrators with enhanced visibility into network usage. They can monitor who is accessing what, and when.
+
+23. A proxy can act as a single point of exit for all web traffic from an internal network. This simplifies network configuration and security management for IT departments.
+
+24. It helps in optimizing resource utilization by consolidating multiple client requests into fewer server connections. This efficiency contributes to better overall network stability.
+
+25. Ultimately, an HTTP proxy empowers organizations and individuals with greater control, security, and performance over their internet access and online interactions.

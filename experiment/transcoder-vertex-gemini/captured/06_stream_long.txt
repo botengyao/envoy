@@ -1,0 +1,77 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write 25 numbered sentences, each about 30 words, describing what an HTTP proxy does."
+    }
+  ],
+  "stream": true
+}
+
+== response 200
+content-type: text/event-stream
+transfer-encoding: chunked
+
+data: {"choices":[{"delta":{"content":"Here are 25 numbered sentences, each around 30 words, describing what an HTTP proxy does:\n\n1.  An HTTP proxy server acts as an intermediary, sitting between a client machine and the target web server.","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" It receives requests and forwards them, effectively becoming a central point for network communication.\n2.  When a client sends an HTTP request, it first directs it to the proxy, not directly to the intended website. This redirection is fundamental to its operation and all subsequent actions.\n3.  Upon receiving a client's request","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":", the proxy then establishes its own connection to the specified web server on behalf of the client. It effectively masks the original requestor.\n4.  The proxy forwards the client's request to the web server, making it appear as if the proxy itself is the origin of the request. This provides a layer of anonymity for","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" the actual client.\n5.  Once the web server processes the request, it sends its response back to the proxy server. The server believes the proxy was the original requestor.\n6.  The proxy then receives this response from the web server and subsequently forwards it back to the original client. This completes the communication loop","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" through the intermediary.\n7.  A key function is enhancing user privacy by masking the client's actual IP address from the destination website. This makes it harder to track individual users directly.\n8.  HTTP proxies often employ caching mechanisms, storing copies of frequently accessed web content. This significantly speeds up subsequent requests for the","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" same resources, improving performance.\n9.  By serving cached content, proxies reduce the load on origin web servers and minimize bandwidth consumption, especially in large organizational networks with many users.\n10. Proxies can enforce security policies by filtering out malicious websites or unwanted content based on predefined rules. This acts as a protective barrier","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" for internal users.\n11. They enable administrators to control user access to specific websites or categories of content, vital for maintaining productivity and acceptable use policies within organizations.\n12. Proxies can log all web traffic passing through them, providing valuable data for auditing, troubleshooting, or monitoring internet usage patterns. This aids in","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" network analysis.\n13. Some proxies perform content modification, altering HTTP headers or even the body of web pages before forwarding them. This can include ad-blocking or data compression.\n14. For enhanced security, a proxy can intercept SSL/TLS encrypted traffic (often called SSL inspection). This allows it to examine encrypted","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" content for threats before it reaches the client.\n15. This interception involves the proxy acting as a \"man-in-the-middle\" with the client's trust, enabling deep packet inspection for security appliances within an enterprise environment.\n16. Proxies can help users bypass geographical restrictions or censorship by routing traffic","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" through servers located in different regions. This unlocks restricted content access.\n17. In development environments, proxies are invaluable for debugging network requests and responses, allowing developers to inspect the raw HTTP traffic exchanged between client and server.\n18. They provide a centralized point for network management, simplifying the application of security policies, content","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" filtering, and usage monitoring across an entire network infrastructure.\n19. Proxies can also be configured to require user authentication before granting internet access, adding an extra layer of security and accountability for network resources.\n20. By managing traffic flow, proxies can implement bandwidth throttling or traffic shaping policies. This ensures fair resource distribution","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" and prioritizes critical applications over others.\n21. They act as a firewall enhancement, preventing direct connections between internal network clients and external web servers, thereby reducing the network's attack surface.\n22. Forward proxies, the most common type for clients, are specifically designed to handle requests originating from inside a private network","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" destined for the external internet.\n23. They can modify HTTP headers, adding or removing information before forwarding requests or responses. This fine-grained control is useful for various network optimizations.\n24. A transparent proxy intercepts traffic without requiring client configuration, making its presence invisible to the end-user. This is common in","role":"assistant"},"finish_reason":null,"index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" corporate or public Wi-Fi networks.\n25. Conversely, a non-transparent (explicit) proxy requires manual configuration in the client's browser or operating system settings. Users are aware their traffic is being proxied.","role":"assistant"},"finish_reason":"stop","index":0}],"id":"5du1atLhMvuil7oPlorDqAw","model":"gemini-2.5-flash","object":"chat.completion.chunk","usage":{"completion_tokens":3765,"completion_tokens_details":{"reasoning_tokens":2881},"prompt_tokens":21,"total_tokens":3786}}
+
+data: [DONE]
+
+
+
+== PASS
+Here are 25 numbered sentences, each around 30 words, describing what an HTTP proxy does:
+
+1.  An HTTP proxy server acts as an intermediary, sitting between a client machine and the target web server. It receives requests and forwards them, effectively becoming a central point for network communication.
+2.  When a client sends an HTTP request, it first directs it to the proxy, not directly to the intended website. This redirection is fundamental to its operation and all subsequent actions.
+3.  Upon receiving a client's request, the proxy then establishes its own connection to the specified web server on behalf of the client. It effectively masks the original requestor.
+4.  The proxy forwards the client's request to the web server, making it appear as if the proxy itself is the origin of the request. This provides a layer of anonymity for the actual client.
+5.  Once the web server processes the request, it sends its response back to the proxy server. The server believes the proxy was the original requestor.
+6.  The proxy then receives this response from the web server and subsequently forwards it back to the original client. This completes the communication loop through the intermediary.
+7.  A key function is enhancing user privacy by masking the client's actual IP address from the destination website. This makes it harder to track individual users directly.
+8.  HTTP proxies often employ caching mechanisms, storing copies of frequently accessed web content. This significantly speeds up subsequent requests for the same resources, improving performance.
+9.  By serving cached content, proxies reduce the load on origin web servers and minimize bandwidth consumption, especially in large organizational networks with many users.
+10. Proxies can enforce security policies by filtering out malicious websites or unwanted content based on predefined rules. This acts as a protective barrier for internal users.
+11. They enable administrators to control user access to specific websites or categories of content, vital for maintaining productivity and acceptable use policies within organizations.
+12. Proxies can log all web traffic passing through them, providing valuable data for auditing, troubleshooting, or monitoring internet usage patterns. This aids in network analysis.
+13. Some proxies perform content modification, altering HTTP headers or even the body of web pages before forwarding them. This can include ad-blocking or data compression.
+14. For enhanced security, a proxy can intercept SSL/TLS encrypted traffic (often called SSL inspection). This allows it to examine encrypted content for threats before it reaches the client.
+15. This interception involves the proxy acting as a "man-in-the-middle" with the client's trust, enabling deep packet inspection for security appliances within an enterprise environment.
+16. Proxies can help users bypass geographical restrictions or censorship by routing traffic through servers located in different regions. This unlocks restricted content access.
+17. In development environments, proxies are invaluable for debugging network requests and responses, allowing developers to inspect the raw HTTP traffic exchanged between client and server.
+18. They provide a centralized point for network management, simplifying the application of security policies, content filtering, and usage monitoring across an entire network infrastructure.
+19. Proxies can also be configured to require user authentication before granting internet access, adding an extra layer of security and accountability for network resources.
+20. By managing traffic flow, proxies can implement bandwidth throttling or traffic shaping policies. This ensures fair resource distribution and prioritizes critical applications over others.
+21. They act as a firewall enhancement, preventing direct connections between internal network clients and external web servers, thereby reducing the network's attack surface.
+22. Forward proxies, the most common type for clients, are specifically designed to handle requests originating from inside a private network destined for the external internet.
+23. They can modify HTTP headers, adding or removing information before forwarding requests or responses. This fine-grained control is useful for various network optimizations.
+24. A transparent proxy intercepts traffic without requiring client configuration, making its presence invisible to the end-user. This is common in corporate or public Wi-Fi networks.
+25. Conversely, a non-transparent (explicit) proxy requires manual configuration in the client's browser or operating system settings. Users are aware their traffic is being proxied.

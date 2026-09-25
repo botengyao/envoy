@@ -1,0 +1,30 @@
+== request
+POST /v1/chat/completions
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a haiku about proxies."
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}
+
+== response 200
+content-type: text/event-stream
+transfer-encoding: chunked
+
+data: {"choices":[{"delta":{"content":"A hidden path found,\nThrough another's digital door,\nWorlds open, now free.","role":"assistant"},"finish_reason":"stop","index":0}],"id":"4du1aoixIaHcl7oPiPqUsQ0","model":"gemini-2.5-flash","object":"chat.completion.chunk","usage":{"completion_tokens":755,"completion_tokens_details":{"reasoning_tokens":735},"prompt_tokens":7,"total_tokens":762}}
+
+data: [DONE]
+
+
+
+== PASS
+A hidden path found,
+Through another's digital door,
+Worlds open, now free.
