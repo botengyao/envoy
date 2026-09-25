@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <utility>
@@ -35,6 +36,7 @@ using HttpFilters::AiProtocolManager::FlattenJsonField;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
+using HttpFilters::AiProtocolManager::readString;
 using HttpFilters::AiProtocolManager::SseEvent;
 using HttpFilters::AiProtocolManager::SseEventPtr;
 using HttpFilters::AiProtocolManager::SseStreamPropagator;
@@ -86,17 +88,35 @@ bool isGeminiModelId(absl::string_view model) {
   });
 }
 
-// Joins a Gemini candidate's text parts. A lone part is moved rather than copied: text past the
-// inline string threshold is a reference into the SSE frame's payload, not a string.
+// Finds the string value at `path`. Past the SSE decoder's inline threshold that value is a
+// reference into the frame's payload, which can be moved but not read.
+nlohmann::json* findString(nlohmann::json& node, std::initializer_list<absl::string_view> path) {
+  nlohmann::json* found = &node;
+  for (const absl::string_view key : path) {
+    if (!found->is_object()) {
+      return nullptr;
+    }
+    const auto it = found->find(key);
+    if (it == found->end()) {
+      return nullptr;
+    }
+    found = &*it;
+  }
+  return found->is_string() || JsonWithExtBuf::isExternalRef(*found) ? found : nullptr;
+}
+
+nlohmann::json takeString(nlohmann::json& node, std::initializer_list<absl::string_view> path,
+                          nlohmann::json fallback = "") {
+  nlohmann::json* found = findString(node, path);
+  return found != nullptr ? std::move(*found) : std::move(fallback);
+}
+
+// Joins a Gemini candidate's text parts. A lone part is moved as is: a reference can't be read.
 absl::StatusOr<nlohmann::json> takeGeminiText(nlohmann::json& parts) {
   std::vector<nlohmann::json*> texts;
   for (nlohmann::json& part : parts) {
-    if (!part.is_object()) {
-      continue;
-    }
-    if (const auto text = part.find("text");
-        text != part.end() && (text->is_string() || JsonWithExtBuf::isExternalRef(*text))) {
-      texts.push_back(&*text);
+    if (nlohmann::json* text = findString(part, {"text"}); text != nullptr) {
+      texts.push_back(text);
     }
   }
   if (texts.size() == 1) {
@@ -682,9 +702,9 @@ absl::Status TranscoderFilter::transcodeSseEventToIr(SseEvent& event, bool& shou
       return absl::InvalidArgumentError("transcoder: Gemini SSE chunk missing `candidates` array");
     }
     nlohmann::json chunk = nlohmann::json::object();
-    chunk["id"] = doc.value("responseId", sse_stream_id_);
+    chunk["id"] = takeString(doc, {"responseId"}, sse_stream_id_);
     chunk["object"] = "chat.completion.chunk";
-    chunk["model"] = doc.value("modelVersion", sse_stream_model_);
+    chunk["model"] = takeString(doc, {"modelVersion"}, sse_stream_model_);
     nlohmann::json choices = nlohmann::json::array();
     for (size_t i = 0; i < doc["candidates"].size(); ++i) {
       auto& cand = doc["candidates"][i];
@@ -718,12 +738,13 @@ absl::Status TranscoderFilter::transcodeSseEventToIr(SseEvent& event, bool& shou
   }
 
   if (target == LLMProtocol::AnthropicMessages) {
-    const std::string event_type = doc.value("type", std::string(event.event()));
+    const std::string event_type = readString(doc, "type").value_or(std::string(event.event()));
     if (event_type == "message_start") {
       if (doc.contains("message") && doc["message"].is_object()) {
         const auto& msg = doc["message"];
-        sse_stream_id_ = msg.value("id", sse_stream_id_);
-        sse_stream_model_ = msg.value("model", sse_stream_model_);
+        // Kept for later frames, so it must be inline: a reference dies with this frame.
+        sse_stream_id_ = readString(msg, "id").value_or(sse_stream_id_);
+        sse_stream_model_ = readString(msg, "model").value_or(sse_stream_model_);
       }
       doc = {
           {"id", sse_stream_id_},
@@ -736,11 +757,7 @@ absl::Status TranscoderFilter::transcodeSseEventToIr(SseEvent& event, bool& shou
       return absl::OkStatus();
     }
     if (event_type == "content_block_delta") {
-      std::string text;
-      if (doc.contains("delta") && doc["delta"].is_object() && doc["delta"].contains("text") &&
-          doc["delta"]["text"].is_string()) {
-        text = doc["delta"]["text"].get<std::string>();
-      }
+      nlohmann::json text = takeString(doc, {"delta", "text"});
       doc = {{"id", sse_stream_id_},
              {"object", "chat.completion.chunk"},
              {"model", sse_stream_model_},
@@ -831,12 +848,8 @@ absl::Status TranscoderFilter::transcodeSseEventFromIr(SseEvent& event, bool& sh
     nlohmann::json out = nlohmann::json::object();
     nlohmann::json candidates = nlohmann::json::array();
     for (size_t i = 0; i < doc["choices"].size(); ++i) {
-      const auto& choice = doc["choices"][i];
-      std::string text;
-      if (choice.contains("delta") && choice["delta"].is_object() &&
-          choice["delta"].contains("content") && choice["delta"]["content"].is_string()) {
-        text = choice["delta"]["content"].get<std::string>();
-      }
+      auto& choice = doc["choices"][i];
+      nlohmann::json text = takeString(choice, {"delta", "content"});
       nlohmann::json cand = nlohmann::json::object();
       cand["index"] = choice.value("index", static_cast<int>(i));
       cand["content"] = {{"role", "model"},
@@ -848,8 +861,8 @@ absl::Status TranscoderFilter::transcodeSseEventFromIr(SseEvent& event, bool& sh
       candidates.push_back(std::move(cand));
     }
     out["candidates"] = std::move(candidates);
-    if (doc.contains("model") && doc["model"].is_string()) {
-      out["modelVersion"] = doc["model"];
+    if (nlohmann::json* model = findString(doc, {"model"}); model != nullptr) {
+      out["modelVersion"] = std::move(*model);
     }
     transcodeIrUsageToGemini(doc, out);
     doc = std::move(out);
@@ -858,13 +871,11 @@ absl::Status TranscoderFilter::transcodeSseEventFromIr(SseEvent& event, bool& sh
   }
 
   if (source_protocol_ == LLMProtocol::AnthropicMessages) {
-    const auto& choice = doc["choices"][0];
-    if (choice.contains("delta") && choice["delta"].is_object() &&
-        choice["delta"].contains("content") && choice["delta"]["content"].is_string()) {
-      const std::string text = choice["delta"]["content"].get<std::string>();
+    auto& choice = doc["choices"][0];
+    if (nlohmann::json* text = findString(choice, {"delta", "content"}); text != nullptr) {
       doc = {{"type", "content_block_delta"},
              {"index", choice.value("index", 0)},
-             {"delta", {{"type", "text_delta"}, {"text", text}}}};
+             {"delta", {{"type", "text_delta"}, {"text", std::move(*text)}}}};
       (void)event.set_event("content_block_delta");
       return absl::OkStatus();
     }
@@ -882,10 +893,10 @@ absl::Status TranscoderFilter::transcodeSseEventFromIr(SseEvent& event, bool& sh
     }
     doc = {{"type", "message_start"},
            {"message",
-            {{"id", doc.value("id", "msg_transcoded")},
+            {{"id", takeString(doc, {"id"}, "msg_transcoded")},
              {"type", "message"},
              {"role", "assistant"},
-             {"model", doc.value("model", sse_stream_model_)},
+             {"model", takeString(doc, {"model"}, sse_stream_model_)},
              {"content", nlohmann::json::array()}}}};
     (void)event.set_event("message_start");
     return absl::OkStatus();

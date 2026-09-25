@@ -159,6 +159,29 @@ public:
     runDecodeChain(std::move(filters), payload);
   }
 
+  std::string runSseResponseChain(std::vector<AiFilterSharedPtr> filters, absl::string_view sse) {
+    FilterManager manager(std::move(filters));
+    FakeBridge resp_bridge(*dispatcher_);
+    BufferManager resp_out_buffer(BufferManager::Config{}, factory_, resp_bridge);
+    manager.startSseResponse(factory_, resp_bridge, resp_out_buffer, [this](absl::Status s) {
+      status_ = std::move(s);
+      completed_ = true;
+    });
+    Buffer::OwnedImpl data(sse);
+    manager.onResponseData(data, /*end_stream=*/true);
+    for (int i = 0; i < 20; ++i) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    }
+    EXPECT_TRUE(completed_);
+    resp_out_buffer.onDestroy();
+    return resp_bridge.injected_.toString();
+  }
+
+  static nlohmann::json firstSseData(const std::string& sse) {
+    const size_t start = sse.find("data: ") + 6;
+    return nlohmann::json::parse(sse.substr(start, sse.find('\n', start) - start));
+  }
+
   nlohmann::json forwarded() { return nlohmann::json::parse(bridge_.injected_.toString()); }
 
   uint64_t counterValue(const std::string& name) {
@@ -175,6 +198,10 @@ public:
   StreamInfo::StreamInfoImpl stream_info_;
   NiceMock<Stats::MockIsolatedStatsStore> stats_store_;
   Http::TestRequestHeaderMapImpl request_headers_;
+  // Past the SSE decoder's inline string threshold, so a frame holds it by reference; the client
+  // must still get the escape decoded.
+  const std::string escaped_long_text_ = std::string(3000, 'a') + "\\n" + std::string(10, 'b');
+  const std::string long_text_ = std::string(3000, 'a') + "\n" + std::string(10, 'b');
 
   absl::Status status_;
   bool completed_{false};
@@ -534,41 +561,116 @@ TEST_F(TranscoderFilterTest, EncodeSseKeepsGeminiTextHeldByReference) {
   TranscoderFilter::setTargetProtocol(LLMProtocol::GeminiGenerateContent);
   request_headers_ =
       Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", "/v1/chat/completions"}};
-
   const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::OpenAiChatCompletions};
-  auto backend_boundary_filter = std::make_shared<TranscoderFilter>(
-      makeConfig(TranscoderProto::FROM_IR, TranscoderProto::TO_IR), context);
 
-  FilterManager manager({backend_boundary_filter});
-  FakeBridge resp_bridge(*dispatcher_);
-  BufferManager resp_out_buffer(BufferManager::Config{}, factory_, resp_bridge);
-  absl::Status resp_status;
-  bool resp_done = false;
-  manager.startSseResponse(factory_, resp_bridge, resp_out_buffer, [&](absl::Status s) {
-    resp_status = std::move(s);
-    resp_done = true;
-  });
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::FROM_IR, TranscoderProto::TO_IR), context)},
+      absl::StrCat(R"(data: {"candidates":[{"content":{"role":"model","parts":[{"text":")",
+                   escaped_long_text_,
+                   R"("}]},"finishReason":"STOP"}],"modelVersion":"gemini-2.5-flash"})",
+                   "\r\n\r\n"));
 
-  const std::string text = std::string(3000, 'a') + "\\n" + std::string(10, 'b');
-  Buffer::OwnedImpl sse_data(absl::StrCat(
-      R"(data: {"candidates":[{"content":{"role":"model","parts":[{"text":")", text,
-      R"("}]},"finishReason":"STOP"}],"modelVersion":"gemini-2.5-flash"})", "\r\n\r\n"));
-  manager.onResponseData(sse_data, /*end_stream=*/true);
-  for (int i = 0; i < 20; ++i) {
-    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
-  }
-
-  ASSERT_TRUE(resp_done);
-  ASSERT_TRUE(resp_status.ok()) << resp_status;
-  const std::string out = resp_bridge.injected_.toString();
-  const std::string first_payload = out.substr(6, out.find('\n') - 6);
-  nlohmann::json chunk = nlohmann::json::parse(first_payload);
+  ASSERT_TRUE(status_.ok()) << status_;
+  nlohmann::json chunk = firstSseData(out);
   EXPECT_EQ(chunk["object"], "chat.completion.chunk");
-  EXPECT_EQ(chunk["choices"][0]["delta"]["content"],
-            std::string(3000, 'a') + "\n" + std::string(10, 'b'));
+  EXPECT_EQ(chunk["choices"][0]["delta"]["content"], long_text_);
   EXPECT_EQ(chunk["choices"][0]["finish_reason"], "stop");
   EXPECT_THAT(out, testing::HasSubstr("data: [DONE]"));
-  resp_out_buffer.onDestroy();
+}
+
+// An Anthropic `text_delta` past the inline string threshold must still come out as the delta.
+TEST_F(TranscoderFilterTest, EncodeSseKeepsAnthropicTextHeldByReference) {
+  TranscoderFilter::setTargetProtocol(LLMProtocol::AnthropicMessages);
+  request_headers_ =
+      Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", "/v1/chat/completions"}};
+  const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::OpenAiChatCompletions};
+
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::FROM_IR, TranscoderProto::TO_IR), context)},
+      absl::StrCat("event: content_block_delta\n",
+                   R"(data: {"type":"content_block_delta","index":0,)",
+                   R"("delta":{"type":"text_delta","text":")", escaped_long_text_, "\"}}\n\n"));
+
+  ASSERT_TRUE(status_.ok()) << status_;
+  nlohmann::json chunk = firstSseData(out);
+  EXPECT_EQ(chunk["object"], "chat.completion.chunk");
+  EXPECT_EQ(chunk["choices"][0]["delta"]["content"], long_text_);
+}
+
+// An IR delta held by reference, whether from an OpenAI backend or the `TO_IR` leg, must still
+// reach a Gemini client.
+TEST_F(TranscoderFilterTest, EncodeSseToGeminiClientKeepsTextHeldByReference) {
+  request_headers_ = Http::TestRequestHeaderMapImpl{
+      {":method", "POST"}, {":path", "/v1beta/models/gemini-2.5-flash:streamGenerateContent"}};
+  const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::GeminiGenerateContent};
+
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::TO_IR, TranscoderProto::FROM_IR), context)},
+      absl::StrCat(R"(data: {"choices":[{"index":0,"delta":{"content":")", escaped_long_text_,
+                   R"("},"finish_reason":null}]})", "\n\n"));
+
+  ASSERT_TRUE(status_.ok()) << status_;
+  nlohmann::json chunk = firstSseData(out);
+  EXPECT_EQ(chunk["candidates"][0]["content"]["parts"][0]["text"], long_text_);
+}
+
+// For an Anthropic client such a delta is a `content_block_delta`, not a `message_start`.
+TEST_F(TranscoderFilterTest, EncodeSseToAnthropicClientKeepsTextHeldByReference) {
+  request_headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", "/v1/messages"}};
+  const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::AnthropicMessages};
+
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::TO_IR, TranscoderProto::FROM_IR), context)},
+      absl::StrCat(R"(data: {"choices":[{"index":0,"delta":{"content":")", escaped_long_text_,
+                   R"("},"finish_reason":null}]})", "\n\n"));
+
+  ASSERT_TRUE(status_.ok()) << status_;
+  EXPECT_THAT(out, testing::StartsWith("event: content_block_delta\n"));
+  nlohmann::json event = firstSseData(out);
+  EXPECT_EQ(event["delta"]["text"], long_text_);
+}
+
+// Any string can be held by reference, and one that is only forwarded goes out as it came in.
+TEST_F(TranscoderFilterTest, EncodeSseForwardsGeminiModelHeldByReference) {
+  TranscoderFilter::setTargetProtocol(LLMProtocol::GeminiGenerateContent);
+  request_headers_ =
+      Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", "/v1/chat/completions"}};
+  const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::OpenAiChatCompletions};
+
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::FROM_IR, TranscoderProto::TO_IR), context)},
+      absl::StrCat(R"(data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}],)",
+                   R"("modelVersion":")", escaped_long_text_, "\"}\n\n"));
+
+  ASSERT_TRUE(status_.ok()) << status_;
+  nlohmann::json chunk = firstSseData(out);
+  EXPECT_EQ(chunk["model"], long_text_);
+  EXPECT_EQ(chunk["choices"][0]["delta"]["content"], "hi");
+}
+
+// A string kept for later frames must be inline, since a reference dies with its frame.
+TEST_F(TranscoderFilterTest, EncodeSseDoesNotKeepAnthropicModelHeldByReference) {
+  TranscoderFilter::setTargetProtocol(LLMProtocol::AnthropicMessages);
+  request_headers_ =
+      Http::TestRequestHeaderMapImpl{{":method", "POST"}, {":path", "/v1/chat/completions"}};
+  const AiFilterContext context{stream_info_, request_headers_, LLMProtocol::OpenAiChatCompletions};
+
+  const std::string out = runSseResponseChain(
+      {std::make_shared<TranscoderFilter>(
+          makeConfig(TranscoderProto::FROM_IR, TranscoderProto::TO_IR), context)},
+      absl::StrCat("event: message_start\n",
+                   R"(data: {"type":"message_start","message":{"id":"msg_1","model":")",
+                   escaped_long_text_, "\"}}\n\n"));
+
+  ASSERT_TRUE(status_.ok()) << status_;
+  nlohmann::json chunk = firstSseData(out);
+  EXPECT_EQ(chunk["id"], "msg_1");
+  EXPECT_EQ(chunk["model"], "transcoded-model");
 }
 
 // When `response_handling` is unset (`DIRECTION_UNSPECIFIED`), the filter splices out of the
