@@ -1,139 +1,121 @@
 # Budget-based routing for AI traffic
 
-Status: proposal, no code. Written against upstream/main `9c3d9aff1a` (2026-10-05). Extension and
-field names are proposals; everything not marked as new exists today.
+Status: proposal, no code. Written against upstream/main `9c3d9aff1a`. Extension and field names
+are proposals; everything not marked as new exists today.
+
+Revision 2 (2026-10-06) is simpler and more general than revision 1. Budgets are now cost-weighted
+rate limits on the existing rate limit service, so the dedicated budget service API and its
+reference server are gone. One charging rule covers requests, tokens and money. Budget routing
+publishes a plain list of eligible targets that general routing extensions consume. Section 9
+lists what changed.
 
 ## Summary
 
-Teams that run Envoy as an LLM gateway want what LiteLLM's proxy gives them: a dollar budget on a
-key, a team, a user or a provider; requests stopped or rerouted when it runs out; and spend in a
-database they can query. The AI Protocol Manager (APM) already has most of the inputs: the
-requested model, `max_tokens`, an input-token estimate, and the token usage the provider reports.
-Nothing turns tokens into money, keeps spend across Envoy instances, or lets a budget choose the
-upstream.
+Operators running Envoy as an LLM gateway want what LiteLLM and agentgateway offer: a price for
+each model, budgets for keys, teams and providers, and traffic that stops or moves when a budget
+runs out. The AI Protocol Manager (APM) already parses the request and extracts the token usage the
+provider reports. What is missing is a price, a counter shared across Envoy instances, and a way
+for a budget to choose the upstream.
 
-This proposal adds:
+The design splits the problem into three steps. Each one builds on a general Envoy mechanism, and
+only the first knows about AI:
 
-- **`envoy.http.ai_filters.cost`** (new AI filter): prices each response from its token usage and a
-  configured price list, and publishes the cost as the `envoy.ai.cost` filter state object.
-- **`envoy.http.ai_filters.budget`** (new AI filter): before the request is routed, reads the
-  budgets that apply from a budget service. When a budget is spent it rejects with a 429 in the
-  client's API dialect. Otherwise it orders the upstream targets that still have budget and hands
-  them to the existing `priority_group` cluster specifier. After the response it records the spend.
-- **`envoy.service.budget.v3.BudgetService`** (new API): two unary RPCs, `GetBudgets` and
-  `RecordSpend`. The service owns the database: limits, windows, spend and a per-request ledger.
-  Envoy owns pricing and routing.
-- **Three small APM core changes**, each useful beyond budgets: an AI filter hook at stream
-  completion that carries the final token usage, a route cluster refresh after the AI filters, and
-  local replies with headers and an error body in the client's dialect.
+| Step | Question | Built on | New |
+|---|---|---|---|
+| Meter | What did this request cost? | token usage from APM | `cost` AI filter publishes `envoy.ai.cost` |
+| Limit | May it run, and what is left? | rate limit descriptors in the rate limit service (RLS): check before, charge after | `budget` AI filter; the stock rate limit filter also works |
+| Route | Where should it go? | the `priority_group` cluster specifier; the `quota_aware` load balancer (envoyproxy/envoy#47805, open) | `budget` publishes the targets that still have budget |
 
-The MVP enforces soft caps: a request is admitted while spend is under the limit, and charged when
-it completes. It makes one RPC before and one after each request. Caching, reservations and
-batching come later.
+```mermaid
+flowchart LR
+  C[Client] --> I[Identity<br/>ext_authz, JWT or API key]
+  subgraph APM[ai_protocol_manager]
+    RI[request_info] --> B[budget] --> CO[cost]
+  end
+  I --> APM --> R[Router<br/>priority_group]
+  R --> P[LLM providers]
+  B <-->|peek before, charge after| RLS[(Rate limit service<br/>Redis)]
+  CO -.->|envoy.ai.cost in access logs| L[(Spend ledger<br/>SQL)]
+```
 
 ## 1. The user's view
 
-### 1.1 Who uses it
+### 1.1 Journeys
 
-| Persona | Wants | Touches |
-|---|---|---|
-| Platform operator | LLM access for many teams with spend caps; cheaper paths when money runs short; predictable behavior when something fails | Envoy config (xDS) |
-| Budget owner (team lead, finance) | Limits set and changed without an Envoy rollout; spend by team, key and model | The budget service's API and database |
-| App developer | Errors their SDK understands; no retry storms; optionally, which target served them | The HTTP API only |
+| | Journey | LiteLLM | agentgateway |
+|---|---|---|---|
+| J1 | Every request's cost reaches access logs, metrics and a ledger | cost tracking, `LiteLLM_SpendLogs` | cost catalog, `gen_ai` cost metric, UI analytics |
+| J2 | A key, team, user or global budget per window; past it, a 429 | `max_budget`, `budget_duration` | per-key `budgets` (USD), token rate limits |
+| J3 | One model from several providers, each with its own budget; spent providers are skipped | `provider_budget_config` | not found |
+| J4 | A team past 80% of its monthly budget is served by a cheaper model until 100% | not found (`soft_budget` only alerts) | not found (conditional routing reads request attributes, not budget state) |
+| J5 | Tokens per minute per key, with the same machinery as money | `tpm_limit` (separate feature) | rate limit `type: tokens` |
 
-### 1.2 Journeys
+### 1.2 What the operator writes
 
-| | Journey | LiteLLM equivalent |
-|---|---|---|
-| J1 | Every request's cost reaches access logs, metrics and a spend ledger | cost tracking, `x-litellm-response-cost`, `LiteLLM_SpendLogs` |
-| J2 | A key, team, user or global budget per window; past it, a 429 | `max_budget` and `budget_duration` on keys, teams, users and end users |
-| J3 | One model from several providers, each with its own budget. Exhausted providers are skipped; a 429 only when none is left | `provider_budget_config`; "No deployments available - crossed budget" |
-| J4 | A team past 80% of its monthly budget is served by a cheaper model until it reaches 100% | none; LiteLLM's `soft_budget` only alerts |
-| J5 | Which target served a request; spend per team and model in Prometheus; the ledger in SQL | `/spend/logs`, `/key/info`, Prometheus metrics |
-
-### 1.3 What runs
-
-LiteLLM's quick start is the proxy plus Postgres, and LiteLLM does not enforce budgets without the
-database. Here the equivalent is Envoy, a budget service, and Postgres:
-
-```
-             ┌──────────────────────────── Envoy ─────────────────────────────┐
-  client ───►│ ext_authz ──► ai_protocol_manager ──► router (priority_group)  │───► OpenAI, Azure, ...
-             └─────┬────────────────────┬─────────────────────────────────────┘
-         key check │         GetBudgets │ before routing
-                   │        RecordSpend │ after the response
-                   ▼                    ▼
-             ┌─────────────────── budget service ───────────────────┐
-             │ keys, budgets (limit, window), spend, ledger          │───► Postgres
-             └───────────────────────────────────────────────────────┘
-```
-
-The key check can go to the same service, which then plays the part of LiteLLM's virtual keys, or
-to any identity provider: JWTs and `api_key_auth` work too.
-
-### 1.4 What the operator writes
-
-Envoy, with the new pieces marked:
+A budget is a name and a subject. Its limit and window live in the rate limit service, the same
+place as any other rate limit:
 
 ```yaml
-http_filters:
-- name: envoy.filters.http.ext_authz              # virtual key -> {key_id, team_id} metadata
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
-    transport_api_version: V3
-    grpc_service: {envoy_grpc: {cluster_name: budget_service}, timeout: 0.1s}
 - name: envoy.filters.http.ai_protocol_manager
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-    request_handling:
-      refresh_route_cluster: true                   # new (PR 3)
-    response_handling:
-      token_usage: {}
+    request_handling: {}
+    response_handling: {token_usage: {}}
     filters:
     - name: envoy.http.ai_filters.request_info
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
-    - name: envoy.http.ai_filters.budget            # new (PRs 5 and 6)
+    - name: envoy.http.ai_filters.budget                # new
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.http.ai_filters.budget.v3.Budget
-        budget_service: {envoy_grpc: {cluster_name: budget_service}, timeout: 0.05s}
-        budgets:                                    # checked and charged on every request
-        - name: key-monthly
-          subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:key_id)%"
-        - name: team-monthly
+        rate_limit_service:
+          grpc_service: {envoy_grpc: {cluster_name: ratelimit}}
+          transport_api_version: V3
+        domain: llm
+        budgets:                                        # checked and charged on every request
+        - name: team                                    # money (the default)
           subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:team_id)%"
-        routing:
-        - models: [{exact: gpt-4o}]
-          targets:                                  # the first target with budget left wins
-          - name: gpt-4o-openai
-            cluster: openai
-            budgets:
-            - {name: provider-daily, subject: openai}
-            - name: team-monthly                    # J4: only while the team is under 80%
-              subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:team_id)%"
-              spend_threshold: {value: 80}
-          - name: gpt-4o-azure
-            cluster: azure_openai
-            budgets:
-            - {name: provider-daily, subject: azure}
-            - name: team-monthly
-              subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:team_id)%"
-              spend_threshold: {value: 80}
-          - name: gpt-4o-mini
-            cluster: openai
-            model: gpt-4o-mini                      # rewrites the request's model
-    - name: envoy.http.ai_filters.cost              # new (PR 2)
+        - name: key_tpm                                 # tokens
+          subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:key_id)%"
+          charge: TOKENS
+        models:                                         # budget routing, by requested model
+          gpt-4o:
+            targets:                                    # the first target with room wins
+            - cluster: openai
+              budgets: [{name: provider}, {name: team, below: {value: 80}}]
+            - cluster: azure_openai
+              budgets: [{name: provider}, {name: team, below: {value: 80}}]
+            - cluster: openai
+              model: gpt-4o-mini
+    - name: envoy.http.ai_filters.cost                  # new
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.http.ai_filters.cost.v3.Cost
-        prices:
-        - {models: [gpt-4o], input_per_million: 2.50, cached_input_per_million: 1.25, output_per_million: 10.00}
-        - {models: [gpt-4o-mini], input_per_million: 0.15, cached_input_per_million: 0.075, output_per_million: 0.60}
-        ensure_stream_usage: true
-- name: envoy.filters.http.router
+        prices:                                         # per million tokens
+          gpt-4o: {input: 2.50, cached_input: 1.25, output: 10.00}
+          gpt-4o-mini: {input: 0.15, cached_input: 0.075, output: 0.60}
 ```
 
-The route declares the AI endpoint and lets the existing `priority_group` cluster specifier read
-the budget filter's choice:
+The limits, in the stock rate limit service (`envoyproxy/ratelimit`, backed by Redis). Each budget
+is one descriptor, the budget's name as the key and its subject as the value. A target budget
+without a subject (`provider` above) is counted per target cluster:
+
+```yaml
+domain: llm
+descriptors:
+- key: team                  # every team: $500 a month, in micro-dollars
+  rate_limit: {unit: month, requests_per_unit: 500000000}
+- key: key_tpm               # every key: 100k tokens a minute
+  rate_limit: {unit: minute, requests_per_unit: 100000}
+- key: provider
+  value: openai              # $100 a day
+  rate_limit: {unit: day, requests_per_unit: 100000000}
+- key: provider
+  value: azure_openai
+  rate_limit: {unit: day, requests_per_unit: 50000000}
+```
+
+The route lets the existing `priority_group` specifier take the budget filter's order, and retries
+the next target when a provider fails or answers 429:
 
 ```yaml
 - match: {prefix: /v1/chat/completions}
@@ -147,35 +129,35 @@ the budget filter's choice:
           priority_groups:
           - {name: default, clusters: [{cluster_name: openai, weight: 1}]}
           override_metadata_namespace: envoy.ai.budget
-    retry_policy: {retry_on: "5xx,reset", num_retries: 2, refresh_cluster_on_retry: true}
+    retry_policy:
+      retry_on: "5xx,reset,connect-failure,retriable-status-codes"
+      retriable_status_codes: [429]
+      num_retries: 2
+      refresh_cluster_on_retry: true
   typed_per_filter_config:
     envoy.filters.http.ai_protocol_manager:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
       request: {llm_protocol: OPENAI_CHAT_COMPLETIONS}
 ```
 
-A retry to another cluster keeps the request's path and headers, so a target on a provider with a
-different URL or credential, such as Azure OpenAI, needs upstream HTTP filters on its cluster that
-set them (`credential_injector`, `header_mutation`).
+A per-key limit that lives in a database, as LiteLLM's `/key/generate` sets it, comes from the
+identity step and overrides the configured limit for that request:
 
-The budget owner sets limits in the service. With the reference service of section 8:
-
-```
-PUT /budgets/team-monthly/search      {"limit": 500, "window": "month"}
-PUT /budgets/key-monthly/*            {"limit": 20,  "window": "month"}    # default for every key
-PUT /budgets/provider-daily/openai    {"limit": 100, "window": "day"}
-GET /budgets/team-monthly/search   -> {"limit": 500, "spent": 412.17, "resets_at": "2026-11-01T00:00:00Z"}
+```yaml
+- name: key
+  subject: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:key_id)%"
+  limit:
+    amount: "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:monthly_budget_micros)%"
+    unit: MONTH
 ```
 
-### 1.5 What the client sees
+### 1.3 What the client sees
 
 | Team `search` has spent | Result |
 |---|---|
 | under 80% | `gpt-4o` on OpenAI, or on Azure once OpenAI's daily budget is spent |
 | 80% to 100% | `gpt-4o-mini`; the response's `model` field says so |
-| 100% | rejected |
-
-A rejection in the OpenAI dialect:
+| 100% | a 429 in the client's own error format |
 
 ```
 HTTP/1.1 429 Too Many Requests
@@ -183,355 +165,245 @@ content-type: application/json
 retry-after: 2203200
 x-should-retry: false
 
-{"error": {"message": "Budget 'team-monthly' is spent until 2026-11-01T00:00:00Z.",
+{"error": {"message": "Budget 'team' is spent until 2026-11-05T00:00:00Z.",
            "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}
 ```
 
-`insufficient_quota` is what OpenAI itself returns for an exhausted billing quota, so clients that
-handle that case handle this one. The OpenAI and Anthropic SDKs retry 429s by default and skip the
-retry when the response carries `x-should-retry: false`, so a rejected call is not retried against
-a budget that will not clear for days. Anthropic and Gemini clients get their own error shapes
-(6.5).
+`insufficient_quota` is what OpenAI returns for an exhausted billing quota. The OpenAI and Anthropic
+SDKs retry a 429 unless the response carries `x-should-retry: false`, so the header keeps them from
+retrying against a budget that will not clear for days.
 
-An operator who wants clients to see the target chosen for the initial attempt adds a route
-response header with the value `%FILTER_STATE(envoy.ai.budget.target:PLAIN)%`.
+## 2. Design
 
-## 2. LiteLLM to Envoy
+### 2.1 One charging rule
 
-| LiteLLM | Here |
+Every budget charges an amount for each request, chosen by `charge`:
+
+| `charge` | Amount | Charged | Typical use |
+|---|---|---|---|
+| `COST` (default) | `envoy.ai.cost` in micro-units of the price currency | after the response | money per day or month |
+| `TOKENS` | total tokens the provider reported | after the response | tokens per minute |
+| `REQUESTS` | 1 | before the request | requests per minute |
+
+Requests, tokens and money go through one code path: the same descriptors, the same check, the
+same charge. agentgateway works the same way, debiting an expression over normalized usage for
+every limit.
+
+### 2.2 Two phases: peek, then charge
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Envoy (budget, cost)
+  participant RLS as Rate limit service
+  participant P as Provider
+  C->>E: POST /v1/chat/completions, model gpt-4o
+  E->>RLS: peek team, key_tpm, provider=openai, provider=azure_openai (hits 0)
+  RLS-->>E: per-descriptor status and remaining
+  alt a request budget is spent, or no target has room
+    E-->>C: 429, retry-after, x-should-retry: false
+  else
+    E->>P: first eligible target, model rewritten if the target names one
+    P-->>E: response with token usage
+    E-->>C: response
+    E->>RLS: charge cost or tokens to team, key_tpm and the served provider
+  end
+```
+
+- **Peek.** One `ShouldRateLimit` call before routing carries every distinct descriptor of the
+  request budgets and of the candidate targets, each with an explicit per-descriptor `hits_addend`
+  of 0. `envoyproxy/ratelimit` treats that as a check that adds nothing. A request-level 0 would
+  count as 1, so the per-descriptor value matters.
+- **Charge.** One more call after the response adds the amount to each distinct descriptor that
+  applied, fire-and-forget, the way the rate limit filter's `apply_on_stream_done` does it.
+- **Overshoot.** Admission sees spend as of the peek, so a budget can be overspent by the cost of
+  requests already running when it ran out: about concurrency × cost per request. LiteLLM without
+  reservations and agentgateway behave the same way.
+- **Audit.** A budget with `mode: AUDIT` is peeked and charged but never rejects or reroutes; a
+  counter shows what enforcement would have done.
+
+### 2.3 Budget routing: prune an ordered target list
+
+```mermaid
+flowchart TD
+  A[Peek all budgets] --> G{A request budget spent?}
+  G -- yes --> X[429 in the client's format]
+  G -- no --> T[Targets for the requested model, in order]
+  T --> F[Keep targets whose budgets all have room<br/>and are below their thresholds]
+  F --> N{Any left?}
+  N -- no --> X
+  N -- yes --> W[Publish them as envoy.ai.budget<br/>rewrite the model for the first]
+  W --> R[Router takes the first; retries take the next]
+```
+
+- **Targets come from a model table**, like LiteLLM's `model_list` and agentgateway's
+  `virtualModels` failover: the requested model maps to ordered targets, each a cluster with an
+  optional upstream `model`. `"*"` matches any model not listed.
+- **A target is eligible** when every budget it names has room and is under its `below`
+  threshold. A target budget without a subject counts per target cluster, which is how provider
+  budgets (J3) work. `below` on a request budget is the soft tier for J4; it is computed from the
+  peek's `current_limit` and `limit_remaining`, which are exact while the limit fits the RLS's
+  32-bit fields (3.5).
+- **The output is one general signal**, dynamic metadata `envoy.ai.budget`:
+  - `priority_groups`: one group per eligible target, in order, for the `priority_group` cluster
+    specifier, whose override reads exactly this shape;
+  - `candidates`: the eligible targets' ids, in the list shape the `quota_aware` load balancer in
+    #47805 reads. Today a target id is a cluster name; `quota_aware` matches host ids inside one
+    cluster, so it needs targets that name hosts (open question 2).
+
+  The filter also sets the filter state `envoy.ai.budget.target` to the first target, for logs and
+  response headers, and asks APM to refresh the route's cluster after the AI filters.
+- **Retries walk the list.** With `refresh_cluster_on_retry`, the specifier picks the next group
+  on each retry. Retrying on 5xx, connect failures and 429 by default means a provider failure does
+  not fail the request. agentgateway's eviction fails the request that triggered it unless retries
+  are also configured.
+- **Model rewrite.** The MVP rewrites the body once, for the first target. A retry keeps that body,
+  so the fallback list keeps only targets that send the same model. Per-attempt rewriting belongs
+  in the upstream APM, alongside the model fallback work.
+
+### 2.4 What the configuration compiles to
+
+| The operator writes | Envoy uses |
 |---|---|
-| `model_list` deployment | a cluster, named by a budget target |
-| model group (`model_name`) | the `models` of a `routing` entry |
-| virtual key, `/key/generate` | ext_authz to a key service, which can be the budget service; `api_key_auth` for static keys; JWT |
-| key, team, user, end-user, tag and global budgets | entries in `budgets`, each with a subject format string: `%DYNAMIC_METADATA(...)%`, `%FILTER_STATE(...)%`, `%REQ(...)%`, or a constant |
-| `model_max_budget` | a subject that joins key and model: `%DYNAMIC_METADATA(...:key_id)%/%FILTER_STATE(envoy.ai.model.request:PLAIN)%` |
-| `provider_budget_config` | budgets on targets, with a constant subject |
-| `max_budget`, `budget_duration` | a limit and a window, stored by the budget service |
-| model price map, `input_cost_per_token` | `cost.prices`, per million tokens |
-| spend in Postgres, synced through Redis | the budget service; Envoy keeps no budget state in the MVP |
-| budget reservation | after the MVP (section 10) |
-| `fail_closed_budget_enforcement` | `failure_mode_deny: true`, which answers 503 when the service is unreachable |
-| `x-litellm-response-cost` | `%FILTER_STATE(envoy.ai.cost:PLAIN)%` in access logs. A response header cannot carry it: the cost is known only after the last byte |
-| spend metrics in Prometheus | the stats access logger, counting `envoy.ai.cost` with team and model tags |
+| `budgets[].name`, `subject` | an RLS descriptor `(name, subject)` |
+| a limit and window | the RLS config, or a per-request `limit` override |
+| `charge: COST`, `TOKENS`, `REQUESTS` | the descriptor's `hits_addend` at charge time |
+| `models.<model>.targets` | `envoy.ai.budget` metadata for `priority_group` or `quota_aware` |
+| `prices` | `envoy.ai.cost`, readable as `%FILTER_STATE(envoy.ai.cost:PLAIN)%` |
 
-## 3. What APM has today
-
-- **The body is parsed before later filters see the request.** APM holds the headers, parses the
-  body, runs the AI filters, and only then releases headers and body (`filter.cc`,
-  `decodeHeaders()` and `finalizeDecode()`).
-- **AI filters can await.** `AiFilter::decode()` is a coroutine (`ai_filter.h:103`), so a filter
-  can wait on a gRPC call through a `Coroutine::LeafAwaitable`
-  (`source/common/coroutine/leaf_awaitable.h`). Stream teardown cancels the wait. A filter can
-  rewrite the body through `AiRequest::json()` and the headers through
-  `AiFilterContext::request_headers`, and reject through `LocalReplier(code, details)`
-  (`ai_filter.h:86`). No helper for gRPC calls exists yet, and the context carries no dispatcher.
-- **Request attributes.** `request_info` publishes `envoy.data.ai.v3.RequestInfo` (model,
-  `stream`, `max_output_tokens`, `estimated_input_tokens`, ...) as typed metadata under
-  `envoy.ai.request_info`. Since #47916 it also stores the model as the `envoy.ai.model.request`
-  string filter state object, which formatters, route matching and the `matcher` cluster specifier
-  can read.
-- **Token usage.** APM extracts it from OpenAI Chat Completions and Responses, Anthropic and Gemini
-  responses, unary and SSE. It publishes once, at a clean end of stream, as typed metadata under
-  `envoy.ai.token_usage` (`finalizeResponseHandling()`, `filter.cc:672`). Input counts include
-  cached and cache-creation tokens; output includes reasoning. Nothing is published on a reset or a
-  non-2xx response, and only the attempt the router selected is counted.
-- **No cost, no budget.** Nothing prices tokens. The APM docs say costing needs provider identity
-  and a price model, and that usage is provider-reported and unverified.
-- **No re-routing after the AI filters.** Route and cluster are fixed before APM runs. A
-  `refresh_route_cluster` knob exists only on the local branch `apm-refresh-route-cluster`
-  (`0bcf76df63`).
-- **Local replies are bare.** `LocalReplier` sends `details` as a plain-text body; a filter cannot
-  add headers (`filter.cc:465-471`).
-- **No completion hook.** AI filters live for their decode and encode coroutines. Nothing tells
-  them the stream finished, and nothing hands them the final usage.
-
-Pieces outside APM that this design reuses:
-
-- **The `priority_group` cluster specifier.** With `override_metadata_namespace`, a filter supplies
-  a per-request ordered list of groups as a typed `PriorityGroupsOverride`. The initial attempt
-  takes the first group and each retry the next, given `refresh_cluster_on_retry`. Every
-  `refreshRouteCluster()` re-selects.
-- **The connection manager's order.** Every filter's `onStreamComplete()` runs first, then the
-  access log (deferred until later on HTTP/3), then every filter's `onDestroy()`
-  (`conn_manager_impl.cc:454-470`). A cost published in `onStreamComplete()` is visible to access
-  loggers and to the global rate limit filter's `apply_on_stream_done`, which runs from
-  `onDestroy()`.
-- **Formatters.** `%FILTER_STATE(key:PLAIN)%` and `%FILTER_STATE(key:FIELD:name)%` work in access
-  logs, the stats access logger, `set_filter_state` and `hits_addend.format`.
-
-## 4. Gaps
-
-| Need | Today |
-|---|---|
-| Tokens priced in money | missing |
-| Spend shared across Envoy instances, per subject and window, with limits from a database | missing; RLS counts, but see 5.2 |
-| A budget check after the body is parsed and before the model is rewritten | an AI filter could do it; none exists |
-| A budget decision that changes the upstream | the `priority_group` override exists; nothing refreshes the cluster after the AI filters |
-| The final usage handed to an AI filter | missing |
-| A rejection with `retry-after`, `x-should-retry` and an error body in the client's dialect | missing |
-
-## 5. Options
-
-### 5.1 No new Envoy code
-
-ext_authz placed after APM decides; gRPC access logs carry the spend.
-
-- ext_authz receives `envoy.ai.request_info` through `typed_metadata_context_namespaces` and
-  answers OK, or 429 with an OpenAI-style body the service writes itself.
-- For J3 the service returns a `priority_groups` list as dynamic metadata, which `priority_group`
-  reads from the untyped `envoy.filters.http.ext_authz` namespace. ext_authz clears the route cache
-  only when it also changes a header, so the service has to set a dummy header.
-- The service prices `envoy.ai.token_usage` from the access log stream. gRPC access logs include
-  typed metadata only when the stream also has an untyped namespace
-  (`grpc_access_log_utils.cc:318`), and APM publishes typed metadata only.
-
-This is enough to prototype J2 and J3 today. It cannot do J4, because the body is serialized before
-ext_authz runs. Every operator's service has to reimplement pricing and the dialect error shapes,
-and it depends on two workarounds.
-
-### 5.2 The rate limit service as the spend counter
-
-Once the cost filter exists, a descriptor in the global rate limit filter's own `rate_limits` (route
-level `rate_limits` ignore `hits_addend`) can charge money at stream end:
+Nothing below the first column is AI-specific, so a deployment can skip the budget filter. With
+only the cost filter, two entries in the stock rate limit filter's own `rate_limits` (route-level
+`rate_limits` ignore `hits_addend`) give a money budget (J2):
 
 ```yaml
 rate_limits:
-- actions:
-  - metadata:
-      descriptor_key: team
-      metadata_key: {key: envoy.filters.http.ext_authz, path: [{key: team_id}]}
-  hits_addend: {format: "%FILTER_STATE(envoy.ai.cost:PLAIN)%"}
+- actions: [{metadata: {descriptor_key: team, metadata_key: {key: envoy.filters.http.ext_authz, path: [{key: team_id}]}}}]
+  hits_addend: {number: 0}                                         # peek before
+- actions: [{metadata: {descriptor_key: team, metadata_key: {key: envoy.filters.http.ext_authz, path: [{key: team_id}]}}}]
+  hits_addend: {format: "%FILTER_STATE(envoy.ai.cost:PLAIN)%"}     # charge after
   apply_on_stream_done: true
 ```
 
-Token quotas are built this way today; Envoy AI Gateway uses the same mechanism. For money it falls
-short:
+The budget filter adds what this pattern lacks: one place to declare budgets, routing, thresholds,
+the model rewrite, and a rejection in the client's dialect.
 
-- `requests_per_unit`, `limit_remaining` and the request-level `hits_addend` are `uint32`. Counted
-  in micro-units, a limit tops out near 4,295 currency units per window.
-- There is no defined read-only check. A request-level `hits_addend` of 0 counts as 1, and what a
-  descriptor-level 0 means is up to the service.
-- Limits live in the rate limit service's config, not in rows a budget owner edits. The
-  per-request `limit` override is `uint32` too.
-- It cannot steer routing. The rate limit filter runs after the AI filters and never clears the
-  route cache, and `limit_remaining` only reaches response headers.
+## 3. Details
 
-Rate limits stay the right tool for tokens or requests per minute.
+### 3.1 Pricing (`cost`)
 
-### 5.3 Recommended: AI filters and a budget service
+```
+uncached = max(0, input - cached - cache_creation)    # TokenUsage counts both inside input
+cost     = ceil(uncached       * input
+              + cached         * cached_input           # defaults to input
+              + cache_creation * cache_write            # defaults to input
+              + output         * output)                # output includes reasoning
+```
 
-- The decision runs inside the AI filter chain, after parsing and before the body is serialized,
-  so it can rewrite the model (J4).
-- Amounts are integer micro-units end to end, as `uint64`.
-- `GetBudgets` reads without charging, and `RecordSpend` charges once per request id. The ledger is
-  idempotent, and reservations can be added later without a new API.
-- The routing output is the existing `priority_group` override, so retries fall back across
-  targets with no router change.
-- Rejections speak the client's dialect.
-- The cost filter alone improves 5.1 and 5.2: both can read `envoy.ai.cost` instead of pricing
-  usage themselves.
+- **Lookup.** Keys are tried in order: `<cluster>/<model>` for a provider-specific price, then
+  `<model>`, then `default`. The served cluster is the one that answered. The model is the one in
+  the request body after the AI filters ran, then the one the response reports, so a fallback is
+  priced as the model that served it. Unpriced requests cost 0 and are counted, like agentgateway's
+  lookup-status metric, so a budget that silently charges nothing is visible.
+- **Missing usage.** A 2xx response can end without usable counts: the client cut the stream, the
+  provider sent none, the body was compressed (APM reads only identity-encoded bodies, hence the
+  `accept-encoding` removal in 1.2), or extraction failed and APM published a `FAILED` record.
+  All are charged the input estimate (`estimated_input_tokens × input`) when `request_info` has
+  `token_estimation`, and 0 otherwise.
+- **OpenAI streams** report usage only with `stream_options.include_usage`. With
+  `ensure_stream_usage` the cost filter sets it, as the transcoder already does for streams it sends
+  to an OpenAI-shaped backend; the client then sees one extra chunk with an empty `choices`.
+- **Untrusted counts.** Counts come from the upstream, hence the saturating subtraction and an
+  optional `max_cost_per_request`.
+- **The record.** `envoy.ai.cost` is a read-only filter state object. It prints as micro-units
+  through `:PLAIN`. Its fields `micros`, `input_tokens`, `output_tokens`, `total_tokens`, `model`
+  and `source` (`REPORTED`, `ESTIMATED`, `NONE`) are readable with `:FIELD:`, so access logs, the
+  stats access logger and `hits_addend` all read the same numbers.
 
-## 6. Design
-
-### 6.1 Terms
-
-- **Price**: currency units per million tokens, per model, for input, cached input, cache writes
-  and output. One unit per million tokens is one micro-unit per token, so a cost in micro-units is
-  `tokens × price`.
-- **Cost**: the integer micro-units (1e-6 of the operator's currency) that one request spent.
-- **Budget**: a named limit, such as `team-monthly`. The service keeps a state per subject: the
-  limit, the amount spent, and when the window ends.
-- **Subject**: whom a budget is for on this request, produced by a substitution format string.
-- **Target**: an upstream choice: a cluster, an optional model rewrite, and the budgets it draws
-  on.
-- **Eligible**: a target whose every budget has spent less than `spend_threshold` (default 100%) of
-  its limit. A budget without a limit never blocks.
-
-### 6.2 Request path
-
-AI filter order: `request_info`, `budget`, `cost`, then `transcoder` if present. The budget filter
-reads the model filter state that `request_info` sets; the cost filter runs after the budget filter
-so it prices the model that was chosen.
-
-1. An auth filter has already put the caller's identity in metadata or filter state.
-2. `budget` formats each subject. If any substitution in a subject has no value, that budget does
-   not apply and `subject_missing` counts it, just as a rate limit descriptor with a missing value
-   is dropped. Checking each substitution matters: a missing value otherwise renders as `-`, and a
-   composite subject such as `key/model` is never empty, so callers without a key would share one
-   subject.
-3. It picks the first `routing` entry whose `models` match `envoy.ai.model.request`. With no match
-   there is no routing, only the budgets.
-4. It collects the distinct (budget, subject) keys of `budgets` and of the entry's targets, sends
-   one `GetBudgets`, and awaits it with the configured timeout. No keys, no call.
-5. If any entry of `budgets` is spent, it rejects with 429.
-6. It walks the targets in order and keeps the eligible ones. If none is eligible, it rejects with
-   429.
-7. It keeps the eligible targets that send the same model as the first one, and writes them as a
-   `PriorityGroupsOverride` under `override_metadata_namespace`: one group per target, named after
-   the target and holding its cluster at weight 1 (a group with weight 0 is ignored and the route's
-   configured groups are used instead). A retry cannot change the body, so a target with a
-   different model is no fallback (6.9).
-8. It sets `envoy.ai.budget.target` to the first target's name. If that target names a `model`, it
-   rewrites the request's model.
-9. `cost` looks up the price of the model the request now carries and keeps it for completion.
-10. After the last AI filter, APM calls `refreshRouteCluster()`, then serializes and replays the
-    body. `priority_group` sends the initial attempt to the first target's cluster, and retries
-    move down the list.
-
-### 6.3 Completion
-
-APM's own `onStreamComplete()` calls the new `AiFilter::onStreamComplete()` of each AI filter in
-reverse chain order, before the access log runs, passing the final `TokenUsage` if one was
-published.
-
-1. `cost` computes the cost (6.4) and sets `envoy.ai.cost`.
-2. `budget` finds the served target: the first target of the override whose cluster is the
-   upstream cluster that answered. It sends `RecordSpend` with an id it generated for the request,
-   the distinct keys of `budgets` and of the served target, the cost, the priced model, the served
-   target, and the configured metadata namespaces. The call is fire-and-forget.
-
-What gets charged:
+### 3.2 What gets charged
 
 - Only a response that came from an upstream with a 2xx status (response code details
-  `via_upstream`). A local reply, including the budget filter's own 429 or a rejection by another
-  AI filter, and an upstream error are never charged. The hook still runs for those streams,
-  because the AI filters outlive a cancelled chain.
-- Each (budget, subject) once, even when it appears both in `budgets` and on the target, as
-  `team-monthly` does in 1.4.
-- Under an id the budget filter generates. `x-request-id` is not used: Envoy keeps a client's value
-  unless the request is an edge request, so a client could replay one id and have every later
-  request deduplicated away.
-- Nothing when there is no cost record or the cost is zero.
+  `via_upstream`). Local replies, including the budget filter's own 429, and upstream errors are
+  never charged; the completion hook still runs for them.
+- Each descriptor once, even when a budget appears both in `budgets` and on the target.
+- Under a subject only when every substitution in it has a value. A missing value would render as
+  `-`, so callers without a key would share one counter. The budget does not apply instead, and is
+  counted, the way a rate limit descriptor with a missing value is dropped.
 
-### 6.4 Pricing
+### 3.3 Rejection
 
-```
-uncached = max(0, input - cached - cache_creation)   # TokenUsage counts both inside input
-cost     = ceil(uncached       * input_price
-              + cached         * cached_input_price    # defaults to input_price
-              + cache_creation * cache_write_price     # defaults to input_price
-              + output         * output_price)         # output includes reasoning
-```
-
-- **Which model is priced.** First the model in the request body after the AI filters ran, then the
-  model the response reports, then `default_price`. An unpriced request costs 0 and `unpriced`
-  counts it. An operator who enforces budgets should set `default_price`; otherwise an unpriced
-  model is free.
-- **Missing usage.** A 2xx response can end without usable counts: the client cut the stream, the
-  provider sent none, the body was compressed (APM reads only identity-encoded bodies and counts
-  `unsupported_content_encoding`; the route in 1.4 strips `accept-encoding` for this reason), or
-  extraction failed and APM published a `FAILED` record without counts. All are handled alike: the
-  cost is the input estimate, `estimated_input_tokens × input_price`, when `request_info` has
-  `token_estimation` set, and 0 otherwise. The record's `source` says `ESTIMATED` or `NONE`.
-- **Untrusted counts.** Counts come from the upstream and are not checked for consistency, hence
-  the saturating subtraction. `max_cost_per_request`, when set, caps one request's cost, so one
-  inflated usage report cannot empty a budget.
-- **OpenAI streams.** An OpenAI Chat Completions stream reports usage only if the request sets
-  `stream_options.include_usage`; without it a streamed request is charged only its input
-  estimate. With `ensure_stream_usage`, the cost filter sets it on OpenAI Chat streaming requests,
-  as the transcoder already does for streams it sends to an OpenAI-shaped backend
-  (`transcoding_engine.cc:766-769`). The client then receives one extra chunk with an empty
-  `choices`. Anthropic, Gemini and OpenAI Responses streams always carry usage.
-- **Rounding.** `ceil` never undercounts; it overcounts by less than one micro-unit per request.
-- **The record.** `envoy.ai.cost` is a read-only filter state object with life span `FilterChain`.
-  It serializes as the micro-unit count, so `%FILTER_STATE(envoy.ai.cost:PLAIN)%` prints e.g.
-  `1234`. The fields `micros`, `model` and `source` are readable with `:FIELD:`, and gRPC access
-  logs receive it as an `envoy.data.ai.v3.Cost` message through `filter_state_objects_to_log`.
-
-### 6.5 Rejection
-
-The reply is a 429 with `retry-after` (seconds until the earliest window end that would admit the
-request), `x-should-retry: false`, response code details `ai_budget_exhausted`, and the error body
-of the client's API:
+The reply is a 429 with `retry-after` (the peek's `duration_until_reset`), `x-should-retry: false`,
+response code details `ai_budget_exhausted`, and the error body of the client's API:
 
 | Client API | Body |
 |---|---|
 | OpenAI Chat Completions, Responses | `{"error": {"message": M, "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}` |
 | Anthropic Messages | `{"type": "error", "error": {"type": "rate_limit_error", "message": M}}` |
 | Gemini | `{"error": {"code": 429, "message": M, "status": "RESOURCE_EXHAUSTED"}}` |
-| unknown | `M` as plain text |
 
-`M` names the budget and when its window ends, never the limit, the spend or the subject. The
-connection manager's `local_reply_config` still applies on top.
+`M` names the budget and when it resets, never the limit, the spend or the subject.
 
-### 6.6 Failures
+### 3.4 Failures
 
-| Event | Behavior | Counter |
-|---|---|---|
-| `GetBudgets` fails or times out | `failure_mode_deny: false` (default): admit, with every target in configured order. `true`: 503 | `service_error`, `failure_mode_allowed` |
-| A key with no limit in the service | does not limit | none |
-| A substitution in a subject has no value | that budget does not apply | `subject_missing` |
-| The model matches no `routing` entry | budgets only; the route is untouched | none |
-| The served cluster matches no target | only `budgets` are charged | `target_unmatched` |
-| A local reply or an upstream error | not charged | none |
-| A 2xx response without usable counts | the input estimate is charged (6.4) | `cost.estimated` |
-| No `envoy.ai.cost` at completion | nothing is recorded | `cost_missing` |
-| `RecordSpend` fails | dropped; the ledger undercounts | `spend_record_error` |
+| Event | Behavior |
+|---|---|
+| The RLS fails or times out | `failure_mode_deny: false` (default) admits with every target in order; `true` replies 503 |
+| A budget has no limit in the RLS | it never blocks |
+| The model matches no `models` entry | request budgets only; the route is untouched |
+| The served cluster matches no target | only request budgets are charged |
+| A local reply or an upstream error | not charged |
 
-Failing open matches the rate limit filter's default. A budget is a financial guardrail, not an
-access control, and an outage of the budget service should not take the gateway down with it.
-Operators who need a hard stop set `failure_mode_deny`, the counterpart of LiteLLM's
-`fail_closed_budget_enforcement`.
+Failing open matches the rate limit filter's default: a budget is a financial guardrail, and an
+outage of the counter store should not take the gateway down.
 
-### 6.7 How firm a budget is
+### 3.5 Limits of the stock rate limit service
 
-Admission reads spend when the request starts; the cost is added when the response ends. A budget
-can therefore be overspent by the cost of requests that were admitted before it ran out and were
-still running, roughly concurrency × cost per request. Twenty concurrent agents at $0.50 per call
-can overshoot by about $10. LiteLLM without reservations behaves the same way. Reservations
-(section 10) close most of the gap: admission reserves the request's maximum cost, and completion
-releases it.
+- `requests_per_unit` is `uint32`. Counted in micro-dollars, a limit tops out near $4,295 per
+  window; tokens fit easily. Larger money budgets need an RLS with 64-bit limits. The protocol
+  already carries a `uint64` per-descriptor `hits_addend`, so only the server changes.
+- Windows are fixed and aligned to the Unix epoch, as in agentgateway. A month is 30 days unless
+  the server runs with `USE_CALENDAR_MONTH_RATE_LIMIT`.
+- Refunds (`is_negative_hits`) exist, which is what reservations need later (section 8).
 
-### 6.8 Trust
+### 3.6 Trust
 
 - Subjects must come from something the client cannot forge: ext_authz metadata, JWT claims,
-  `api_key_auth`'s forwarded client header (it overwrites whatever the client sent), or filter
-  state set by a trusted filter. A client-supplied header as subject lets a caller spend someone
-  else's budget or dodge their own.
-- Token counts are provider-reported. A budget against an untrusted upstream can be gamed by that
-  upstream; `max_cost_per_request` bounds the damage per request.
-- Nothing the client sends decides what gets charged: the spend id is generated by Envoy (6.3).
-- The budget service is a write path for money. Use mTLS between Envoy and the service, and
-  authenticate its admin endpoints.
+  `api_key_auth`'s forwarded client header (it overwrites the client's), or trusted filter state.
+- Token counts are provider-reported, so a budget against an untrusted upstream can be gamed by it.
+- The rate limit service is now a write path for money: use mTLS.
 
-### 6.9 Interactions
+## 4. LiteLLM, agentgateway and this design
 
-- **Transcoder.** Budget and cost run before it, on the client's dialect; the transcoder carries
-  the model through. Usage is extracted from the provider's response before any response
-  transcoding, so the cost reflects what the provider reported.
-- **Body rewrites.** The model rewrite and `ensure_stream_usage` edit the parsed body, so they need
-  `reserialize_body` at its default, `ALWAYS`. The MVP rewrites the model only for APIs that carry
-  it in the body (OpenAI, Anthropic); Gemini names it in the path, which a target cannot rewrite
-  yet.
-- **Retries and model fallback.** In the MVP the body is rewritten once, for the first target, so
-  fallback by retry is limited to targets that send the same model (6.2, step 7). Rewriting per
-  attempt belongs to the upstream APM and the model fallback work, which can take the same ordered
-  target list as input.
-- **Attempts.** The downstream APM only sees the attempt the router selected. A failed or hedged
-  attempt that the provider still billed is not charged. Per-attempt accounting belongs in the
-  upstream APM, but upstream filters never get `onStreamComplete()`: an upstream request only calls
-  `destroyFilters()` (`upstream_request.cc:199`). There APM would have to run the hook from
-  `onDestroy()`.
-- **Rate limits.** Complementary: rate limits for tokens or requests per minute, budgets for money
-  per day or month.
+| | LiteLLM | agentgateway (v1.6.0) | This design |
+|---|---|---|---|
+| Model table | `model_list` | `llm.models`, `virtualModels` | `budget.models` and clusters |
+| Prices | built-in map, USD per token | built-in catalog and overlays, per 1M tokens, context tiers | `cost.prices`, per 1M tokens, optional per cluster |
+| Who a budget is for | key, team, user, end user, tag, provider, deployment | API key (USD); any CEL key for token limits | any subject a format string can build |
+| Units | USD; tokens and requests separately | requests, tokens, USD | `REQUESTS`, `TOKENS`, `COST`, one path |
+| Counters | Postgres, with Redis for cross-instance spend | memory, flushed to SQLite or Postgres; RLS for remote limits | any RLS, e.g. `envoyproxy/ratelimit` with Redis |
+| Before and after | check, charge after; optional reservation | check, charge after; token estimate trued up | peek, charge after; refunds allow reservations later |
+| Skip spent providers | yes | not found | yes |
+| Cheaper model when a budget runs low | not found | not found | yes, `below` thresholds |
+| Failover | fallbacks, cooldown on 429 | priority groups, eviction | priority groups, retries on 5xx and 429 |
+| Rejection | 400, 401 or 429, varies | 429 and `Retry-After` | 429 in the client's dialect, `retry-after`, `x-should-retry` |
 
-### 6.10 Observability
+## 5. What exists today
 
-- Counters under the APM stat prefix:
-  - `cost.{priced, unpriced, estimated, usage_missing}`
-  - `budget.{allowed, rerouted, rejected, service_error, failure_mode_allowed, subject_missing,
-    target_unmatched, cost_missing, spend_recorded, spend_record_error}`
-- Access log fields: `%FILTER_STATE(envoy.ai.cost:PLAIN)%`, the priced (served) model
-  `%FILTER_STATE(envoy.ai.cost:FIELD:model)%`, the requested model
-  `%FILTER_STATE(envoy.ai.model.request:PLAIN)%`, the target chosen for the initial attempt
-  `%FILTER_STATE(envoy.ai.budget.target:PLAIN)%`, and the cluster that served `%UPSTREAM_CLUSTER%`.
-- Spend metrics with no new code: a stats access logger counter with
-  `value_format: "%FILTER_STATE(envoy.ai.cost:PLAIN)%"`, tagged by team and by the priced model.
-  Tagging by the requested model would count a downgraded request against the model it asked for.
+- **APM** parses the body before later filters see the request and runs AI filters, which can
+  await, rewrite the body and reject (`ai_filter.h`). `request_info` publishes the model as the
+  `envoy.ai.model.request` filter state. Token usage is published at a clean end of stream as typed
+  metadata `envoy.ai.token_usage`, never on a reset or non-2xx response.
+- **Missing in APM:** a price, a hook that tells AI filters the stream completed (upstream filters
+  never get `onStreamComplete()` either), a route refresh after the AI filters, and local replies
+  with headers.
+- **The RLS client** (`source/extensions/filters/common/ratelimit/`) already sends per-descriptor
+  `hits_addend`, `is_negative_hits` and limit overrides, and returns per-descriptor statuses. The
+  rate limit filter keeps its stream-done call alive past filter teardown (`OnStreamDoneCallBack`).
+- **`priority_group`** re-selects on every `refreshRouteCluster()` and reads a per-request override
+  from metadata; an override group needs weight 1 or it is ignored.
+- **`envoyproxy/ratelimit`** peeks on an explicit per-descriptor 0, refunds negative hits, accepts
+  per-request limit overrides, and has a `quota_mode` that returns the backends still under quota.
 
-## 7. API sketches
-
-### 7.1 Cost filter
+## 6. API sketches
 
 ```proto
 package envoy.extensions.http.ai_filters.cost.v3;
@@ -540,235 +412,155 @@ package envoy.extensions.http.ai_filters.cost.v3;
 message Cost {
   // Currency units per million tokens.
   message Price {
-    // Exact model names, matched against the model the request is sent with, then the model the
-    // response reports.
-    repeated string models = 1;
-    double input_per_million = 2 [(validate.rules).double = {gte: 0}];
-    double output_per_million = 3 [(validate.rules).double = {gte: 0}];
-    // Default to input_per_million.
-    google.protobuf.DoubleValue cached_input_per_million = 4;
-    google.protobuf.DoubleValue cache_write_per_million = 5;
+    double input = 1 [(validate.rules).double = {gte: 0}];
+    double output = 2 [(validate.rules).double = {gte: 0}];
+    // Default to input.
+    google.protobuf.DoubleValue cached_input = 3;
+    google.protobuf.DoubleValue cache_write = 4;
   }
 
-  repeated Price prices = 1;
-
-  // For models no entry names. Unset leaves them unpriced, at cost 0.
-  Price default_price = 2;
+  // Keyed by "<cluster>/<model>", "<model>" or "default".
+  map<string, Price> prices = 1;
 
   // Sets stream_options.include_usage on OpenAI Chat Completions streaming requests.
-  bool ensure_stream_usage = 3;
+  bool ensure_stream_usage = 2;
 
-  // Caps one request's cost, in currency units. Unset: no cap.
-  google.protobuf.DoubleValue max_cost_per_request = 4;
+  // Caps one request's cost, in currency units.
+  google.protobuf.DoubleValue max_cost_per_request = 3;
 }
 ```
-
-### 7.2 Budget filter
 
 ```proto
 package envoy.extensions.http.ai_filters.budget.v3;
 
 // [#extension: envoy.http.ai_filters.budget]
 message Budget {
-  message BudgetRef {
-    // The budget's name in the budget service.
+  enum Charge {
+    COST = 0;
+    TOKENS = 1;
+    REQUESTS = 2;
+  }
+
+  enum Mode {
+    ENFORCE = 0;
+    AUDIT = 1;
+  }
+
+  message Limit {
+    // Format string that yields the limit in the budget's units.
+    string amount = 1 [(validate.rules).string = {min_len: 1}];
+    type.v3.RateLimitUnit unit = 2 [(validate.rules).enum = {defined_only: true}];
+  }
+
+  message BudgetDef {
+    // The RLS descriptor key.
     string name = 1 [(validate.rules).string = {min_len: 1}];
-    // Substitution format string naming whom the budget is for, e.g.
-    // "%DYNAMIC_METADATA(envoy.filters.http.ext_authz:team_id)%". If any substitution has no
-    // value, the budget does not apply to the request.
+    // Format string for the descriptor value. If any substitution has no value, the budget does
+    // not apply to the request.
     string subject = 2 [(validate.rules).string = {min_len: 1}];
-    // Admits while spend is below this share of the limit. Defaults to 100%.
-    type.v3.Percent spend_threshold = 3;
+    Charge charge = 3;
+    Mode mode = 4;
+    // Overrides the RLS limit for this request.
+    Limit limit = 5;
+  }
+
+  message BudgetRef {
+    // A request budget's name, or any other name for a budget counted per target cluster.
+    string name = 1 [(validate.rules).string = {min_len: 1}];
+    // Eligible while spend is below this share of the limit. Defaults to 100%.
+    type.v3.Percent below = 2;
   }
 
   message Target {
-    string name = 1 [(validate.rules).string = {min_len: 1}];
-    string cluster = 2 [(validate.rules).string = {min_len: 1}];
+    string cluster = 1 [(validate.rules).string = {min_len: 1}];
     // Replaces the request's model when this target serves the initial attempt.
-    string model = 3;
-    repeated BudgetRef budgets = 4;
+    string model = 2;
+    repeated BudgetRef budgets = 3;
   }
 
-  message Routing {
-    // Matched against envoy.ai.model.request. Empty matches every model.
-    repeated type.matcher.v3.StringMatcher models = 1;
-    repeated Target targets = 2 [(validate.rules).repeated = {min_items: 1}];
+  message Targets {
+    repeated Target targets = 1 [(validate.rules).repeated = {min_items: 1}];
   }
 
-  config.core.v3.GrpcService budget_service = 1 [(validate.rules).message = {required: true}];
-
-  // When the budget service cannot be reached: admit (false) or reply 503 (true).
-  bool failure_mode_deny = 2;
+  config.ratelimit.v3.RateLimitServiceConfig rate_limit_service = 1
+      [(validate.rules).message = {required: true}];
+  string domain = 2 [(validate.rules).string = {min_len: 1}];
+  bool failure_mode_deny = 3;
 
   // Checked and charged on every request.
-  repeated BudgetRef budgets = 3;
+  repeated BudgetDef budgets = 4;
 
-  // The first entry whose models match is used.
-  repeated Routing routing = 4;
-
-  // Where the PriorityGroupsOverride is written. Defaults to "envoy.ai.budget".
-  string override_metadata_namespace = 5;
-
-  // Metadata namespaces sent with RecordSpend, e.g. envoy.ai.request_info, envoy.ai.token_usage.
-  repeated string spend_metadata_namespaces = 6;
+  // Keyed by the requested model; "*" matches any model not listed.
+  map<string, Targets> models = 5;
 }
 ```
 
-### 7.3 Budget service
+APM core, all small and useful beyond budgets:
 
-```proto
-package envoy.service.budget.v3;
+- `AiFilter::onStreamComplete(const AiStreamCompletion&)`, a no-op by default, with the
+  `StreamInfo` and the published `TokenUsage` (null when none). APM's `onStreamComplete()` calls it
+  in reverse chain order, before the access log.
+- A way for an AI filter to ask for `refreshRouteCluster()` after the chain, instead of the
+  `refresh_route_cluster` knob on the `apm-refresh-route-cluster` branch, so routing works with no
+  extra setting.
+- `LocalReplier` takes extra headers, response code details and an error type; with a type and a
+  known API, the body is that API's error JSON (3.3).
 
-// Reads and charges spend budgets. Amounts are micro-units of the operator's currency.
-service BudgetService {
-  // Returns the state of each budget without charging it. Called before a request is routed.
-  rpc GetBudgets(GetBudgetsRequest) returns (GetBudgetsResponse);
-
-  // Adds a finished request's cost to each budget. The service applies a request_id once.
-  rpc RecordSpend(RecordSpendRequest) returns (RecordSpendResponse);
-}
-
-message BudgetKey {
-  string budget = 1;
-  string subject = 2;
-}
-
-message GetBudgetsRequest {
-  repeated BudgetKey keys = 1;
-}
-
-message BudgetState {
-  // Unset: no limit, so the budget never blocks.
-  google.protobuf.UInt64Value limit_micros = 1;
-  uint64 spent_micros = 2;
-  // When spend resets. Unset for a budget without a window.
-  google.protobuf.Timestamp resets_at = 3;
-}
-
-message GetBudgetsResponse {
-  // One per requested key, in request order.
-  repeated BudgetState states = 1;
-}
-
-message RecordSpendRequest {
-  // Generated by Envoy for the request; the service applies each id once.
-  string request_id = 1;
-  // Distinct keys.
-  repeated BudgetKey keys = 2;
-  uint64 cost_micros = 3;
-  string model = 4;
-  string target = 5;
-  config.core.v3.Metadata metadata = 6;
-}
-
-message RecordSpendResponse {
-}
-```
-
-Nothing in the service is about tokens, so a non-AI route with another cost producer could use it
-too. Windows (calendar day or month, rolling, none) are the service's business; Envoy only compares
-spend with the limit.
-
-### 7.4 APM core
-
-- `AiFilter::onStreamComplete(const AiStreamCompletion&)`, a no-op by default. `AiStreamCompletion`
-  carries the `StreamInfo` and a pointer to the published `TokenUsage`, null when there is none; a
-  `FAILED` record is passed as published.
-  `AiProtocolManagerFilter::onStreamComplete()` calls it in reverse chain order, only on streams
-  whose AI filter chain ran. The MVP covers the downstream placement only (6.9, Attempts).
-- `RequestHandling.refresh_route_cluster`, from `apm-refresh-route-cluster`: after the last AI
-  filter and before the replay, call `refreshRouteCluster()`.
-- `LocalReplier` takes extra response headers, response code details and an error type. When a type
-  is given and the request's API is known, the body is that API's error JSON (6.5). Existing
-  callers keep their plain-text body.
-
-## 8. Reference budget service
-
-It lives outside the Envoy repo, next to the other sandboxes in envoyproxy/examples: Envoy, the
-service and Postgres in one `docker compose up`, like LiteLLM's quick start.
-
-```sql
-CREATE TABLE budget (
-  name         TEXT   NOT NULL,
-  subject      TEXT   NOT NULL,        -- '*' is the default for every subject
-  limit_micros BIGINT NOT NULL,
-  window_kind  TEXT   NOT NULL,        -- 'day', 'month' or 'total'
-  PRIMARY KEY (name, subject));
-
-CREATE TABLE budget_spend (
-  name         TEXT        NOT NULL,
-  subject      TEXT        NOT NULL,
-  window_start TIMESTAMPTZ NOT NULL,
-  spent_micros BIGINT      NOT NULL DEFAULT 0,
-  PRIMARY KEY (name, subject, window_start));
-
-CREATE TABLE spend_log (
-  request_id  TEXT        PRIMARY KEY,
-  at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  cost_micros BIGINT      NOT NULL,
-  model       TEXT,
-  target      TEXT,
-  keys        JSONB       NOT NULL,
-  metadata    JSONB);
-```
-
-- `RecordSpend` is one transaction: insert into `spend_log` with `ON CONFLICT DO NOTHING`, and only
-  when the row is new, add the cost once to each distinct key's `budget_spend` row for the current
-  window.
-- `GetBudgets` reads the `budget` row, falling back to `*`, and the current window's spend.
-- Admin endpoints set limits and read spend (1.4). A `/keys` endpoint plus an ext_authz `Check`
-  give LiteLLM-style virtual keys.
-- Putting Redis in front of Postgres is the service's own scaling choice; Envoy does not see it.
-
-## 9. MVP breakdown
-
-Each PR is reviewable on its own; together they cover J1 to J5.
+## 7. MVP breakdown
 
 | # | PR | Scope | Unlocks |
 |---|---|---|---|
-| 1 | `ai_protocol_manager: add an AI filter stream-complete hook` | `AiFilter::onStreamComplete`, `AiStreamCompletion`, call order; tests for reset, non-2xx and missing usage | 2, 5 |
-| 2 | `ai_filters: add a cost filter` | `cost.proto`, `envoy.data.ai.v3.Cost`, pricing, `envoy.ai.cost`, `ensure_stream_usage`, stats, docs | J1 |
-| 3 | `ai_protocol_manager: refresh the route cluster after the AI filters` | the existing `apm-refresh-route-cluster` branch | 6 |
-| 4 | `ai_protocol_manager: let AI filters reply with headers and a dialect error body` | `LocalReplier` change, the three error shapes, response code details | 5 |
-| 5 | `ai_filters: add a budget filter` | `BudgetService` API; `budget.proto` without `routing`; `GetBudgets` awaited with a timeout; 429; failure modes; the charging rules of 6.3; `RecordSpend` from a per-worker reporter that outlives the stream; stats; integration test against a fake budget service | J2 |
-| 6 | `ai_filters: route by budget` | `routing`, eligibility and thresholds, `PriorityGroupsOverride`, `envoy.ai.budget.target`, model rewrite, served-target attribution; integration test with `priority_group` and retries | J3, J4 |
-| 7 | examples: AI budget sandbox | reference service, schema, compose file, walkthrough | J5, quick start |
+| 1 | `ai_protocol_manager: add an AI filter stream-complete hook` | hook, call order; tests for reset, non-2xx and missing usage | 2, 5 |
+| 2 | `ai_filters: add a cost filter` | prices, `envoy.ai.cost`, `ensure_stream_usage`, lookup stats | J1; J2 and J5 with the stock rate limit filter |
+| 3 | `ai_protocol_manager: let AI filters refresh the route cluster` | builds on `apm-refresh-route-cluster` | 6 |
+| 4 | `ai_protocol_manager: let AI filters reply with headers and a dialect error body` | `LocalReplier`, three error shapes | 5 |
+| 5 | `ai_filters: add a budget filter` | budgets, `charge`, `mode`, limit override, peek and charge over the RLS client, 429, failure modes; integration test against a fake RLS | J2, J5 |
+| 6 | `ai_filters: route by budget` | `models`, eligibility, `below`, `envoy.ai.budget`, model rewrite; integration test with `priority_group` and retries | J3, J4 |
 
-PRs 1 and 2 give spend tracking on their own, plus money-denominated rate limits as in 5.2. PRs 3
-and 4 can land in parallel with 2. PR 5 needs 1, 2 and 4; PR 6 needs 3 and 5.
+There is no new service API and nothing to deploy besides the stock rate limit service and Redis.
+PRs 1 and 2 are useful on their own; 3 and 4 can land in parallel with them.
 
-Tests follow the repo's rules: unit tests with `StrictMock` and simulated time, integration tests
-with a fake upstream for the budget service in the style of `ratelimit_integration_test.cc`, and
-the sandbox against a real provider end to end.
+## 8. After the MVP
 
-## 10. After the MVP
+- **Reservations.** Peek with the request's maximum cost as `hits_addend`, then settle the
+  difference at completion with `is_negative_hits`. This closes most of the overshoot in 2.2 using
+  the same protocol.
+- **Per-attempt rewriting** of the model, path and credentials in the upstream APM, so a fallback
+  can change the model. It is the same ordered target list the model fallback work needs.
+- **Prices as data:** a price file through a `DataSource`, importable from LiteLLM's map or
+  models.dev, with context-length tiers and service tiers.
+- **A local cache of peek results**, so a busy subject stops costing one RLS call per request.
+- **Generic HTTP form.** The budget filter's limit and route steps are not AI-specific. Once
+  rewriting moves upstream, they could become an HTTP filter usable by any metered API.
 
-- **A budget cache.** A process-wide cache of `BudgetState` with a TTL the service hints at, spend
-  accumulated locally between refreshes, and coalesced lookups, so a busy subject stops costing one
-  RPC per request.
-- **Reservations.** `GetBudgets` reserves the request's maximum cost (input estimate × input price
-  plus `max_output_tokens` × output price) under its request id, and `RecordSpend` releases it. The
-  price is needed at admission, so the price list may have to move where both filters can read it
-  (open question 2).
-- **Batched, retried `RecordSpend`** with a bounded queue; the request id keeps retries safe.
-- **Per-attempt accounting and rewriting** in the upstream APM, so failed and hedged attempts are
-  charged and a fallback can change the model.
-- **Remaining-budget response headers**, and the cost in trailers or a final SSE comment for
-  clients that want it.
-- **A mid-stream cutoff** for a stream that outruns its budget.
-- **Pricing**: per-cluster prices from cluster metadata, long-context tiers, batch and service
-  tiers, cache-duration variants, a price file from a `DataSource`, and removing the usage chunk
-  that `ensure_stream_usage` added when the client did not ask for it.
-- **An HTTP/JSON transport** for the budget service, in line with the AI-native callout in #44681.
+## 9. What changed from revision 1
 
-## 11. Open questions
+- **Counters:** a new `BudgetService` gRPC API with a reference server → the existing RLS protocol
+  and `envoyproxy/ratelimit`.
+- **Units:** money only → one `charge` rule for requests, tokens and money.
+- **Configuration:** subjects repeated on every target, plus explicit `budgets` and `routing`
+  lists → budgets named once and referenced by name, and a `models` map. The routing knob
+  (`refresh_route_cluster`) is gone.
+- **Routing output:** a `priority_group` override only → one `envoy.ai.budget` signal read by both
+  `priority_group` and `quota_aware`.
+- **Ledger:** `RecordSpend` rows → access logs that carry `envoy.ai.cost`.
+- **Kept from revision 1:** the cost filter, the charging rules from its review (3.2), dialect
+  rejections, and the three APM core hooks.
 
-1. API home: `envoy.service.budget.v3`, which is generic, or `envoy.service.ai.budget.v3`?
-2. The price list: in the cost filter, as proposed, or in the APM config, where the budget filter
-   could also read it for reservations?
-3. Targets name clusters, as proposed, which keeps one source of truth and exact attribution. Or
-   they reference groups configured on the route, which keeps routing in route config but needs
-   group membership for attribution.
-4. Failure mode default: open, like the rate limit filter?
-5. Rejection: 429 with OpenAI's `insufficient_quota`, as proposed, or 402?
-6. Missing usage: charge the input estimate, as proposed, zero, or a reservation?
+Considered and not chosen:
+
+- **ext_authz plus access logs** only: works for J2 and J3 today, but cannot downgrade the model,
+  and every operator rewrites pricing.
+- **A dedicated budget service**, as in revision 1: worth adding only if the RLS protocol proves
+  insufficient, for example for a per-request ledger written synchronously.
+
+## 10. Open questions
+
+1. Should the budget filter grow into a generic HTTP filter now, or after per-attempt rewriting
+   exists upstream?
+2. Targets name clusters. Should they also be able to name `quota_aware` host ids, for deployments
+   that put every provider in one cluster?
+3. Failure mode default: open, like the rate limit filter. agentgateway defaults to closed.
+4. Rejection: 429 with OpenAI's `insufficient_quota`, or 402?
+5. Should `cost` prices be a map keyed by `<cluster>/<model>`, or a list with explicit `cluster` and
+   `models` fields?
