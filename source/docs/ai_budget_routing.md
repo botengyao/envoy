@@ -3,19 +3,24 @@
 Status: proposal, no code. Written against upstream/main `9c3d9aff1a`. Extension, field and filter
 state names are proposals; everything not marked as new exists today.
 
-Revision 7 (2026-10-07):
+Revision 8 (2026-10-07):
 
-- **The model list belongs to the route, not to an AI filter.** `model_table` keeps the seeding
-  logic, but reads its table from per-route config, a new general way to configure any AI filter
-  per route. A listener-level table remains as a default.
-- **Each candidate says what it targets:** a `cluster`, a `host` in a cluster, or an `authority`
-  for a dynamic forward proxy (DFP) cluster. The commit hands each kind to the matching routing
-  mechanism.
-- **One configuration covers three topologies:** several provider clusters, one DFP cluster, and a
-  single provider.
+- **Per-route AI filter config overrides an AI filter's config.** An AI filter's own config lives
+  inside the APM HTTP filter. Per-route config resolves per AI filter, so the most specific level
+  wins for each filter separately. There is no merging.
+- **The callout API is `envoy.service.ai.callout.v3`.** It is generic rather than quota-specific,
+  and built to be extended:
+  - `Decide` answers with an ordered list of typed actions;
+  - Envoy advertises the actions it supports;
+  - an action the service marks `required` fails the call when Envoy cannot apply it.
+- **`Decide` can add candidates,** behind a per-route allowlist of targets.
 
-Kept from revision 6: the limit check is an APM callout (`Decide` before routing, `Report` after the
-response) to a quota and budget service that owns keys, budgets, prices and the ledger.
+The design is unchanged otherwise:
+
+- the limit check is an APM callout, `Decide` before routing and `Report` after;
+- policy lives in the quota and budget service;
+- the model list is per-route config of the `model_table` AI filter;
+- candidates target a `cluster`, a `host` or an `authority`.
 
 ## Summary
 
@@ -56,9 +61,10 @@ flowchart LR
 | 9. Try a limit first | admin | adds an org-wide cap in dry-run | what would have been blocked | none | `Audit` |
 | 10. Keep a tenant in its region | admin | allows EU teams only EU deployments | EU traffic stays in the EU | `allowed_model_region` | conditional routing |
 | 11. Budget a single provider | admin | puts budgets on an Anthropic-only route | the same limits, with no routing choice | key budgets | per-key `budgets` |
+| 12. Give a tenant its own deployment | admin | registers tenant A's dedicated Azure deployment in the service | tenant A's requests go there first; others never do | per-team model access | not found |
 
-Policy (CUJs 2-5 and 7-11) lives in the service. Envoy config changes only when targets change
-(CUJs 1, 6).
+Policy (CUJs 2-5 and 7-12) lives in the service. Envoy config changes only when the set of targets a
+route may use changes (CUJs 1, 6).
 
 ## 2. Envoy design
 
@@ -75,33 +81,40 @@ flowchart TD
 | Record | Holds | Produced by | Status |
 |---|---|---|---|
 | `envoy.ai.request_info` (typed metadata) | API, model, stream, `max_output_tokens`, `estimated_input_tokens` | `request_info` | exists |
-| `envoy.ai.caller` (filter state) | key, user, team, org, end user, attributes | an identity filter, or the callout from `Decide` | new |
-| `envoy.ai.upstream.candidates` (filter state) | where the request may go, and who excluded what | `model_table`, then policies; sealed by the commit | new |
+| `envoy.ai.caller` (filter state) | key, user, team, org, end user, attributes | an identity filter, or the callout | new |
+| `envoy.ai.upstream.candidates` (filter state) | where the request may go, and who changed what | `model_table`, then policies; sealed by the commit | new |
 | `envoy.ai.token_usage` (typed metadata) | the usage the provider reported | APM, at a clean end of stream | exists |
 
 ### 2.2 Where the model list lives
 
-| Home | Scope | Updated through | Beside the routing it drives | Verdict |
-|---|---|---|---|---|
-| The AI filter's own config | every route on the listener | the listener (or ECDS) | no; cluster names live in two places | a default only |
-| **Per-route AI filter config** | one route | RDS | yes: beside the cluster specifier, retry policy and timeouts | **the table** |
-| Cluster metadata | one provider | CDS | partly: what a cluster serves, not the order | per-provider facts, later |
-| The cluster specifier's config | one route | RDS | yes | no: specifiers run before the body is parsed, and AI filters cannot read their config |
+| Home | Scope | Updated through | Verdict |
+|---|---|---|---|
+| The AI filter's config, inside the APM HTTP filter | every route through that filter chain | LDS, or ECDS for the APM filter | a default; usually empty |
+| **Per-route AI filter config** | one route, virtual host or route configuration | RDS | **the table** |
+| Cluster metadata | one provider | CDS | what a cluster serves, not the order; per-provider facts later |
+| The cluster specifier's config | one route | RDS | not workable: specifiers run before the body is parsed, and AI filters cannot read their config |
 
-The list is routing data: which upstreams may serve this route's models, and in what order. Envoy
-keeps routing data in the route. There it is scoped per API, per virtual host or tenant, and updated
-through RDS without touching listeners. The seeding logic is AI work, though: it needs the parsed
-model and must run before the policies. So `model_table` stays an AI filter and takes its table from
-the route.
+The list is routing data, so it lives with the route, scoped per API, virtual host or tenant and
+updated through RDS. Seeding needs the parsed model and must run before the policies, so it stays in
+the `model_table` AI filter, which reads the route's table.
 
-That needs one general APM capability: per-route config for AI filters, keyed by filter name, as
-`typed_per_filter_config` does for HTTP filters. The callout and the transcoder can use it later the
-same way.
+### 2.3 Per-route config for AI filters
 
-### 2.3 Candidates and target kinds
+`AiProtocolManagerPerRoute.filters` maps an AI filter's name to its per-route config, as
+`typed_per_filter_config` does for HTTP filters.
 
-`envoy.ai.upstream.candidates` is an ordered list. Every candidate names exactly one target, and all
-candidates for one model use the same kind:
+- **Resolution is per AI filter.** APM walks every level that carries per-route config
+  (`Http::Utility::getAllPerFilterConfig`): route configuration, virtual host, route. For each AI
+  filter it takes the most specific level that has an entry. A route that only overrides the
+  callout still inherits its virtual host's model table.
+- **No merging.** A per-route entry replaces the AI filter's config for that request. Merging two
+  model tables would raise precedence questions with no good answer, such as which `"*"` or which
+  candidate order wins.
+- **A filter may have its own per-route type.** The callout uses `CalloutPerRoute`, not `Callout`.
+
+### 2.4 Candidates and target kinds
+
+`envoy.ai.upstream.candidates` is an ordered list of one kind of target:
 
 | Field | Example | Meaning |
 |---|---|---|
@@ -112,12 +125,13 @@ candidates for one model use the same kind:
 | `llm_protocol` | `ANTHROPIC_MESSAGES` | the upstream API, for the transcoder's dynamic target work |
 | `attributes` | `region: eu` | free-form, for policies |
 | `excluded` | `{by: callout, reason: "provider budget spent"}` | empty while eligible |
+| `added_by` | `callout` | set when a policy added the candidate |
 
-Policies exclude with a reason, reorder, or annotate. They never delete, so
-`%FILTER_STATE(envoy.ai.upstream.candidates:PLAIN)%` in an access log says why a request went where
-it did.
+Policies exclude with a reason, reorder, annotate, or add, where the route allows it. They never
+delete, so `%FILTER_STATE(envoy.ai.upstream.candidates:PLAIN)%` in an access log says why a request
+went where it did.
 
-### 2.4 The commit
+### 2.5 The commit
 
 After the last AI filter, if a list exists, APM:
 
@@ -137,48 +151,89 @@ After the last AI filter, if a list exists, APM:
 6. sets `envoy.ai.backend.upstream` to the first target, for logs and the `matcher` cluster
    specifier.
 
-### 2.5 Topologies
+### 2.6 Topologies
 
 | Topology | Model list | Candidate kind | Route | Credentials |
 |---|---|---|---|---|
 | Several provider clusters | per route | `cluster` | `priority_group` + `refresh_cluster_on_retry` | per cluster (`credential_injector`) |
 | One DFP cluster (a fleet of one API) | per route | `authority` | `cluster: <dfp>` and the DFP filter | shared by the fleet |
 | One cluster of static deployments | per route | `host` | `cluster: <pool>` + `previous_hosts`, `previous_priorities` | shared; SNI per host |
-| A single provider | none | — | `cluster: <provider>` | per cluster |
+| A single provider | none, or added by the service | — | `cluster: <provider>` | per cluster |
 
-A single provider needs no list. The callout still checks budgets and reports usage; with no
-candidates, `Decide` only allows or denies.
-
-### 2.6 The callout
+### 2.7 The callout
 
 `envoy.http.ai_filters.callout` is an AI filter:
 
-- **`Decide`, during decode.** It sends `request_info`, the caller, the eligible candidates and the
-  configured request headers. It applies the answer: exclusions and order go to the candidates, the
-  caller to `envoy.ai.caller`, headers to the response. A deny becomes a local reply in the client's
-  API.
-- **`Report`, at completion.** It sends the token usage, the served target, the status and whether
-  the stream finished. The call is fire-and-forget.
+- **`Decide`, during decode.** It sends:
+  - the request summary, the caller and the candidates;
+  - the configured headers and metadata;
+  - the actions it supports.
+
+  It then applies the returned actions in order.
+- **`Report`, at completion.** It sends the token usage, the served target, the status, whether the
+  stream finished, and the configured metadata. The call is fire-and-forget.
 - **Failure.** A failed `Decide` fails closed by default (503), like `ext_authz`, because the
   service may also authenticate keys. `failure_mode_allow` admits with the list unchanged.
 
 ## 3. The service interface
+
+### 3.1 Which interface
 
 | Interface | Gaps for budgets and quotas |
 |---|---|
 | Rate limit service, `envoyproxy/ratelimit` | 32-bit limits; limits in static config; no reservations, ledger, identity or candidates |
 | RLQS | counts requests, not tokens or money; no per-request decision |
 | `ext_authz` | sees headers, not the parsed request; nothing after the response; no candidates |
-| `ext_proc` | streams HTTP bodies; no AI types; heavy for a yes/no and a usage report |
-| **AI callout: `Decide` + `Report` (recommended)** | none of the above; a new, small API |
+| `ext_proc` | streams HTTP bodies; no AI types; heavy for a decision and a usage report |
+| **AI callout (recommended)** | none of the above; a new, small API |
 
-Two unary RPCs, over gRPC or over HTTP with the proto3 JSON mapping. The messages reuse APM's
-records:
+### 3.2 Generic, not quota-specific
+
+The package is `envoy.service.ai.callout.v3`, the service `AiCalloutService`, and the RPCs `Decide`
+and `Report`. A quota-specific package would be narrower without being simpler:
+
+- **The inputs are generic.** A budget service, a routing optimizer, a compliance policy and an
+  experiment service all need the same things: the parsed request, the caller, the candidates and
+  the usage.
+- **Quota semantics need no special types.** A reservation rides in the opaque `context`, usage is
+  `TokenUsage`, and limits live in the service.
+- **One filter, one client.** A deployment that needs two policy services configures the callout
+  filter twice.
+- **It is the AI-native callout of #44681.** It uses the AI types that APM already has, instead of
+  HTTP bodies.
+
+The names avoid `Check`, which `ext_authz` uses.
+
+There is prior art to learn from. Istio's Mixer had `Check`, `Quota` and `Report` calls, and was
+removed in Istio 1.8, largely for the cost of an extra hop on every request. Four things differ here:
+
+- Only parsed AI requests are called out, and they take hundreds of milliseconds to minutes.
+- `Report` is off the request path.
+- The policy logic sits in one service, not in adapters inside the proxy.
+- Caching hints and pushed allowances are the planned answer if the hop ever matters.
+
+### 3.3 Extensibility
+
+- **Actions, not fields.** `Decide` returns an ordered list of `Action`s, each a `oneof`. A new
+  capability is a new action, and old Envoys and old services keep working.
+- **Capabilities.** `DecideRequest.supported_actions` lists the action names this Envoy can apply
+  on this route, `add` only where the route allows it. A service can stay within that list.
+- **`required`.** An action marked `required` that Envoy cannot apply fails the `Decide` call, and
+  `failure_mode_allow` then decides. An unknown action that is not required is skipped and counted.
+- **Pass-through context.** Configured request headers and dynamic metadata namespaces go to the
+  service. The service can set fields under the `envoy.ai.callout` namespace for later filters and
+  logs, without touching other namespaces.
+- **New RPCs, not new phases in old RPCs.** Request-body forwarding for content policies, a batched
+  `Report`, or a streaming allowance feed would be added as new fields or RPCs. Envoy only calls
+  what it is configured to call.
+
+### 3.4 API
 
 ```proto
 package envoy.service.ai.callout.v3;
 
-service AiCallout {
+// A policy decision point for AI requests, called by the AI Protocol Manager.
+service AiCalloutService {
   // Called once the request is parsed, before it is routed.
   rpc Decide(DecideRequest) returns (DecideResponse);
 
@@ -197,10 +252,26 @@ message Caller {
 
 message Candidate {
   string name = 1;
-  // The cluster, host id or authority.
+  // A cluster name, a host's envoy.lb.id, or a host:port, as the list's kind says.
   string target = 2;
-  string model = 3;
-  map<string, string> attributes = 4;
+  uint32 weight = 3;
+  string model = 4;
+  string path = 5;
+  type.ai.v3.LLMProtocol llm_protocol = 6;
+  map<string, string> attributes = 7;
+}
+
+message CandidateList {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    CLUSTER = 1;
+    HOST = 2;
+    AUTHORITY = 3;
+  }
+
+  Kind kind = 1;
+  // The eligible candidates, in order.
+  repeated Candidate candidates = 2;
 }
 
 message DecideRequest {
@@ -208,24 +279,18 @@ message DecideRequest {
   string request_id = 1;
   envoy.data.ai.v3.RequestInfo request = 2;
   Caller caller = 3;
-  // The eligible candidates, in order. Empty on a route without a model list.
-  repeated Candidate candidates = 4;
-  // The request headers the filter is configured to forward, such as authorization.
+  // Unset on a route without a model list.
+  CandidateList candidates = 4;
+  // The configured request headers, such as authorization.
   map<string, string> headers = 5;
+  // The configured dynamic metadata namespaces.
+  config.core.v3.Metadata metadata = 6;
+  // Names of the Action cases this Envoy can apply on this route.
+  repeated string supported_actions = 7;
+  string route_name = 8;
 }
 
-message DecideResponse {
-  message Allow {
-    message Exclusion {
-      string name = 1;
-      string reason = 2;
-    }
-
-    repeated Exclusion exclude = 1;
-    // A new order for the eligible candidates, by name. Empty keeps the order.
-    repeated string order = 2;
-  }
-
+message Action {
   message Deny {
     type.v3.HttpStatus status = 1;
     // Shown to the client, inside its API's error shape.
@@ -235,50 +300,102 @@ message DecideResponse {
     google.protobuf.Duration retry_after = 4;
   }
 
-  oneof decision {
-    Allow allow = 1;
-    Deny deny = 2;
+  message Exclude {
+    string name = 1;
+    string reason = 2;
   }
 
-  // The caller the service resolved, e.g. from an API key. Published as envoy.ai.caller.
-  Caller caller = 3;
+  message Order {
+    // The new order of the eligible candidates, by name. Unnamed ones follow, in their order.
+    repeated string names = 1;
+  }
 
+  message Add {
+    Candidate candidate = 1;
+    // Where to put it; appended when unset.
+    google.protobuf.UInt32Value position = 2;
+  }
+
+  message Annotate {
+    string name = 1;
+    map<string, string> attributes = 2;
+  }
+
+  // Fail Decide if this Envoy cannot apply the action.
+  bool required = 1;
+
+  oneof action {
+    // Reply to the client instead of routing. Later actions are not applied.
+    Deny deny = 2;
+    Exclude exclude = 3;
+    Order order = 4;
+    Add add = 5;
+    Annotate annotate = 6;
+    // Published as envoy.ai.caller.
+    Caller set_caller = 7;
+    config.core.v3.HeaderValueOption add_response_header = 8;
+    // Merged into dynamic metadata namespace envoy.ai.callout.
+    google.protobuf.Struct set_metadata = 9;
+  }
+}
+
+message DecideResponse {
+  // Applied in order.
+  repeated Action actions = 1;
   // Returned unchanged in Report, e.g. to tie a reservation to the request.
-  bytes context = 4;
-
-  repeated config.core.v3.HeaderValueOption response_headers_to_add = 5;
+  bytes context = 2;
 }
 
 message ReportRequest {
   string request_id = 1;
   bytes context = 2;
   Caller caller = 3;
-  // The candidate that served the final attempt; empty if no upstream answered.
-  string served = 4;
+  // The candidate that served the final attempt; unset if no upstream answered.
+  Candidate served = 4;
   // The usage the provider reported; unset when none was published.
   envoy.data.ai.v3.TokenUsage usage = 5;
   // The status sent to the client, and whether the response finished cleanly.
   uint32 status = 6;
   bool complete = 7;
+  uint32 attempts = 8;
+  // The configured dynamic metadata namespaces, at completion.
+  config.core.v3.Metadata metadata = 9;
 }
 
 message ReportResponse {
 }
 ```
 
-What a quota and budget service does with it:
+### 3.5 Adding candidates
 
-- **`Decide`**:
-  1. Authenticate the forwarded key; resolve user and team.
-  2. Refuse models the key may not use (403).
+`Add` lets the service bring targets the route's table does not list: a tenant's dedicated
+deployment (CUJ 12), a fine-tuned model's endpoint, or a whole list on a route with no table. It is
+off unless the route allows it, because the service would otherwise steer traffic anywhere Envoy can
+reach:
+
+- **The route opts in.** `CalloutPerRoute.add` gives the clusters, host ids or authority suffixes a
+  service may add. Envoy advertises `add` in `supported_actions` only there.
+- **The kind must match.** An added candidate must have the list's kind. On a route without a list,
+  the first add sets the kind.
+- **The target must be real.** At the commit, an added cluster must exist and an added authority
+  must match the allowlist. A candidate that fails either check is excluded with the reason, never
+  routed.
+
+### 3.6 What a quota and budget service does
+
+- **`Decide`:**
+  1. Authenticate the forwarded key; `set_caller`.
+  2. Deny models the key may not use (403).
   3. Check the caller's budgets: `spent + reserved + estimate <= limit`, or deny 429 with
      `insufficient_quota` and the reset as `retry_after`.
-  4. Exclude candidates whose own budget or quota is used, with soft rules as further exclusions
+  4. `exclude` candidates whose own budget or quota is used, and apply soft rules the same way
      (CUJs 7, 10).
-  5. Deny 429 if nothing is left; otherwise reserve the estimate and return it in `context`.
-- **`Report`**: price the usage, charge the caller's and the served candidate's budgets, release the
+  5. `add` the tenant's deployment if it has one (CUJ 12).
+  6. Deny 429 if nothing is left; otherwise reserve the estimate under the request id, put it in
+     `context`, and `add_response_header` the remaining budget.
+- **`Report`:** price the usage, charge the caller's and the served candidate's budgets, release the
   reservation, write the ledger row, and ignore a repeated request id.
-- **State**: keys, budgets, limits and prices in SQL; counters and reservations in Redis, with TTLs
+- **State:** keys, budgets, limits and prices in SQL; counters and reservations in Redis, with TTLs
   so a lost `Report` cannot leak a reservation.
 
 ## 4. Filter state and metadata contract
@@ -287,11 +404,11 @@ What a quota and budget service does with it:
 |---|---|---|---|
 | `envoy.ai.request_info` (exists) | typed metadata | `request_info` | callout `Decide`, logs |
 | `envoy.ai.model.request` (exists) | filter state, string | `request_info` | `model_table` |
-| `envoy.ai.caller` (new) | filter state, object; JSON factory for `set_filter_state` | an identity filter, or the callout | callout, logs, stats tags |
+| `envoy.ai.caller` (new) | filter state, object; JSON factory for `set_filter_state` | an identity filter, or the callout's `set_caller` | callout, logs, stats tags |
 | `envoy.ai.upstream.candidates` (new) | filter state, object | `model_table`, then policies; sealed by the commit | policies, logs |
 | `envoy.ai.upstream.candidates` (new) | dynamic metadata: `priority_groups`, `candidates` | the commit | `priority_group`, `quota_aware` |
 | `envoy.ai.backend.upstream` (new, shared) | filter state, string | the commit | `matcher` cluster specifier, logs |
-| `envoy.ai.callout` (new) | filter state, object | callout | logs: `outcome`, `reason`, latency |
+| `envoy.ai.callout` (new) | filter state object (`outcome`, `reason`, latency) and a dynamic metadata namespace (`set_metadata`) | callout | logs, later filters |
 | `envoy.ai.token_usage` (exists) | typed metadata | APM, at a clean end of stream | callout `Report` |
 
 All have life span `FilterChain`. Only the candidates change after they are first written, and only
@@ -300,10 +417,10 @@ until the commit.
 ## 5. The whole configuration
 
 One listener serves all three topologies. The filter chain is the same for every route; each route
-brings its own model list:
+brings its own model list and, where needed, its own callout settings:
 
 - `/v1/chat/completions`: `gpt-4o` on OpenAI, then Azure OpenAI, with `gpt-4o-mini` as the cheaper
-  tier.
+  tier. The service may add only these two clusters.
 - `/fleet/v1/chat/completions`: a fleet of OpenAI-compatible vLLM servers behind one DFP cluster.
 - `/v1/messages`: Anthropic only, with budgets and no routing choice.
 
@@ -346,7 +463,7 @@ static_resources:
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
                   token_estimation: {tokens_per_byte: 0.3}
-              # New. Seeds candidates from the route's table; this listener-level config is empty.
+              # New. Seeds candidates; the tables come from the routes, so this config is empty.
               - name: envoy.http.ai_filters.model_table
                 typed_config:
                   "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_table.v3.ModelTable
@@ -404,6 +521,10 @@ static_resources:
                             - {cluster: openai}
                             - {cluster: azure_openai, path: /openai/v1/chat/completions}
                             - {name: mini, cluster: openai, model: gpt-4o-mini}
+                      envoy.http.ai_filters.callout:
+                        "@type": type.googleapis.com/envoy.extensions.http.ai_filters.callout.v3.CalloutPerRoute
+                        add:                                   # the only clusters the service may add
+                          clusters: [openai, azure_openai]
               # One DFP cluster: a vLLM fleet, each server with its own quota in the service.
               - match: {prefix: /fleet/v1/chat/completions}
                 route:
@@ -559,9 +680,10 @@ static_resources:
 
 Three things stay out of the config on purpose:
 
-- **Keys, budgets, quotas, prices.** These live in the service, so CUJs 2-5 and 7-11 add rows there,
-  not YAML here.
-- **Response headers such as remaining budget.** The service returns them from `Decide`.
+- **Keys, budgets, quotas, prices, tenant deployments.** These live in the service, so CUJs 2-5 and
+  7-12 add rows there, not YAML here.
+- **Response headers such as remaining budget.** The service returns them as `add_response_header`
+  actions.
 - **A model listing endpoint (`/v1/models`).** It can be one more route to the service's HTTP API,
   which knows each key's models.
 
@@ -570,27 +692,31 @@ Three things stay out of the config on purpose:
 **Several clusters.** Team `search` is at 60%, and OpenAI's daily budget is spent.
 
 1. `model_table` seeds `openai`, `azure_openai`, `mini` from the route.
-2. `Decide` excludes `openai` (provider budget spent) and `mini` (a premium target is eligible).
+2. `Decide` returns `set_caller` (team `search`), `exclude openai` (provider budget spent),
+   `exclude mini` (a premium target is eligible), and `add_response_header`
+   `x-ai-budget-remaining`.
 3. The commit applies Azure's path and renders `priority_groups`; the cluster is refreshed.
 4. Attempt 1 goes to `azure_openai`, which injects its `api-key`.
-5. `Report` sends the usage with `served: azure_openai`.
+5. `Report` sends the usage, with `served` = `azure_openai`.
 
-At 84%, the service excludes both premium targets and `mini` serves. At 100%, `Decide` denies with
-429.
+Other states of the same route:
+
+- **84%:** both premium targets are excluded and `mini` serves.
+- **100%:** `Decide` returns a `deny` with 429.
+- **Tenant A with its own deployment:** `Decide` adds it first. On this route it is accepted only
+  if its cluster is in the `add` allowlist.
 
 **One DFP cluster.** `vllm-a` has used its tokens for the minute.
 
 1. `Decide` excludes it.
 2. The commit sets `:authority` to `vllm-b.internal:8000`.
 3. The DFP filter resolves it, and the router sends to `fleet`.
-4. `Report` names `vllm-b.internal:8000`.
-
-A retry stays on `vllm-b`.
+4. A retry stays on `vllm-b`.
 
 **Single provider.** There is no list.
 
 1. `Decide` checks the caller's budgets and allows or denies.
-2. The route's `anthropic` cluster serves.
+2. The `anthropic` cluster serves.
 3. `Report` charges the usage.
 
 ## 6. One cluster of static deployments
@@ -670,13 +796,13 @@ route:
         sni: eastus.example.openai.azure.com
 ```
 
-DFP or static pool? A DFP cluster suits a fleet that changes often, named by DNS, with no
+DFP or static pool? A DFP cluster suits a fleet that changes often and is named by DNS, with no
 per-attempt fallback yet. A static pool suits a fixed set of deployments, with fallback through host
 selection.
 
 ## 7. Details
 
-- **Rejections.** A `Deny` becomes a local reply with the given status, `retry-after`,
+- **Rejections.** A `deny` becomes a local reply with the given status, `retry-after`,
   `x-should-retry: false`, and the client API's error shape. Response code details are
   `ai_callout_denied`.
 - **Retries.** A retry to another cluster refreshes it again. Cross-cluster retries are off with
@@ -688,14 +814,14 @@ selection.
   per-attempt rewriting upstream, which is the model fallback track's work. Until then, one cluster
   means one API and one credential.
 - **Trust.** Forwarded headers can carry API keys, so the service must be trusted and reached over
-  mTLS. Token counts are provider-reported.
+  mTLS. Token counts are provider-reported. Added targets are limited by the route's allowlist.
 
 ## 8. API sketches
 
 ```proto
 // New field on envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute.
-// Per-route configuration for AI filters, keyed by AI filter name. It replaces that filter's
-// listener-level configuration on this route.
+// Per-route configuration for AI filters, keyed by AI filter name. For each AI filter, the most
+// specific level with an entry wins, and its entry replaces that filter's own configuration.
 map<string, google.protobuf.Any> filters = 3;
 ```
 
@@ -731,8 +857,7 @@ message ModelTable {
     repeated Candidate candidates = 1 [(validate.rules).repeated = {min_items: 1}];
   }
 
-  // Keyed by the requested model; "*" matches any model not listed. A route's table replaces this
-  // one.
+  // Keyed by the requested model; "*" matches any model not listed.
   map<string, Candidates> models = 1;
 }
 ```
@@ -752,11 +877,29 @@ message Callout {
   // Request headers sent in Decide, e.g. authorization.
   repeated string forward_headers = 3;
 
+  // Dynamic metadata namespaces sent in Decide and Report.
+  repeated string forward_metadata_namespaces = 4;
+
   // Admit with the candidates unchanged when Decide fails. Defaults to false: 503.
-  bool failure_mode_allow = 4;
+  bool failure_mode_allow = 5;
 
   // Skip Report, for a policy that needs no usage.
-  bool disable_report = 5;
+  bool disable_report = 6;
+}
+
+message CalloutPerRoute {
+  message AddAllowlist {
+    repeated string clusters = 1;
+    repeated string hosts = 2;
+    // Suffixes an added authority's host must end with, e.g. ".internal".
+    repeated string authority_suffixes = 3;
+  }
+
+  // Lets Decide add candidates whose targets are listed here. Unset: add is not offered.
+  AddAllowlist add = 1;
+
+  // Skip the callout on this route.
+  bool disabled = 2;
 }
 ```
 
@@ -765,7 +908,7 @@ APM core gains five general capabilities. Any AI filter can use them:
 | Capability | Interface |
 |---|---|
 | Completion hook | `AiFilter::onStreamComplete(const AiStreamCompletion&)` with the final `TokenUsage` |
-| Per-route AI filter config | `AiProtocolManagerPerRoute.filters`, resolved per stream and passed in `AiFilterContext` |
+| Per-route AI filter config | `AiProtocolManagerPerRoute.filters`, resolved per AI filter and passed in `AiFilterContext` |
 | Candidates and commit | `envoy.ai.upstream.candidates`, sealed at the end of the chain and handed off by target kind |
 | Awaitable callouts | a coroutine-friendly gRPC and HTTP client on `AiFilterContext`, with timeout and cancellation |
 | Replies and headers | `LocalReplier` with status, error type, `retry-after` and headers in the client's API; response headers from AI filters |
@@ -775,12 +918,12 @@ APM core gains five general capabilities. Any AI filter can use them:
 | # | PR | Scope |
 |---|---|---|
 | 1 | `ai_protocol_manager: add an AI filter stream-complete hook` | hook with the final usage |
-| 2 | `ai_protocol_manager: add per-route config for AI filters` | `AiProtocolManagerPerRoute.filters` |
+| 2 | `ai_protocol_manager: add per-route config for AI filters` | `AiProtocolManagerPerRoute.filters`, resolved per AI filter |
 | 3 | `ai_protocol_manager: add upstream candidates and commit them` | seal; model, path and authority; hand-off by kind; cluster refresh |
-| 4 | `ai_filters: add a model table filter` | listener default and per-route tables |
+| 4 | `ai_filters: add a model table filter` | per-route tables |
 | 5 | `ai_protocol_manager: let AI filters reply in the client's API and add response headers` | `LocalReplier`, response headers |
 | 6 | `ai_protocol_manager: add awaitable callouts for AI filters` | gRPC and HTTP clients on the context |
-| 7 | `api: add the AI callout service` and `ai_filters: add a callout filter` | `Decide`, `Report`, `envoy.ai.caller`, `envoy.ai.callout` |
+| 7 | `api: add the AI callout service` and `ai_filters: add a callout filter` | `Decide` with actions, including `add` behind the allowlist; `Report`; `envoy.ai.caller`; `envoy.ai.callout` |
 | 8 | examples: a quota and budget service | Redis and SQL; keys, budgets, prices, ledger, admin API; an e2e sandbox |
 
 #46640 is used unchanged. Static pools also need #47805; fallback across DFP hosts needs #47424 and
@@ -788,9 +931,12 @@ per-attempt host selection.
 
 ## 10. Alternatives
 
-- **The model list in the AI filter's listener-level config only.** It is simpler to implement, but
-  it couples routing data to the listener, cannot differ per route or tenant, and puts cluster names
-  in two places. It remains as the default table.
+- **Fixed response fields instead of actions** (revision 6): `Allow { exclude, order }` or `Deny`.
+  It is simpler, but every new capability changes the response's shape, and there is no way for a
+  service to tell what an older Envoy can do.
+- **A quota-specific API** (`Check`, `Reserve`, `Commit` in a quota package). Its semantics are
+  tighter, but it serves one use, and reservation and settlement fit `Decide`, `context` and
+  `Report` without it.
 - **Budgets as rate limit descriptors in Envoy config** (revisions 2-5). It needs no new API, but
   policy lives in Envoy config, money is capped by 32-bit limits, and there are no reservations,
   ledger, identity or per-key models.
@@ -805,12 +951,15 @@ Decided:
 - APM commits it at the end of the AI filter chain.
 - A `model_table` filter seeds it.
 - The limit check is an APM callout with `Decide` and `Report`, and policy lives in the service.
-- (Revision 7) The model list is per-route config; candidates name a `cluster`, `host` or
-  `authority`.
+- The model list is per-route config; candidates name a `cluster`, `host` or `authority`.
+- (Revision 8) Per-route AI filter config resolves per AI filter and replaces, without merging.
+- (Revision 8) The API is the generic `envoy.service.ai.callout.v3` with an action list,
+  capabilities and `required`.
+- (Revision 8) `add` is in the API now, behind a per-route allowlist.
 
 Open:
 
-1. API package: `envoy.service.ai.callout.v3`, or a name tied to quotas?
-2. Should `Decide` be able to add candidates, not only exclude and reorder?
-3. Should per-route AI filter config merge with the listener's, or replace it, as proposed?
-4. HTTP/JSON in the first callout PR, or after gRPC?
+1. HTTP/JSON in the first callout PR, or after gRPC?
+2. A request-body field for content policies: in this API later, or a separate streaming RPC?
+3. Should `set_metadata` also be able to set filter state for later AI filters, or stay metadata
+   only?
