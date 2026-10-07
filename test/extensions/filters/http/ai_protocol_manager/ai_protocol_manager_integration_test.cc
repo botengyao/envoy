@@ -9,6 +9,8 @@
 #include "test/test_common/simulated_time_system.h"
 
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 
 namespace Envoy {
 namespace {
@@ -409,6 +411,26 @@ typed_config:
     }
     return total;
   }
+
+  // A GenAI metric counter summed across its attribute sets.
+  uint64_t genAiCounter(absl::string_view name) {
+    uint64_t total = 0;
+    for (const auto& counter : test_server_->counters()) {
+      if (counter->tagExtractedName() == name) {
+        total += counter->value();
+      }
+    }
+    return total;
+  }
+
+  // GenAI metrics are recorded when the server completes the stream, which can follow the client
+  // seeing the response end.
+  void waitForGenAiCounter(absl::string_view name, uint64_t value) {
+    for (int attempt = 0; attempt < 500 && genAiCounter(name) < value; ++attempt) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+    EXPECT_EQ(genAiCounter(name), value);
+  }
 };
 
 INSTANTIATE_TEST_SUITE_P(Protocols, AiProtocolManagerResponseIntegrationTest,
@@ -442,6 +464,10 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, SseTokenUsagePublished) {
 
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_found"), 1);
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_missing"), 0);
+
+  // Output tokens are recorded after input tokens.
+  waitForGenAiCounter("gen_ai.client.inference.usage.output_tokens", 10);
+  EXPECT_EQ(genAiCounter("gen_ai.client.inference.usage.input_tokens"), 19);
 }
 
 // The filter installed as an upstream (cluster) HTTP filter: metadata written
@@ -466,6 +492,10 @@ TEST_P(AiProtocolManagerResponseIntegrationTest, UpstreamFilterJsonTokenUsage) {
   EXPECT_EQ(body, response->body());
 
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_found"), 1);
+
+  // Upstream filters never see the stream complete, so they record no GenAI metrics.
+  test_server_->waitForCounter("http.config_test.downstream_rq_completed", testing::Ge(1));
+  EXPECT_EQ(genAiCounter("gen_ai.client.inference.usage.input_tokens"), 0);
 }
 
 // Retries with the upstream installation: each attempt runs its own filter

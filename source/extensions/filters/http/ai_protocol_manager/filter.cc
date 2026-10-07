@@ -150,6 +150,8 @@ FilterConfig::FilterConfig(
     Stats::Scope& scope, AiFilterFactories ai_filter_factories)
     : stats_(AiProtocolManagerStats{
           ALL_AI_PROTOCOL_MANAGER_STATS(POOL_COUNTER_PREFIX(scope, "ai_protocol_manager."))}),
+      // The root scope keeps the stat names equal to the spec's metric names.
+      gen_ai_metrics_(scope.store().rootScope(), stats_),
       request_handling_enabled_(proto.has_request_handling()),
       parse_unconfigured_routes_(proto.request_handling().parse_unconfigured_routes()),
       always_serialize_request_(
@@ -203,6 +205,12 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
     factories.push_back(std::move(cb.value()));
   }
   return std::make_shared<const FilterConfig>(proto, scope, std::move(factories));
+}
+
+void AiProtocolManagerFilter::onStreamComplete() {
+  if (gen_ai_usage_.has_value()) {
+    config_->genAiMetrics().recordUsage(encoder_callbacks_->streamInfo(), *gen_ai_usage_);
+  }
 }
 
 void AiProtocolManagerFilter::onDestroy() {
@@ -680,6 +688,11 @@ bool AiProtocolManagerFilter::finalizeResponseHandling() {
     // `stream_options.include_usage`, or an unrecognized response shape.
     config_->stats().token_usage_missing_.inc();
     return false;
+  }
+  // Held even when another installation owns the namespace: metrics are recorded by the downstream
+  // installation, the only one that sees the stream complete.
+  if (usage.hasAny()) {
+    gen_ai_usage_ = usage;
   }
 
   // Two publications for one stream (both-placement installs) would leave

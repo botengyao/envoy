@@ -162,6 +162,34 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "gen_ai_metrics_lib",
+    srcs = ["gen_ai_metrics.cc"],
+    hdrs = [
+        "gen_ai_convention.h",
+        "gen_ai_metrics.h",
+    ],
+    deps = [
+        ":ai_filter_state_lib",
+        ":stats_lib",
+        ":token_usage_lib",
+        "//envoy/router:string_accessor_interface",
+        "//envoy/stats:stats_interface",
+        "//envoy/stream_info:stream_info_interface",
+        "//envoy/upstream:host_description_interface",
+        "//envoy/upstream:upstream_interface",
+        "//source/common/common:macros",
+        "//source/common/config:metadata_lib",
+        "//source/common/stats:symbol_table_lib",
+        "@abseil-cpp//absl/algorithm:container",
+        "@abseil-cpp//absl/base:core_headers",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@abseil-cpp//absl/hash",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/synchronization",
+    ],
+)
+
+envoy_cc_library(
     name = "response_handler_lib",
     srcs = ["response_handler.cc"],
     hdrs = ["response_handler.h"],
@@ -428,6 +456,7 @@ envoy_cc_library(
         ":external_buffer_interface",
         ":filter_chain_bridge_lib",
         ":filter_manager_lib",
+        ":gen_ai_metrics_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
         ":llm_protocol_conversion_lib",

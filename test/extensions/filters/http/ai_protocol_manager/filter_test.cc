@@ -583,6 +583,25 @@ public:
     return counter != nullptr ? counter->value() : 0;
   }
 
+  // The GenAI metric counter `name` whose tags are exactly `tags`.
+  std::optional<uint64_t> genAiCounter(const std::string& name, const Stats::TagVector& tags) {
+    for (const Stats::CounterSharedPtr& counter : stats_store_.counters()) {
+      if (counter->tagExtractedName() == name && counter->tags() == tags) {
+        return counter->value();
+      }
+    }
+    return std::nullopt;
+  }
+
+  bool anyGenAiCounter() {
+    for (const Stats::CounterSharedPtr& counter : stats_store_.counters()) {
+      if (counter->tagExtractedName().rfind("gen_ai.", 0) == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // The authoritative typed record.
   std::optional<envoy::data::ai::v3::TokenUsage>
   singleTypedWrite(const std::string& expected_namespace) {
@@ -829,6 +848,43 @@ TEST_F(AiProtocolManagerFilterResponseTest, DuplicatePublicationSkipped) {
   EXPECT_TRUE(typed_metadata_writes_.empty()); // No second write.
   EXPECT_EQ(counterValue("token_usage_duplicate"), 1);
   EXPECT_EQ(counterValue("token_usage_found"), 0);
+
+  // The upstream installation never sees the stream complete, so this one still records metrics.
+  filter_->onStreamComplete();
+  EXPECT_EQ(genAiCounter("gen_ai.client.inference.usage.input_tokens",
+                         {{"gen_ai.operation.name", "chat"},
+                          {"gen_ai.provider.name", "openai"},
+                          {"gen_ai.token.modality", "unknown"}}),
+            3);
+}
+
+// Usage becomes GenAI metrics when the stream completes, not at the end of the response body.
+TEST_F(AiProtocolManagerFilterResponseTest, GenAiUsageMetricsRecordedOnStreamComplete) {
+  setup();
+  sendHeaders("text/event-stream");
+  sendData("data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[],"
+           "\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":10,\"total_tokens\":29}}\n\n",
+           false);
+  sendData("data: [DONE]\n\n", true);
+  EXPECT_FALSE(anyGenAiCounter());
+
+  filter_->onStreamComplete();
+  const Stats::TagVector tags{{"gen_ai.operation.name", "chat"},
+                              {"gen_ai.provider.name", "openai"},
+                              {"gen_ai.response.model", "gpt-4o"},
+                              {"gen_ai.token.modality", "unknown"}};
+  EXPECT_EQ(genAiCounter("gen_ai.client.inference.usage.input_tokens", tags), 19);
+  EXPECT_EQ(genAiCounter("gen_ai.client.inference.usage.output_tokens", tags), 10);
+}
+
+TEST_F(AiProtocolManagerFilterResponseTest, GenAiUsageMetricsNeedUsage) {
+  setup();
+  sendHeaders("text/event-stream");
+  sendData("data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}],"
+           "\"usage\":null}\n\ndata: [DONE]\n\n",
+           true);
+  filter_->onStreamComplete();
+  EXPECT_FALSE(anyGenAiCounter());
 }
 
 // The provider-reported total is surfaced separately when it disagrees with

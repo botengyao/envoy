@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -15,6 +16,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
+#include "source/extensions/filters/http/ai_protocol_manager/gen_ai_metrics.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
@@ -60,11 +62,13 @@ public:
   uint32_t maxJsonBodySize() const { return max_json_body_size_; }
   uint32_t maxParsedSseEvents() const { return max_parsed_sse_events_; }
   AiProtocolManagerStats& stats() const { return stats_; }
+  const GenAiMetrics& genAiMetrics() const { return gen_ai_metrics_; }
 
 private:
   // Counters are thread-safe to increment; mutable so a shared const config
   // serves them.
   mutable AiProtocolManagerStats stats_;
+  const GenAiMetrics gen_ai_metrics_;
   const bool request_handling_enabled_ = false;
   const bool parse_unconfigured_routes_ = false;
   const bool always_serialize_request_ = true;
@@ -174,6 +178,7 @@ public:
       : buffer_factory_(buffer_factory), config_(std::move(config)) {}
 
   // Http::StreamFilterBase
+  void onStreamComplete() override;
   void onDestroy() override;
 
   // Http::StreamDecoderFilter
@@ -259,6 +264,8 @@ private:
   bool encode_input_ended_{false};
   bool encode_has_trailers_{false};
   bool encode_rejected_{false};
+  // Finalized usage, recorded as GenAI metrics when the stream completes.
+  std::optional<TokenUsage> gen_ai_usage_;
 };
 
 } // namespace AiProtocolManager

@@ -145,6 +145,24 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "gen_ai_metrics_test",
+    srcs = ["gen_ai_metrics_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/protobuf:utility_lib",
+        "//source/common/router:string_accessor_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:ai_filter_state_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:gen_ai_metrics_lib",
+        "//test/mocks/stats:stats_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "//test/mocks/upstream:host_mocks",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "filter_test",
     srcs = ["filter_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

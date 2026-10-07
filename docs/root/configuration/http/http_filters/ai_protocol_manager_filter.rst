@@ -632,6 +632,53 @@ without streaming response body bytes:
     response_body_mode: NONE
     response_trailer_mode: SEND
 
+.. _config_http_filters_ai_protocol_manager_gen_ai_metrics:
+
+OpenTelemetry GenAI metrics
+---------------------------
+
+Token usage extraction also records the token usage metrics of the `OpenTelemetry GenAI semantic
+conventions <https://github.com/open-telemetry/semantic-conventions-genai>`_. They need no
+configuration. Stat names are the conventions' metric names and tag names are their attribute
+names, so the :ref:`OpenTelemetry stat sink
+<envoy_v3_api_msg_extensions.stat_sinks.open_telemetry.v3.SinkConfig>` exports them as the
+conventions define them. They are not under the filter's statistics prefix, so every listener
+shares them.
+
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 2, 1, 2
+
+  gen_ai.client.inference.usage.input_tokens, Counter, "Input tokens, cached tokens included."
+  gen_ai.client.inference.usage.output_tokens, Counter, "Output tokens, reasoning tokens included."
+  gen_ai.client.inference.usage.cache_read.input_tokens, Counter, Input tokens read from the provider's cache. Recorded only when nonzero.
+  gen_ai.client.inference.usage.cache_write.input_tokens, Counter, Input tokens written to the provider's cache. Recorded only when nonzero.
+  gen_ai.client.inference.usage.reasoning.output_tokens, Counter, Output tokens spent on reasoning. Recorded only when nonzero.
+  gen_ai.client.inference.operation.input_tokens, Histogram, Input tokens per response.
+  gen_ai.client.inference.operation.output_tokens, Histogram, Output tokens per response.
+
+The attributes are:
+
+* ``gen_ai.operation.name``: ``chat``, or ``generate_content`` for the Gemini API.
+* ``gen_ai.provider.name``: ``openai``, ``anthropic`` or ``gcp.gen_ai``, from the response's wire
+  API. A cluster serving another provider behind one of these APIs names it with the
+  ``gen_ai.provider.name`` key of its ``envoy.filters.http.ai_protocol_manager`` filter metadata.
+* ``gen_ai.request.model``: the ``envoy.ai.model.request`` filter state, when set, for example by the
+  request info AI filter.
+* ``gen_ai.response.model``: the model the response reports.
+* ``server.address`` and ``server.port``: the upstream host's hostname and port, when the host has
+  a hostname.
+* ``gen_ai.token.modality``: ``unknown``, on the counters only.
+
+A model name or hostname longer than 128 bytes, or containing a control character, is reported as
+``_OTHER``. Each metric keeps at most 2000 attribute sets, the OpenTelemetry metrics SDK's default
+cardinality limit. Measurements for further sets go to a series whose only attribute is
+``otel.metric.overflow`` with value ``true``, and are counted by ``gen_ai_metrics_overflow``.
+
+The metrics are recorded when the downstream stream completes, so the downstream installation
+records them and an upstream installation records none. To drop them, exclude the ``gen_ai.``
+prefix with :ref:`stats_matcher <envoy_v3_api_field_config.metrics.v3.StatsConfig.stats_matcher>`.
+
 Upstream (cluster) installation
 -------------------------------
 
@@ -706,6 +753,7 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   sse_event_too_large, Counter, Pending or complete SSE event data exceeded ``max_sse_event_size``; that entire event was skipped.
   unsupported_content_encoding, Counter, The response carried a non-identity ``content-encoding``; extraction skipped.
   usage_trailers_synthesized, Counter, Empty response trailers were synthesized at end of stream to carry token usage to a downstream consumer.
+  gen_ai_metrics_overflow, Counter, "A :ref:`GenAI metric <config_http_filters_ai_protocol_manager_gen_ai_metrics>` measurement went to the metric's overflow series because the metric already held 2000 attribute sets."
   request_info.published, Counter, The request info AI filter published an ``envoy.data.ai.v3.RequestInfo`` record.
   request_info.partial, Counter, A published request info record ignored at least one value Envoy could not use.
   request_info.duplicate, Counter, Request info publication skipped because another installation of the filter had already published the namespace for this stream.
