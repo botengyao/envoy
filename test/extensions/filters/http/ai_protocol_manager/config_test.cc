@@ -80,58 +80,6 @@ TEST(AiProtocolManagerConfigTest, IsRegisteredAsUpstreamFilter) {
                            testing::NotNull()));
 }
 
-// A token-usage limits config with an out-of-range cap is rejected by proto
-// validation.
-TEST(AiProtocolManagerConfigTest, RejectsOversizedEventCap) {
-  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
-  proto_config.mutable_response_handling()
-      ->mutable_token_usage()
-      ->mutable_limits()
-      ->mutable_max_sse_event_size()
-      ->set_value(20 * 1024 * 1024);
-  NiceMock<Server::Configuration::MockFactoryContext> context;
-
-  AiProtocolManagerFilterConfigFactory factory;
-  EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
-               EnvoyException);
-}
-
-// An explicit zero cap is rejected: there is no way to disable the bound.
-TEST(AiProtocolManagerConfigTest, RejectsZeroCaps) {
-  NiceMock<Server::Configuration::MockFactoryContext> context;
-  AiProtocolManagerFilterConfigFactory factory;
-  {
-    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
-    proto_config.mutable_response_handling()
-        ->mutable_token_usage()
-        ->mutable_limits()
-        ->mutable_max_sse_event_size()
-        ->set_value(0);
-    EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
-                 EnvoyException);
-  }
-  {
-    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
-    proto_config.mutable_response_handling()
-        ->mutable_token_usage()
-        ->mutable_limits()
-        ->mutable_max_json_body_size()
-        ->set_value(0);
-    EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
-                 EnvoyException);
-  }
-  {
-    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
-    proto_config.mutable_response_handling()
-        ->mutable_token_usage()
-        ->mutable_limits()
-        ->mutable_max_parsed_sse_events()
-        ->set_value(0);
-    EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
-                 EnvoyException);
-  }
-}
-
 // The parser's inline-string threshold comes from the request-handling config,
 // falling back to the parser's own default when unset.
 TEST(AiProtocolManagerConfigTest, InlineStringThresholdDefaultsAndOverrides) {
@@ -177,7 +125,7 @@ TEST(AiProtocolManagerConfigTest, RejectsOutOfRangeInlineStringThreshold) {
 // placement).
 TEST(AiProtocolManagerConfigTest, CreatesStreamFilterFromUpstreamContext) {
   envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
-  proto_config.mutable_response_handling()->mutable_token_usage();
+  proto_config.mutable_request_handling();
   NiceMock<Server::Configuration::MockUpstreamFactoryContext> context;
 
   AiProtocolManagerFilterConfigFactory factory;
@@ -207,14 +155,12 @@ TEST(AiProtocolManagerConfigTest, CreatesRouteSpecificConfig) {
       testing::WhenDynamicCastTo<const RouteConfig*>(testing::AllOf(
           testing::Property(&RouteConfig::hasRequest, true),
           testing::Property(&RouteConfig::requestProtocol, LLMProtocol::OpenAiChatCompletions),
-          testing::Property(&RouteConfig::responseProtocol, LLMProtocol::AnthropicMessages),
-          testing::Property(&RouteConfig::effectiveResponseProtocol,
-                            LLMProtocol::AnthropicMessages))));
+          testing::Property(&RouteConfig::responseProtocol, LLMProtocol::AnthropicMessages))));
 }
 
-// Without a response declaration the response side inherits the request API;
-// without a request declaration the route is response-only.
-TEST(AiProtocolManagerConfigTest, RouteConfigResponseFallsBackToRequestProtocol) {
+// The two declarations are independent: one route declares no response API, the other
+// declares no request.
+TEST(AiProtocolManagerConfigTest, RouteConfigDeclaresRequestAndResponseSeparately) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
   AiProtocolManagerFilterConfigFactory factory;
   {
@@ -228,9 +174,7 @@ TEST(AiProtocolManagerConfigTest, RouteConfigResponseFallsBackToRequestProtocol)
     EXPECT_THAT(route_config.get(),
                 testing::WhenDynamicCastTo<const RouteConfig*>(testing::AllOf(
                     testing::Property(&RouteConfig::hasRequest, true),
-                    testing::Property(&RouteConfig::responseProtocol, LLMProtocol::Unspecified),
-                    testing::Property(&RouteConfig::effectiveResponseProtocol,
-                                      LLMProtocol::OpenAiChatCompletions))));
+                    testing::Property(&RouteConfig::responseProtocol, LLMProtocol::Unspecified))));
   }
   {
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
@@ -242,7 +186,7 @@ TEST(AiProtocolManagerConfigTest, RouteConfigResponseFallsBackToRequestProtocol)
                             .value();
     EXPECT_THAT(route_config.get(), testing::WhenDynamicCastTo<const RouteConfig*>(testing::AllOf(
                                         testing::Property(&RouteConfig::hasRequest, false),
-                                        testing::Property(&RouteConfig::effectiveResponseProtocol,
+                                        testing::Property(&RouteConfig::responseProtocol,
                                                           LLMProtocol::OpenAiResponses))));
   }
 }

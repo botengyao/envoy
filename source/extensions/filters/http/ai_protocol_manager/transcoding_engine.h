@@ -11,6 +11,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event.h"
 #include "source/extensions/filters/http/ai_protocol_manager/token_usage.h"
+#include "source/extensions/filters/http/ai_protocol_manager/usage_record.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -523,6 +524,10 @@ struct TranscodeStreamState {
   // The native usage `accumulateUsage` has merged so far. Never finalized itself: renders
   // finalize a copy.
   TokenUsage usage{};
+  // The usage the provider reported, read off each event of a `ToIr` leg before the rules run, so
+  // neither a refused event nor a failed rule loses any of it. The leg hands it down the chain as
+  // the `_envoy.token_usage` record (reserved_member.h) once the stream ends.
+  UsageAccumulator provider_usage{};
   // The events of `StreamOutput::once` outputs already written, by SSE event name.
   absl::flat_hash_set<std::string> written_once{};
   // Set once the stream has ended, by a `Terminate` case or by `finishStream()`, after which
@@ -771,6 +776,10 @@ public:
   // caller still holds the original and can forward it untranslated. `StreamEvent` legs go
   // through `transcodeStreamEvent()` instead.
   //
+  // A `Response` leg carries the document's reserved member (reserved_member.h) through, whatever
+  // its outcome. A `ToIr` one also writes the usage the provider reported into it, as the
+  // `_envoy.token_usage` record, which the IR's own `usage` cannot hold in full.
+  //
   // A `Request` leg also moves what its dialect names in the request path rather than the body
   // (`DialectTranscodePack::envelope`): `ToIr` lifts it from `ctx.request_path` into the IR body,
   // and `FromIr` moves it out of the body into `ctx.rewritten_path`, which the caller must send the
@@ -789,8 +798,12 @@ public:
 
   // Runs one `StreamEvent` leg on `event`, one event of a streamed response, and returns the
   // events to forward in its place: none when the grammar drops it, several when it writes more.
-  // On success `event` is consumed. On failure `event` and `ctx.stream_state` are left exactly as
-  // they were, so the caller can forward the event untranslated and carry on with the stream.
+  // On success `event` is consumed. On failure `event` and `ctx.stream_state` are left as they
+  // were, so the caller can forward the event untranslated and carry on with the stream; only the
+  // provider's usage the event carried is kept (`TranscodeStreamState::provider_usage`).
+  //
+  // An event that carries only the reserved member passes through every leg. A `ToIr` leg emits
+  // one itself when its stream ends, ahead of the terminator: the `_envoy.token_usage` record.
   //
   // `ctx.stream_state` is required, and must be the same object for every event of one stream.
   // A leg whose dialect is the IR is the identity.
@@ -798,7 +811,8 @@ public:
   transcodeStreamEvent(const TranscodeLeg& leg, TranscodeContext& ctx, SseEventPtr& event) const;
 
   // Ends a `StreamEvent` leg once its source stream has ended, and returns the events to append:
-  // the grammar's `on_source_end`, unless the stream has already terminated.
+  // the grammar's `on_source_end`, after a `ToIr` leg's usage record, unless the stream has already
+  // terminated.
   absl::StatusOr<std::vector<SseEventPtr>> finishStream(const TranscodeLeg& leg,
                                                         TranscodeContext& ctx) const;
 

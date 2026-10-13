@@ -4,6 +4,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/reserved_member.h"
 #include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event.h"
 #include "source/extensions/filters/http/ai_protocol_manager/transcoding_engine.h"
 
@@ -1494,6 +1495,8 @@ TEST(TranscodingEngineTest, ResponseLegsRefuseAPayloadThatIsNotAResponse) {
     const absl::Status status = engine.transcode(c.leg, ctx, doc);
     EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument) << c.payload;
     EXPECT_THAT(status.message(), testing::HasSubstr(c.field)) << c.payload;
+    // A `ToIr` leg still hands down what it read of the usage.
+    ReservedMember::remove(doc);
     EXPECT_EQ(doc, original);
   }
 
@@ -1504,7 +1507,7 @@ TEST(TranscodingEngineTest, ResponseLegsRefuseAPayloadThatIsNotAResponse) {
 }
 
 // A response that goes into the IR and back out to its own dialect keeps its answer, finish
-// reason and token counts.
+// reason and token counts, and carries the usage record the `ToIr` leg wrote all the way through.
 TEST(TranscodingEngineTest, ResponseLegsRoundTripThroughTheIr) {
   auto engine_or = TranscodingEngine::createDefault();
   ASSERT_THAT(engine_or.status(), IsOk());
@@ -1522,6 +1525,8 @@ TEST(TranscodingEngineTest, ResponseLegsRoundTripThroughTheIr) {
   nlohmann::json doc = gemini;
   ASSERT_THAT(engine.transcode(kGeminiResponseToIr, ctx, doc), IsOk());
   ASSERT_THAT(engine.transcode(kIrResponseToGemini, ctx, doc), IsOk());
+  EXPECT_TRUE(doc["_envoy"].contains("token_usage"));
+  ReservedMember::remove(doc);
   EXPECT_EQ(doc, gemini);
 
   const nlohmann::json anthropic = nlohmann::json::parse(R"({
@@ -1533,6 +1538,8 @@ TEST(TranscodingEngineTest, ResponseLegsRoundTripThroughTheIr) {
   doc = anthropic;
   ASSERT_THAT(engine.transcode(kAnthropicResponseToIr, ctx, doc), IsOk());
   ASSERT_THAT(engine.transcode(kIrResponseToAnthropic, ctx, doc), IsOk());
+  EXPECT_TRUE(doc["_envoy"].contains("token_usage"));
+  ReservedMember::remove(doc);
   EXPECT_EQ(doc, anthropic);
 }
 
@@ -1871,7 +1878,8 @@ TEST(TranscodingEngineTest, StreamEventLegForTheIrIsTheIdentity) {
 
 // Each Gemini chunk becomes an IR chunk that carries its answer text, and a chunk that is not a
 // response (an error) goes out as it came. A Gemini stream just ends, so the IR's `[DONE]` is
-// appended.
+// appended, after the record of the usage Gemini reported: it names the model Gemini served, where
+// the IR chunk names the one the request asked for.
 TEST(TranscodingEngineTest, TranscodesGeminiStreamToIr) {
   auto engine_or = TranscodingEngine::createDefault();
   ASSERT_THAT(engine_or.status(), IsOk());
@@ -1910,8 +1918,142 @@ TEST(TranscodingEngineTest, TranscodesGeminiStreamToIr) {
               "choices": [{"index": 0, "delta": {}, "finish_reason": "content_filter"}]}},
     {"untranslated": {"data": {"error": {"code": 429, "message": "Resource exhausted"}}}},
     {"raw": "not json"},
+    {"data": {"_envoy": {"token_usage": {
+      "llm_protocol": "GEMINI_GENERATE_CONTENT", "model": "gemini-2.5-flash",
+      "input_tokens": 10, "output_tokens": 8, "total_tokens": 18,
+      "output_token_details": {"reasoning_tokens": 3}, "provider_total_tokens": 18,
+      "extraction_status": "COMPLETE"}}}},
     {"raw": "[DONE]"}
   ])"));
+}
+
+// A `ToIr` response leg writes the usage the provider reported into the reserved member, as the
+// record the IR's `usage` cannot hold in full: Gemini's tool-use count has no place there.
+TEST(TranscodingEngineTest, ToIrResponseLegHandsDownTheProviderUsage) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  nlohmann::json doc = nlohmann::json::parse(R"({
+    "candidates": [{"content": {"role": "model", "parts": [{"text": "Hi"}]}}],
+    "usageMetadata": {"promptTokenCount": 6, "toolUsePromptTokenCount": 5,
+                      "candidatesTokenCount": 10, "totalTokenCount": 22},
+    "modelVersion": "gemini-2.5-pro"
+  })");
+  TranscodeContext ctx;
+  ASSERT_THAT(engine_or->transcode(kGeminiResponseToIr, ctx, doc), IsOk());
+
+  EXPECT_EQ(doc["usage"], nlohmann::json::parse(R"({
+    "prompt_tokens": 11, "completion_tokens": 10, "total_tokens": 21
+  })"));
+  EXPECT_EQ(doc["_envoy"], nlohmann::json::parse(R"({"token_usage": {
+    "llm_protocol": "GEMINI_GENERATE_CONTENT", "model": "gemini-2.5-pro",
+    "input_tokens": 11, "output_tokens": 10, "total_tokens": 21,
+    "input_token_details": {"tool_use_tokens": 5}, "provider_total_tokens": 22,
+    "extraction_status": "COMPLETE"
+  }})"));
+}
+
+// A response the leg cannot convert goes out untranslated, but with the usage it carries.
+TEST(TranscodingEngineTest, ToIrResponseLegHandsDownUsageItCannotConvert) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  const nlohmann::json original = nlohmann::json::parse(R"({
+    "type": "message", "model": "claude-sonnet-4-5",
+    "usage": {"input_tokens": 7, "output_tokens": 3}
+  })");
+  nlohmann::json doc = original;
+  TranscodeContext ctx;
+  EXPECT_EQ(engine_or->transcode(kAnthropicResponseToIr, ctx, doc).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  EXPECT_EQ(doc["_envoy"]["token_usage"]["input_tokens"], 7);
+  EXPECT_EQ(doc["_envoy"]["token_usage"]["extraction_status"], "COMPLETE");
+  ReservedMember::remove(doc);
+  EXPECT_EQ(doc, original);
+}
+
+// The reserved member is not the dialect's: a `FromIr` leg carries it through untouched.
+TEST(TranscodingEngineTest, FromIrResponseLegCarriesTheReservedMemberThrough) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  nlohmann::json doc = nlohmann::json::parse(R"({
+    "id": "chatcmpl-1", "object": "chat.completion", "created": 1700000000, "model": "gpt-4o",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"},
+                 "finish_reason": "stop"}],
+    "_envoy": {"token_usage": {"extraction_status": "COMPLETE"}}
+  })");
+  TranscodeContext ctx;
+  ASSERT_THAT(engine_or->transcode(kIrResponseToAnthropic, ctx, doc), IsOk());
+  EXPECT_EQ(doc["type"], "message");
+  EXPECT_EQ(doc["_envoy"], nlohmann::json::parse(R"({"token_usage": {
+    "extraction_status": "COMPLETE"
+  }})"));
+}
+
+// Anthropic reports the input side of the usage at the start of the stream and the output side
+// at its end. The record of both goes down the chain ahead of the IR's terminator.
+TEST(TranscodingEngineTest, ToIrStreamLegHandsDownUsageAheadOfTheTerminator) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  const nlohmann::json out = runStream(*engine_or, kAnthropicStreamToIr, nlohmann::json::parse(R"([
+    {"event": "message_start",
+     "data": {"type": "message_start",
+              "message": {"id": "msg_1", "model": "claude-sonnet-4-5-20250929",
+                          "usage": {"input_tokens": 10, "cache_read_input_tokens": 1000,
+                                    "cache_creation_input_tokens": 20, "output_tokens": 1}}}},
+    {"event": "content_block_delta",
+     "data": {"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "Hi"}}},
+    {"event": "message_delta",
+     "data": {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+              "usage": {"output_tokens": 5}}},
+    {"event": "message_stop", "data": {"type": "message_stop"}}
+  ])"));
+
+  ASSERT_GE(out.size(), 2U);
+  EXPECT_EQ(out[out.size() - 2], nlohmann::json::parse(R"({"data": {"_envoy": {"token_usage": {
+    "llm_protocol": "ANTHROPIC_MESSAGES", "model": "claude-sonnet-4-5-20250929",
+    "input_tokens": 1030, "output_tokens": 5, "total_tokens": 1035,
+    "input_token_details": {"cached_tokens": 1000, "cache_creation_tokens": 20},
+    "extraction_status": "COMPLETE"
+  }}}})"));
+  EXPECT_EQ(out.back(), nlohmann::json::parse(R"({"raw": "[DONE]"})"));
+}
+
+// An event the grammar refuses still counts: Anthropic's in-band `error` has no case, so it goes
+// out untranslated, and the stream's record reports the input the provider had already counted,
+// flagged partial.
+TEST(TranscodingEngineTest, ToIrStreamLegKeepsUsageOfAnEventItRefuses) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  const nlohmann::json out = runStream(*engine_or, kAnthropicStreamToIr, nlohmann::json::parse(R"([
+    {"event": "message_start",
+     "data": {"type": "message_start",
+              "message": {"id": "msg_1", "model": "claude-sonnet-4-5",
+                          "usage": {"input_tokens": 10, "output_tokens": 1}}}},
+    {"event": "error", "data": {"type": "error", "error": {"type": "overloaded_error"}}}
+  ])"));
+
+  ASSERT_EQ(out.size(), 3U);
+  EXPECT_EQ(out[1], nlohmann::json::parse(R"({"untranslated": {"event": "error",
+    "data": {"type": "error", "error": {"type": "overloaded_error"}}}})"));
+  EXPECT_EQ(out[2], nlohmann::json::parse(R"({"data": {"_envoy": {"token_usage": {
+    "llm_protocol": "ANTHROPIC_MESSAGES", "model": "claude-sonnet-4-5",
+    "input_tokens": 10, "output_tokens": 1, "total_tokens": 11, "extraction_status": "PARTIAL"
+  }}}})"));
+}
+
+// An event that carries only the reserved member passes every leg, whichever way it converts.
+TEST(TranscodingEngineTest, StreamLegsPassAnEventThatCarriesOnlyTheReservedMember) {
+  auto engine_or = TranscodingEngine::createDefault();
+  ASSERT_THAT(engine_or.status(), IsOk());
+  const nlohmann::json events = nlohmann::json::parse(R"([
+    {"data": {"_envoy": {"token_usage": {"extraction_status": "FAILED"}}}}
+  ])");
+  EXPECT_EQ(runStream(*engine_or, kIrStreamToAnthropic, events), events);
+  const nlohmann::json from_gemini = runStream(*engine_or, kGeminiStreamToIr, events);
+  ASSERT_EQ(from_gemini.size(), 2U);
+  EXPECT_EQ(from_gemini[0], events[0]);
+  EXPECT_EQ(from_gemini[1], nlohmann::json::parse(R"({"raw": "[DONE]"})"));
 }
 
 // The IR has no message or content block boundaries, so the first IR chunk also opens the

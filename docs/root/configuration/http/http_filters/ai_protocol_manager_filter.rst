@@ -9,18 +9,13 @@ directions of a stream:
 * On the **request (decode) path** it buffers a declared AI endpoint's payload
   off the connection manager's hot path — parsing it as it arrives — so that
   routing and admission decisions can be made on the fully received body.
-* On the **response (encode) path** it can extract normalized LLM **token
-  usage** from provider responses — OpenAI (Chat Completions and Responses
-  API), Anthropic (Messages API), and Gemini (``generateContent`` /
-  ``streamGenerateContent``) — and publish it as typed dynamic metadata for
-  consumption by typed-metadata readers, e.g. :ref:`ext_proc
-  <config_http_filters_ext_proc>` metadata forwarding and other filters.
+* On the **response (encode) path** it runs the same AI filters over a 2xx SSE
+  or JSON response, for example to publish the LLM **token usage** the provider
+  reported with the :ref:`token usage
+  <config_http_filters_ai_protocol_manager_token_usage>` AI filter.
 
-Request and response processing are enabled independently, by the presence of
-:ref:`request_handling
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.request_handling>`
-and :ref:`response_handling
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.response_handling>`.
+Processing is enabled by the presence of :ref:`request_handling
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.request_handling>`.
 
 The filter acts only on requests it has a reason to inspect. A request on a
 route that is not a declared AI endpoint -- and, unless
@@ -118,12 +113,12 @@ matching the provider's REST path, such as ``/chat/completions``:
         request:
           llm_protocol: OPENAI_CHAT_COMPLETIONS
 
-The request and response wire APIs are declared separately (an optional
+The request and response wire APIs are declared separately: an optional
 :ref:`response
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute.response>`
-declaration covers gateways whose response API differs from the request API,
-e.g. under protocol translation); when the response API is undeclared it
-falls back to the request API.
+declaration names the API of the backend, which the :ref:`transcoder
+<envoy_v3_api_msg_extensions.http.ai_filters.transcoder.v3.Transcoder>` converts
+to and from when it differs from the client's.
 
 A filter ahead of this one that knows the caller better than the route does
 can name the request API itself, with the ``envoy.ai.llm_protocol.request``
@@ -182,6 +177,12 @@ filter (category ``envoy.http.ai_filters``)
 may read or modify the document, or reject the request with a local reply.
 Routes without a per-route request declaration, and requests without a body,
 run no AI filters.
+
+The AI filters that ran over a request also run, in reverse order, over its
+response when it is a 2xx with a ``text/event-stream`` or JSON content type:
+one SSE event, or one batch of JSON fields, at a time. A response with a
+non-identity ``content-encoding`` cannot be read, and skips them (counted by
+``unsupported_content_encoding``).
 
 Once the AI filters finish, the parsed document is re-serialized as the
 request body by default. With :ref:`reserialize_body
@@ -411,117 +412,94 @@ counted by ``transcoder.failed``.
   Other vendor paths and authentication headers are left to the route, for example through
   ``prefix_rewrite`` and ``request_headers_to_add``.
 
-Response token-usage extraction
--------------------------------
+.. _config_http_filters_ai_protocol_manager_token_usage:
 
-When :ref:`response_handling.token_usage
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.ResponseHandling.token_usage>`
-is configured, 2xx responses with a ``text/event-stream`` or
-``application/json`` content type are observed as they stream through the
-filter. Inspection is scoped to routes carrying a per-route configuration;
-setting :ref:`include_unconfigured_routes
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.include_unconfigured_routes>`
-widens it to every route, for response-only installations whose routes cannot
-be declared (for example a dynamic-forward-proxy cluster). The filter **never stops iteration or modifies the original
-response**, and no extraction failure can affect it. Extraction works on a
-separately bounded side copy — hard-capped at :ref:`max_sse_event_size
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtractionLimits.max_sse_event_size>`
-(SSE) or :ref:`max_json_body_size
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtractionLimits.max_json_body_size>`
-(JSON) per stream, regardless of how large individual data frames are, and
-charged to the stream's buffer memory account when :ref:`account tracking
-<envoy_v3_api_field_config.overload.v3.BufferFactoryConfig.minimum_account_to_track_power_of_two>`
-is enabled — and the extraction work runs on the response's filter-chain
-callbacks. Parsing uses the filter's shared streaming JSON machinery
-(``JsonWithExtBufParser``): a JSON body streams incrementally into the parser
-with no retained side copy, and oversized string values are never
-materialized in the document. A complete SSE event
-arriving within one data frame — the dominant shape of real streams — is
-processed in place and retains nothing; only an event split across frames is
-buffered (consolidating a split event can transiently hold a second
-account-charged copy, bounded by the cap). Only the retained copy is
-account-charged: the transient allocations of parsing a completed event or
-body (the assembled event data string and the JSON document tree) are
-short-lived, bounded by the same caps, and not charged. Named events that
-cannot carry usage (keepalives, content deltas, non-terminal OpenAI
-Responses lifecycle events) are dropped on their ``event:`` line alone,
-before any payload is assembled or parsed, and per-stream parse work is
-bounded by :ref:`max_parsed_sse_events
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtractionLimits.max_parsed_sse_events>`.
+Token usage
+~~~~~~~~~~~
 
-Responses with a non-identity ``content-encoding`` are skipped (counted by
-``unsupported_content_encoding``). To extract usage from compressed provider
-responses:
+The :ref:`token usage filter
+<envoy_v3_api_msg_extensions.http.ai_filters.token_usage.v3.TokenUsage>` publishes
+the token usage a response reports as :ref:`envoy.data.ai.v3.TokenUsage
+<envoy_v3_api_msg_data.ai.v3.TokenUsage>` typed dynamic metadata, under
+``envoy.ai.token_usage``, once the response ends. It never modifies, holds or
+fails the response.
 
-* **Downstream installation**: place the :ref:`decompressor filter
-  <config_http_filters_decompressor>` so that it runs before this filter on
-  the encode path (list it *after* this filter in ``http_filters``, since
-  encoder filters run in reverse order).
-* **Upstream installation**: Envoy's decompressor is a downstream-only filter
-  today, so it cannot run before a cluster-installed AI Protocol Manager. The
-  practical approach is to prevent compression on the provider connection —
-  remove or pin the request's ``accept-encoding`` header on the cluster's
-  filter chain (e.g. with the :ref:`header mutation filter
-  <config_http_filters_header_mutation>`, which supports upstream
-  installation) so the provider responds with identity encoding.
+It reads the response in the IR, OpenAI Chat Completions, and has no
+configuration. A response from an OpenAI-compatible backend is in the IR
+already; any other backend's response is converted by the transcoder's
+backend-boundary instance, which the filter must come after on the response
+path. Response filters run in reverse order, so the filter is listed before
+that instance:
 
-Both streaming shapes are handled:
+.. code-block:: yaml
 
-* SSE streams (OpenAI chunks and lifecycle events, Anthropic named events,
-  Gemini ``?alt=sse``), reassembled across arbitrary frame boundaries.
-* JSON bodies, including Gemini's default (non-SSE) streaming whose complete
-  body is a root-level JSON array of chunks.
+  filters:
+  - name: envoy.http.ai_filters.transcoder      # client API <-> IR
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+      request_handling: TO_IR
+      response_handling: FROM_IR
+  - name: envoy.http.ai_filters.token_usage
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.token_usage.v3.TokenUsage
+  - name: envoy.http.ai_filters.transcoder      # IR <-> backend API
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+      request_handling: FROM_IR
+      response_handling: TO_IR
 
-The response's :ref:`wire API <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` is
-resolved in precedence order: the route's declared response API, the route's
-declared request API, then :ref:`default_llm_protocol
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.default_llm_protocol>`;
-when none is declared it is auto-detected from the response shape (only
-strong, dialect-unique markers lock detection).
-Cumulative streaming counters (Anthropic ``message_delta``, Gemini snapshots)
-are merged with last-value-wins semantics per native field, and the canonical
-values are computed once, after the last event.
+The IR's ``usage`` cannot hold all that other APIs report: it has no place for
+Gemini's tool-use prompt tokens or for a provider total that disagrees with the
+computed one, and an IR response may name the model the client asked for rather
+than the one that served it. So a ``TO_IR`` leg reads the usage from the
+backend's own response before converting it, and hands the record of it down the
+chain in the reserved ``_envoy`` member: on the converted body, or on an event
+of its own at the end of a stream. The filter publishes that record when there
+is one, and reads the IR's ``usage`` otherwise. The record names the backend's
+API and the model it reported, and counts usage in events the transcoder could
+not convert, such as Anthropic's in-band ``error``. The AI Protocol Manager
+removes ``_envoy`` from a response as it enters the AI filters, so an upstream
+cannot supply a record, and again before it leaves them, so a client never sees
+one.
 
-All emitted counts follow one canonical, **inclusive** contract regardless of
-dialect: ``input_tokens`` covers all input consumed (uncached input, cached
-reads, cache writes, and tool-use prompt tokens), ``output_tokens`` covers all
-generated output including reasoning/thought tokens, and ``total_tokens`` is
-computed as their sum and emitted only when both components are known, so the
-emitted triple is always internally consistent. The total the provider itself
-reported is always preserved separately as ``provider_total_tokens``, whether
-or not it agrees with the canonical sum (a disagreement — an internally
-inconsistent response, or a usage bucket unknown to the extractor — is
-counted by ``token_usage_total_mismatch``). The breakdown fields
-(``input_token_details``, ``output_token_details``) are parts of the
-canonical values. The extractor
-normalizes each dialect's native shape onto this contract — for example
+A document in another API than the IR is not read: Anthropic's
+``input_tokens``, read as the IR, would leave out its cache reads. Such a
+response publishes a status-only ``FAILED`` record and is counted by
+``token_usage.api_mismatch``.
+
+All published counts follow one canonical, **inclusive** contract regardless of
+the provider's API: ``input_tokens`` covers all input consumed (uncached input,
+cached reads, cache writes, and tool-use prompt tokens), ``output_tokens``
+covers all generated output including reasoning/thought tokens, and
+``total_tokens`` is computed as their sum and published only when both
+components are known, so the published triple is always internally consistent.
+The total the provider itself reported is preserved separately as
+``provider_total_tokens``, whether or not it agrees with the canonical sum (a
+disagreement is counted by ``token_usage.total_mismatch``). The breakdown fields
+(``input_token_details``, ``output_token_details``) are parts of the canonical
+values. Each API's native shape is normalized onto this contract — for example
 Anthropic's disjoint cache buckets are summed into the canonical input, and
 Gemini's thoughts are summed into the canonical output.
 
 .. note::
 
-  The canonical fields carry consistent *inclusion semantics* across dialects
-  — which native buckets are counted — not equivalent units of work or cost.
+  The canonical fields carry consistent *inclusion semantics* across APIs —
+  which native buckets are counted — not equivalent units of work or cost.
   Tokenizer behavior, model vocabulary, cache pricing, and provider pricing
   all differ; cost accounting additionally needs provider/model identity and
   a pricing model.
 
-At end of stream the result is published under the metadata namespace
-(default ``envoy.ai.token_usage``) as **typed dynamic metadata**: an
-:ref:`envoy.data.ai.v3.TokenUsage <envoy_v3_api_msg_data.ai.v3.TokenUsage>`
-message with full ``uint64`` precision and enum-typed status fields. No
-untyped ``Struct`` mirror is emitted, so consumers that read only untyped
-metadata (``%DYNAMIC_METADATA%`` access-log formatters, CEL expressions)
-do not see this record; consume it through :ref:`ext_proc
-<config_http_filters_ext_proc>` typed metadata forwarding
-(``metadata_options.forwarding_namespaces.typed``) or a filter reading typed
-dynamic metadata, sharing the proto definition for safe parsing.
+Only typed metadata is published: consumers that read only untyped metadata
+(``%DYNAMIC_METADATA%`` access-log formatters) do not see the record; consume it
+through :ref:`ext_proc <config_http_filters_ext_proc>` typed metadata forwarding
+(``metadata_options.forwarding_namespaces.typed``), ``%TYPED_CEL%``, or a filter
+reading typed dynamic metadata, sharing the proto definition for safe parsing.
 
-``llm_protocol`` names the wire API the response spoke, deliberately not a
-provider identity: shape detection cannot distinguish an OpenAI-compatible
-backend (vLLM, other gateways, Gemini's compatibility endpoint) from OpenAI
-itself. When the actual provider identity is needed, derive it from
-configuration or routing (for example cluster metadata), not from this field.
+``llm_protocol`` names the wire API the usage was reported in, deliberately not
+a provider identity: an OpenAI-compatible backend (vLLM, other gateways,
+Gemini's compatibility endpoint) reports an OpenAI API. When the actual provider
+identity is needed, derive it from configuration or routing (for example
+cluster metadata), not from this field.
 
 .. warning::
 
@@ -532,73 +510,48 @@ configuration or routing (for example cluster metadata), not from this field.
   against untrusted destinations, independent verification is required.
 
 Metadata is only published at a clean end of the HTTP response (a reset or
-abandoned stream publishes nothing). When extraction failed outright — the
-only usage-bearing event exceeded a cap, or every usage document was
-malformed, unparseable, or truncated — a **status-only** record is published
-(``llm_protocol``, ``model`` when captured, and ``extraction_status:
-FAILED``, with no counts), so per-stream consumers can distinguish
-"extraction failed" from "the provider supplied no usage", which publishes
-nothing and counts ``token_usage_missing``. ``extraction_status`` reports
-extraction quality: ``COMPLETE`` means every observed usage document was
-extracted; ``PARTIAL`` means usable counts were published but extraction lost
-input on this stream — an event over :ref:`max_sse_event_size
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtractionLimits.max_sse_event_size>`,
-an unparseable document, a known usage field carrying a malformed value
-(wrong type, negative, fractional, null, or out of range), SSE input
-truncated before its terminating blank line, or a canonical sum exceeding the
-exactly-representable bound — so the counts may be stale (for example an
-earlier cumulative snapshot) or incomplete. No status implies the model
-response succeeded (an OpenAI ``response.failed`` event carrying usage is
-still published). Usage can be legitimately absent (for example an OpenAI
-stream without ``stream_options.include_usage``); this is counted by the
-``token_usage_missing`` statistic and no metadata is written.
+abandoned stream publishes nothing). ``extraction_status`` reports extraction
+quality: ``COMPLETE`` means every usage document was read; ``PARTIAL`` means
+usable counts were published but some usage-bearing input was lost — a known
+usage field carrying a malformed value (wrong type, negative, fractional, null,
+or out of range), an in-band stream error before the provider's final usage, or
+a canonical sum exceeding the exactly-representable bound — so the counts may be
+stale or incomplete; ``FAILED`` means usage-bearing input was observed but no
+count could be read, and the record carries no counts. Usage can be
+legitimately absent (for example an OpenAI stream without
+``stream_options.include_usage``); this is counted by ``token_usage.missing``
+and no metadata is written.
 
 The published values are **selected-response usage**, not the total provider
 cost of servicing the downstream request: with retries or hedging only the
 attempt whose response the router selects publishes (a losing attempt can
 still consume billable tokens upstream), and any 2xx body containing usage
 fields — including one served by a cache or generated locally between this
-filter and the client-facing edge — is extracted even though no provider call
-may have occurred for it. Aggregating true per-request provider cost requires
+filter and the client-facing edge — is read even though no provider call may
+have occurred for it. Aggregating true per-request provider cost requires
 per-attempt accounting outside this filter.
 
-Example configuration:
-
-.. code-block:: yaml
-
-  http_filters:
-  - name: envoy.filters.http.ai_protocol_manager
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-      response_handling:
-        token_usage: {}
-
-Filter ordering
-~~~~~~~~~~~~~~~
-
-Metadata is written when the final response data frame (or the response
-trailers) passes this filter. A consumer that reads metadata on the encode
+The record is written as the response ends, before the AI Protocol Manager
+passes the end of the response on. A consumer that reads metadata on the encode
 path — such as an ext_proc filter using
 :ref:`metadata_options.forwarding_namespaces
 <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.metadata_options>`
-— must run *after* the AI Protocol Manager on the encode path to observe the
-usage on that same end-of-stream frame:
+— must run *after* the AI Protocol Manager on the encode path:
 
 * Downstream installation: encoder filters run in the reverse of the
-  ``http_filters`` order, so list the consumer *before* this filter.
+  ``http_filters`` order, so list the consumer *before* the AI Protocol Manager.
 * Upstream installation: all upstream encoder filters run before every
   downstream encoder filter, so any downstream consumer observes the metadata
   without ordering constraints.
 
 An ext_proc consumer additionally needs a :ref:`processing mode
 <envoy_v3_api_msg_extensions.filters.http.ext_proc.v3.ProcessingMode>` under
-which the external processor actually receives a message at or after end of
-stream — the metadata does not exist yet at response-header time, and by
-default ext_proc sends no response-body messages (``response_body_mode:
-NONE``) and skips response trailers. Configure ``response_body_mode: STREAMED``
-(the terminal, end-of-stream body message carries the metadata context), or
-``response_trailer_mode: SEND`` for trailer-ended responses; forwarding the
-namespace alone is not sufficient:
+which the external processor receives a message at the end of the response —
+the metadata does not exist yet at response-header time, and by default ext_proc
+sends no response-body messages (``response_body_mode: NONE``) and skips
+response trailers. Configure ``response_body_mode: STREAMED`` (the terminal,
+end-of-stream body message carries the metadata context), or
+``response_trailer_mode: SEND`` for trailer-ended responses:
 
 .. code-block:: yaml
 
@@ -609,28 +562,35 @@ namespace alone is not sufficient:
       typed:
       - envoy.ai.token_usage
 
-When the external processor only needs token usage metadata, streaming response body
-bytes across gRPC can be avoided. Configuring :ref:`usage_signal
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.usage_signal>`
-to ``SYNTHESIZE_TRAILERS`` adds empty response trailers at end of stream if none exist.
-A downstream ``ext_proc`` filter with ``response_trailer_mode: SEND`` and
-``response_body_mode: NONE`` receives the token usage metadata in ``metadata_context``
-without streaming response body bytes:
+To publish the usage of compressed provider responses, which skip the AI
+filters:
 
-.. code-block:: yaml
+* **Downstream installation**: place the :ref:`decompressor filter
+  <config_http_filters_decompressor>` so that it runs before the AI Protocol
+  Manager on the encode path (list it *after* the AI Protocol Manager in
+  ``http_filters``, since encoder filters run in reverse order).
+* **Upstream installation**: Envoy's decompressor is a downstream-only filter
+  today, so it cannot run before a cluster-installed AI Protocol Manager. The
+  practical approach is to prevent compression on the provider connection —
+  remove or pin the request's ``accept-encoding`` header on the cluster's
+  filter chain (e.g. with the :ref:`header mutation filter
+  <config_http_filters_header_mutation>`, which supports upstream
+  installation) so the provider responds with identity encoding.
 
-  # Upstream filter chain:
-  response_handling:
-    token_usage:
-      usage_signal: SYNTHESIZE_TRAILERS
+The filter outputs statistics in the ``ai_protocol_manager.token_usage.``
+namespace:
 
-.. code-block:: yaml
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 1, 1, 2
 
-  # Downstream ext_proc:
-  processing_mode:
-    response_header_mode: SKIP
-    response_body_mode: NONE
-    response_trailer_mode: SEND
+  found, Counter, "A record with counts was published (``COMPLETE`` or ``PARTIAL``)."
+  partial, Counter, A published record was flagged ``extraction_status: PARTIAL``.
+  failed, Counter, A status-only record was published (``extraction_status: FAILED``; no counts read).
+  missing, Counter, A response ended without usage to publish.
+  total_mismatch, Counter, The provider-reported total disagreed with the canonical input + output sum.
+  duplicate, Counter, Publication was skipped because another installation had already published ``envoy.ai.token_usage`` for this stream.
+  api_mismatch, Counter, "A response, with no record from a transcoder, was in another API than the IR, so it was not read."
 
 Upstream (cluster) installation
 -------------------------------
@@ -638,45 +598,23 @@ Upstream (cluster) installation
 The filter is also registered as an upstream HTTP filter for deployments where
 handling must live on the cluster — for example a dynamic-forward-proxy egress
 cluster whose destination is only known per request. The upstream installation
-is the full filter: the request-path offload/replay runs there too, once per
-retry or hedged attempt, with the caveats described under the request payload
-offload section above. Response token-usage extraction behaves identically in
-either chain.
+is the full filter: the request-path offload/replay and the AI filters run there
+too, once per retry or hedged attempt, with the caveats described under the
+request payload offload section above. The route declares the endpoint for the
+upstream installation as it does for the downstream one.
 
 Typed dynamic metadata written from the upstream installation lands on the
 downstream stream's metadata and is visible to downstream typed-metadata
-consumers exactly as in a downstream installation.
-
-.. note::
-
-  Enable response handling in a **single** placement per metadata namespace.
-  With both placements enabled at once, the first publication owns the
-  namespace for the stream -- the upstream instance, since upstream encoder
-  filters run before downstream encoder filters -- and later instances skip
-  publishing (counted by ``token_usage_duplicate``) rather than merging two
-  observations into one hybrid record. Give each placement its own
-  :ref:`metadata_namespace
-  <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.metadata_namespace>`
-  to capture both.
-
-Response-only installation: a deployment that installs the filter purely to
-observe responses — for example token-usage extraction on a
-dynamic-forward-proxy egress cluster — leaves ``request_handling`` unset (the
-decode path is then a pure passthrough: no header hold, no offload, no
-per-attempt replay) and, since such routes declare no per-route
-configuration, sets :ref:`include_unconfigured_routes
-<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.include_unconfigured_routes>`:
-
-.. code-block:: yaml
-
-  response_handling:
-    token_usage:
-      include_unconfigured_routes: true
+consumers exactly as in a downstream installation. With the token usage filter
+in both installations, the first publication owns ``envoy.ai.token_usage`` for
+the stream -- the upstream instance's, since upstream encoder filters run before
+downstream encoder filters -- and the later instance skips publishing (counted
+by ``token_usage.duplicate``) rather than writing a second record.
 
 Upstream retries and hedging: each upstream attempt runs its own filter
-instance, but only the attempt whose response the router selects streams to a
-clean end of stream through its encoder chain — and non-2xx attempts never
-engage extraction — so only the winning attempt publishes metadata.
+instance, but only the attempt whose response the router selects reaches a
+clean end of its response through its encoder chain — and non-2xx attempts run
+no AI filters — so only the winning attempt publishes metadata.
 
 Statistics
 ----------
@@ -692,20 +630,7 @@ The filter outputs statistics in the ``ai_protocol_manager.`` namespace.
   request_passthrough, Counter, "A payload on an unconfigured route failed to parse under :ref:`parse_unconfigured_routes <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.parse_unconfigured_routes>` and was forwarded unchanged; never a request failure."
   request_external_buffer_error, Counter, The external buffer failed irrecoverably on the request path and the stream was answered with a 500.
   response_external_buffer_error, Counter, The external buffer failed irrecoverably on the response path and the stream was answered with a 500.
-  token_usage_found, Counter, A response yielded token usage and metadata was written (includes ``PARTIAL`` records).
-  token_usage_partial, Counter, A published record was flagged ``extraction_status: PARTIAL``.
-  token_usage_failed, Counter, A status-only record was published (``extraction_status: FAILED``; no counts recovered).
-  token_usage_missing, Counter, A handled response ended with no usage to extract.
-  token_usage_total_mismatch, Counter, The provider-reported total disagreed with the canonical input + output sum.
-  token_usage_duplicate, Counter, Publication skipped because another installation of the filter had already published the namespace for this stream.
-  malformed_usage_field, Counter, "A document carried a known usage field with an unusable value (wrong type, negative, fractional, or out of range); the response is flagged partial."
-  sse_incomplete_event, Counter, Non-empty SSE input could not form a complete event by end of stream and was discarded; the response is flagged partial.
-  sse_event_budget_exhausted, Counter, The stream hit :ref:`max_parsed_sse_events <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtractionLimits.max_parsed_sse_events>`; extraction went inert and the response is flagged partial.
-  response_parse_error, Counter, A JSON body or SSE event payload failed to parse (per occurrence; the stream is unaffected).
-  response_body_too_large, Counter, A JSON response exceeded ``max_json_body_size``; extraction skipped.
-  sse_event_too_large, Counter, Pending or complete SSE event data exceeded ``max_sse_event_size``; that entire event was skipped.
-  unsupported_content_encoding, Counter, The response carried a non-identity ``content-encoding``; extraction skipped.
-  usage_trailers_synthesized, Counter, Empty response trailers were synthesized at end of stream to carry token usage to a downstream consumer.
+  unsupported_content_encoding, Counter, "A response the AI filters would have run over carried a non-identity ``content-encoding``, so they did not."
   request_info.published, Counter, The request info AI filter published an ``envoy.data.ai.v3.RequestInfo`` record.
   request_info.partial, Counter, A published request info record ignored at least one value Envoy could not use.
   request_info.duplicate, Counter, Request info publication skipped because another installation of the filter had already published the namespace for this stream.

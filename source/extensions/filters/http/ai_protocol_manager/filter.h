@@ -18,7 +18,6 @@
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf_parser.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
-#include "source/extensions/filters/http/ai_protocol_manager/response_handler.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stats.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
@@ -51,14 +50,6 @@ public:
   bool parseUnconfiguredRoutes() const { return parse_unconfigured_routes_; }
   bool alwaysSerializeRequest() const { return always_serialize_request_; }
   uint32_t inlineStringThresholdBytes() const { return inline_string_threshold_bytes_; }
-  bool tokenUsageEnabled() const { return token_usage_enabled_; }
-  bool includeUnconfiguredRoutes() const { return include_unconfigured_routes_; }
-  LLMProtocol defaultLLMProtocol() const { return default_llm_protocol_; }
-  const std::string& metadataNamespace() const { return metadata_namespace_; }
-  bool synthesizeUsageTrailers() const { return synthesize_usage_trailers_; }
-  uint32_t maxSseEventSize() const { return max_sse_event_size_; }
-  uint32_t maxJsonBodySize() const { return max_json_body_size_; }
-  uint32_t maxParsedSseEvents() const { return max_parsed_sse_events_; }
   AiProtocolManagerStats& stats() const { return stats_; }
 
 private:
@@ -69,14 +60,6 @@ private:
   const bool parse_unconfigured_routes_ = false;
   const bool always_serialize_request_ = true;
   const uint32_t inline_string_threshold_bytes_ = 0;
-  const bool token_usage_enabled_ = false;
-  const bool include_unconfigured_routes_ = false;
-  const LLMProtocol default_llm_protocol_ = LLMProtocol::Unspecified;
-  const std::string metadata_namespace_;
-  const bool synthesize_usage_trailers_ = false;
-  const uint32_t max_sse_event_size_ = 0;
-  const uint32_t max_json_body_size_ = 0;
-  const uint32_t max_parsed_sse_events_ = 0;
   const AiFilterFactories ai_filter_factories_;
 };
 
@@ -96,12 +79,6 @@ public:
   bool hasRequest() const { return has_request_; }
   LLMProtocol requestProtocol() const { return request_protocol_; }
   LLMProtocol responseProtocol() const { return response_protocol_; }
-
-  // The wire API for response extraction on this route: the declared response
-  // API, falling back to the declared request API.
-  LLMProtocol effectiveResponseProtocol() const {
-    return response_protocol_ != LLMProtocol::Unspecified ? response_protocol_ : request_protocol_;
-  }
 
 private:
   const bool has_request_ = false;
@@ -159,14 +136,9 @@ private:
 // (filter_manager.h); payload schema validation is one of them. Normalization
 // comes later.
 //
-// Encode (response) path: observe-only token-usage extraction. When
-// response_handling.token_usage is configured, 2xx SSE/JSON responses on
-// configured routes (or on all routes with include_unconfigured_routes) are
-// teed into a ResponseHandler; at end of stream the normalized usage is
-// published as dynamic metadata on the downstream StreamInfo, from downstream
-// and upstream installations alike. The filter never stops iteration or
-// mutates the response; extraction works on bounded side state, synchronously
-// on the encode callbacks, and no handler failure can affect the stream.
+// Encode (response) path: a 2xx SSE or JSON response to a request whose AI
+// filters ran is decoded into SSE events or JSON fields, run through the same
+// AI filters in reverse order, and re-serialized.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
@@ -204,11 +176,6 @@ private:
   // The inline-string threshold for this stream: the route's payload schema
   // when it pins one, otherwise the filter's configured default.
   uint32_t inlineStringThresholdBytes() const;
-
-  // Publish the accumulated token usage as dynamic metadata and account stats.
-  // Called exactly once, at response end of stream (data or trailers).
-  // Returns whether a record was published for this stream.
-  bool finalizeResponseHandling();
 
   // Finalizes the decode path when the full request body (and optional trailers) has been received.
   // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
@@ -254,8 +221,6 @@ private:
   std::unique_ptr<FilterManager> filter_manager_;
 
   // Encode-path state.
-  ResponseHandlerPtr response_handler_;
-  bool response_finalized_{false};
   bool encode_input_ended_{false};
   bool encode_has_trailers_{false};
   bool encode_rejected_{false};

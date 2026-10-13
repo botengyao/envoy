@@ -20,7 +20,7 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#protodoc-title: AI token usage]
 
 // Canonical LLM token usage extracted from a provider response by the
-// :ref:`AI Protocol Manager filter <config_http_filters_ai_protocol_manager>`,
+// :ref:`token usage AI filter <config_http_filters_ai_protocol_manager_token_usage>`,
 // published as typed dynamic metadata under one namespace at a clean end of
 // stream.
 //
@@ -46,8 +46,9 @@ message TokenUsage {
     COMPLETE = 1;
 
     // Usable counts were extracted, but some usage-bearing input was lost:
-    // malformed, truncated, or skipped by a configured resource limit. The
-    // counts may be stale (an earlier cumulative snapshot) or incomplete.
+    // malformed, truncated by an in-band stream error, or in an API the
+    // extractor does not read. The counts may be stale (an earlier cumulative
+    // snapshot) or incomplete.
     PARTIAL = 2;
 
     // Usage-bearing input was observed but no usable canonical count could

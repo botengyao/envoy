@@ -23,7 +23,7 @@ using HttpFilters::AiProtocolManager::AiRequestPtr;
 using HttpFilters::AiProtocolManager::AiRequestReceiver;
 using HttpFilters::AiProtocolManager::AiResponseStreamPropagator;
 using HttpFilters::AiProtocolManager::AiResponseStreamReceiver;
-using HttpFilters::AiProtocolManager::FieldPathSegment;
+using HttpFilters::AiProtocolManager::flattenJson;
 using HttpFilters::AiProtocolManager::FlattenJsonField;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
@@ -36,72 +36,8 @@ using HttpFilters::AiProtocolManager::TranscodeDirection;
 using HttpFilters::AiProtocolManager::TranscodeLeg;
 using HttpFilters::AiProtocolManager::TranscodeStreamState;
 using HttpFilters::AiProtocolManager::TranscodingEngine;
+using HttpFilters::AiProtocolManager::unflattenFields;
 using TranscoderProto = envoy::extensions::http::ai_filters::transcoder::v3::Transcoder;
-
-namespace {
-
-void flattenInto(const nlohmann::json& node, std::vector<FieldPathSegment>& path,
-                 std::vector<FlattenJsonField>& out) {
-  if (node.is_object() && !node.empty()) {
-    for (const auto& [key, value] : node.items()) {
-      path.emplace_back(key);
-      flattenInto(value, path, out);
-      path.pop_back();
-    }
-    return;
-  }
-  if (node.is_array() && !node.empty()) {
-    for (size_t i = 0; i < node.size(); ++i) {
-      path.emplace_back(i);
-      flattenInto(node[i], path, out);
-      path.pop_back();
-    }
-    return;
-  }
-  out.emplace_back(path, node);
-}
-
-} // namespace
-
-nlohmann::json unflattenFields(absl::Span<const FlattenJsonField> fields) {
-  nlohmann::json root = nlohmann::json::object();
-  // Whether the field before was a partial chunk of a string, which the next field completes.
-  bool continues_string = false;
-  for (const FlattenJsonField& field : fields) {
-    nlohmann::json* curr = &root;
-    for (const FieldPathSegment& seg : field.field_path()) {
-      if (absl::holds_alternative<std::string>(seg)) {
-        if (!curr->is_object()) {
-          *curr = nlohmann::json::object();
-        }
-        curr = &((*curr)[absl::get<std::string>(seg)]);
-      } else {
-        const size_t idx = absl::get<size_t>(seg);
-        if (!curr->is_array()) {
-          *curr = nlohmann::json::array();
-        }
-        while (curr->size() <= idx) {
-          curr->push_back(nullptr);
-        }
-        curr = &((*curr)[idx]);
-      }
-    }
-    if (continues_string && curr->is_string() && field.node().is_string()) {
-      curr->get_ref<std::string&>().append(field.node().get_ref<const std::string&>());
-    } else {
-      *curr = field.node();
-    }
-    continues_string = field.is_partial();
-  }
-  return root;
-}
-
-std::vector<FlattenJsonField> flattenJson(const nlohmann::json& json) {
-  std::vector<FlattenJsonField> out;
-  std::vector<FieldPathSegment> path;
-  flattenInto(json, path, out);
-  return out;
-}
 
 TranscoderFilterConfig::TranscoderFilterConfig(const TranscoderProto& proto,
                                                TranscodingEngine engine, Stats::Scope& scope)
@@ -169,14 +105,13 @@ TranscoderFilter::encodeUnary(AiResponseStreamReceiver receive_response,
   nlohmann::json doc = unflattenFields(all_fields);
   TranscodeContext ctx = responseContext();
   const absl::Status status = config_->engine().transcode(*leg, ctx, doc);
-  if (!status.ok()) {
+  if (status.ok()) {
+    config_->stats().transcoded_.inc();
+  } else {
+    // The engine left `doc` untranslated, but with the reserved member it carries down the chain.
     config_->stats().failed_.inc();
     ENVOY_LOG(debug, "transcoder: forwarding unary response untranslated: {}", status.message());
-    CO_RETURN_IF_ERROR(co_await propagate_response(std::move(all_fields)));
-    co_return absl::OkStatus();
   }
-
-  config_->stats().transcoded_.inc();
   CO_RETURN_IF_ERROR(co_await propagate_response(flattenJson(doc)));
   co_return absl::OkStatus();
 }

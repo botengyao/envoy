@@ -163,6 +163,17 @@ private:
   bool root_emitted_{false};
 };
 
+// A unary response body reaches an AI filter as the leaf fields `FlatteningJsonDecoder` flattens it
+// into, while some AI filters work on whole documents. These two convert between the two forms
+// without serializing the document in between.
+//
+// Rebuilds the document `fields` flatten. A string that arrives as partial chunks
+// (`FlattenJsonField::is_partial()`) is joined back into one.
+nlohmann::json unflattenFields(absl::Span<const FlattenJsonField> fields);
+// Flattens `json` into the leaf fields, in the same order, that `FlatteningJsonDecoder` emits for
+// its serialization: one per scalar and per empty object or array, none of them partial.
+std::vector<FlattenJsonField> flattenJson(const nlohmann::json& json);
+
 } // namespace AiProtocolManager
 } // namespace HttpFilters
 } // namespace Extensions

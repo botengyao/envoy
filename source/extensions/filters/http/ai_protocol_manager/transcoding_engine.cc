@@ -7,6 +7,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/reserved_member.h"
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/ascii.h"
@@ -2837,10 +2838,47 @@ absl::Status transcodeRequest(const DialectTranscodePack& pack, TranscodeDirecti
   return absl::OkStatus();
 }
 
+// Takes `json`'s reserved member out of the dialect's reach. Returns it, or null when there is
+// none.
+nlohmann::json takeReservedMember(nlohmann::json& json) {
+  if (!json.is_object()) {
+    return nullptr;
+  }
+  const auto member = json.find(ReservedMember::Name);
+  if (member == json.end()) {
+    return nullptr;
+  }
+  nlohmann::json taken = std::move(*member);
+  json.erase(member);
+  return taken;
+}
+
+// Puts back what takeReservedMember() took.
+void restoreReservedMember(nlohmann::json& json, nlohmann::json member) {
+  if (!member.is_null() && json.is_object()) {
+    json[std::string(ReservedMember::Name)] = std::move(member);
+  }
+}
+
+void addUsageRecord(nlohmann::json& member, const UsageAccumulator& usage) {
+  if (!member.is_object()) {
+    member = nlohmann::json::object();
+  }
+  member[std::string(ReservedMember::TokenUsageRecord)] = usageRecordToJson(usage.record());
+}
+
 absl::Status transcodeResponse(const DialectTranscodePack& pack, TranscodeDirection direction,
                                TranscodeContext& ctx, nlohmann::json& json) {
   if (pack.protocol == TranscodingEngine::kIrProtocol) {
     return absl::OkStatus();
+  }
+  nlohmann::json reserved = takeReservedMember(json);
+  if (direction == TranscodeDirection::ToIr) {
+    UsageAccumulator usage;
+    usage.add(AdapterRegistry::get(pack.protocol), json);
+    if (usage.observed()) {
+      addUsageRecord(reserved, usage);
+    }
   }
   const TranscodeRuleSet& rules =
       direction == TranscodeDirection::ToIr ? pack.response.to_ir : pack.response.from_ir;
@@ -2849,11 +2887,11 @@ absl::Status transcodeResponse(const DialectTranscodePack& pack, TranscodeDirect
   // offloaded bytes.
   nlohmann::json working = json;
   absl::Status status = rules.execute(working, &ctx);
-  if (!status.ok()) {
-    return status;
+  if (status.ok()) {
+    json = std::move(working);
   }
-  json = std::move(working);
-  return absl::OkStatus();
+  restoreReservedMember(json, std::move(reserved));
+  return status;
 }
 
 // Builds an SSE event named `name` around the JSON payload `json`.
@@ -2866,6 +2904,23 @@ absl::StatusOr<SseEventPtr> makeJsonEvent(const std::string& name, nlohmann::jso
     return status;
   }
   return event;
+}
+
+// Puts the event that hands a `ToIr` stream's usage record down the chain ahead of `events`, when
+// the provider reported any. The event carries only the reserved member, so the AI Protocol
+// Manager drops it before the response leaves.
+void prependUsageRecord(const TranscodeLeg& leg, const TranscodeStreamState& state,
+                        std::vector<SseEventPtr>& events) {
+  if (leg.direction != TranscodeDirection::ToIr || !state.provider_usage.observed()) {
+    return;
+  }
+  nlohmann::json member;
+  addUsageRecord(member, state.provider_usage);
+  JsonWithExtBuf payload;
+  payload.setJson(nlohmann::json{{std::string(ReservedMember::Name), std::move(member)}});
+  auto event = std::make_unique<SseEvent>();
+  event->set_json(std::move(payload));
+  events.insert(events.begin(), std::move(event));
 }
 
 // Builds the events a stream grammar writes itself, completing each JSON payload with its rules.
@@ -2993,9 +3048,14 @@ TranscodingEngine::transcodeStreamEvent(const TranscodeLeg& leg, TranscodeContex
     return absl::InvalidArgumentError("no SSE event to transcode");
   }
   std::vector<SseEventPtr> out;
-  if (*grammar == nullptr) {
+  if (*grammar == nullptr ||
+      (event->is_json() && ReservedMember::isOnlyMember(event->json().json()))) {
     out.push_back(std::move(event));
     return out;
+  }
+  // Read before any case can refuse the event, and outside the rules' rollback below.
+  if (leg.direction == TranscodeDirection::ToIr && event->is_json()) {
+    ctx.stream_state->provider_usage.add(AdapterRegistry::get(leg.dialect), event->json().json());
   }
 
   const std::vector<StreamEventCase>& cases = (*grammar)->cases;
@@ -3023,6 +3083,7 @@ TranscodingEngine::transcodeStreamEvent(const TranscodeLeg& leg, TranscodeContex
     }
     ctx.stream_state->terminated = true;
     event.reset();
+    prependUsageRecord(leg, *ctx.stream_state, *emitted);
     return emitted;
   }
   case StreamDisposition::Transcode:
@@ -3074,6 +3135,7 @@ TranscodingEngine::finishStream(const TranscodeLeg& leg, TranscodeContext& ctx) 
     return emitted.status();
   }
   ctx.stream_state->terminated = true;
+  prependUsageRecord(leg, *ctx.stream_state, *emitted);
   return emitted;
 }
 

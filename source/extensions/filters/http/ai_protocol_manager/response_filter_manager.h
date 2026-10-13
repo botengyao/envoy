@@ -25,7 +25,9 @@ namespace AiProtocolManager {
 // relative to the request path. Incoming response bytes fed via onData() are buffered and
 // accounted against the stream's FilterChainBridge watermarks, decoded into response items by the
 // active response mode (e.g. SSE frames), passed through the filter pipeline, and re-serialized
-// into the output BufferManager.
+// into the output BufferManager. Each document loses its ReservedMember (reserved_member.h) as it
+// is decoded and again before it is serialized; an SSE event that carries nothing else is not
+// serialized at all.
 //
 // Lifetime: owns a shared_ptr<AsyncState> so coroutines can safely suspend across asynchronous
 // operations; cancel() and destruction safely tear down the pipeline at any point.

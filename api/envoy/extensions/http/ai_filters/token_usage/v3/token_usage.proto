@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package envoy.extensions.http.ai_filters.token_usage.v3;
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.http.ai_filters.token_usage.v3";
+option java_outer_classname = "TokenUsageProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/http/ai_filters/token_usage/v3;token_usagev3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: Token usage AI filter]
+// Token usage AI filter :ref:`configuration overview
+// <config_http_filters_ai_protocol_manager_token_usage>`.
+// [#extension: envoy.http.ai_filters.token_usage]
+
+// Publishes the token usage a response reports as :ref:`TokenUsage
+// <envoy_v3_api_msg_data.ai.v3.TokenUsage>` typed dynamic metadata, under ``envoy.ai.token_usage``,
+// at a clean end of stream. It reads the response in the IR, OpenAI Chat Completions: either the
+// response as an OpenAI-compatible backend sent it, or as the :ref:`transcoder
+// <envoy_v3_api_msg_extensions.http.ai_filters.transcoder.v3.Transcoder>` converted it, in which
+// case it publishes the record of the usage the backend reported in its own API. It never
+// modifies, holds or fails the response.
+message TokenUsage {
+}

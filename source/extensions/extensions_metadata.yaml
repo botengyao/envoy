@@ -2417,6 +2417,13 @@ envoy.http.ai_filters.schema_validation:
   status: alpha
   type_urls:
   - envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
+envoy.http.ai_filters.token_usage:
+  categories:
+  - envoy.http.ai_filters
+  security_posture: unknown
+  status: alpha
+  type_urls:
+  - envoy.extensions.http.ai_filters.token_usage.v3.TokenUsage
 envoy.http.ai_filters.transcoder:
   categories:
   - envoy.http.ai_filters

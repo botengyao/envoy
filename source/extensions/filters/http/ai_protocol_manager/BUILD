@@ -162,23 +162,30 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "response_handler_lib",
-    srcs = ["response_handler.cc"],
-    hdrs = ["response_handler.h"],
+    name = "reserved_member_lib",
+    srcs = ["reserved_member.cc"],
+    hdrs = ["reserved_member.h"],
     deps = [
-        ":json_with_ext_buf_parser_lib",
-        ":llm_protocol_adapters_lib",
-        ":stats_lib",
-        ":token_usage_lib",
-        "//envoy/buffer:buffer_interface",
-        "//envoy/common:pure_lib",
-        "//envoy/stats:stats_macros",
-        "//source/common/buffer:buffer_lib",
-        "//source/common/common:assert_lib",
-        "//source/common/common:logger_lib",
-        "//source/common/http/sse:sse_parser_lib",
-        "//source/extensions/filters/http/ai_protocol_manager/sse:sse_scanner_lib",
         "@abseil-cpp//absl/strings",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_cc_library(
+    name = "usage_record_lib",
+    srcs = ["usage_record.cc"],
+    hdrs = ["usage_record.h"],
+    deps = [
+        ":json_readers_lib",
+        ":llm_protocol_adapters_lib",
+        ":llm_protocol_conversion_lib",
+        ":token_usage_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
+        "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
+        "@nlohmann_json//:json",
     ],
 )
 
@@ -201,8 +208,10 @@ envoy_cc_library(
     deps = [
         ":json_with_ext_buf_lib",
         ":llm_protocol_adapters_lib",
+        ":reserved_member_lib",
         ":schema_lib",
         ":token_usage_lib",
+        ":usage_record_lib",
         "//source/common/buffer:buffer_lib",
         "//source/extensions/filters/http/ai_protocol_manager/sse:sse_event_lib",
         "@abseil-cpp//absl/container:flat_hash_map",
@@ -273,6 +282,7 @@ envoy_cc_library(
         ":external_buffer_interface",
         ":filter_pipeline_lib",
         ":flattening_json_codec_lib",
+        ":reserved_member_lib",
         ":task_group_lib",
         "//envoy/buffer:buffer_interface",
         "//source/common/buffer:buffer_lib",
@@ -286,6 +296,7 @@ envoy_cc_library(
         "@abseil-cpp//absl/functional:any_invocable",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/types:span",
         "@abseil-cpp//absl/types:variant",
     ],
 )
@@ -430,8 +441,8 @@ envoy_cc_library(
         ":filter_manager_lib",
         ":json_with_ext_buf_lib",
         ":json_with_ext_buf_parser_lib",
+        ":llm_protocol_adapters_lib",
         ":llm_protocol_conversion_lib",
-        ":response_handler_lib",
         ":schema_lib",
         ":serializer_lib",
         ":stats_lib",
@@ -452,7 +463,6 @@ envoy_cc_library(
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/status:statusor",
         "@abseil-cpp//absl/strings",
-        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
     ],
 )

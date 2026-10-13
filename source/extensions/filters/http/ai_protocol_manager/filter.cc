@@ -3,7 +3,6 @@
 #include <memory>
 
 #include "envoy/common/exception.h"
-#include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/http/codes.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -21,7 +20,6 @@
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 
 #include "absl/strings/match.h"
-#include "absl/strings/numbers.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -30,16 +28,7 @@ namespace AiProtocolManager {
 
 namespace {
 
-constexpr absl::string_view DefaultTokenUsageNamespace{"envoy.ai.token_usage"};
 constexpr absl::string_view SseContentType{"text/event-stream"};
-// Sized so that ordinary OpenAI Responses API terminal lifecycle events --
-// which embed the complete response object, generated output included -- are
-// extracted by default; see the proto for the rationale.
-constexpr uint32_t DefaultMaxSseEventSize = 1024 * 1024;
-constexpr uint32_t DefaultMaxJsonBodySize = 4 * 1024 * 1024;
-// Far above ordinary streams (hundreds to low thousands of events) while
-// bounding the parse work a lifetime event flood can extract; see the proto.
-constexpr uint32_t DefaultMaxParsedSseEvents = 65536;
 
 // HTTP Content-Type is case-insensitive and may carry parameters
 // (`application/json; charset=utf-8`).
@@ -103,46 +92,6 @@ bool contentEncodingIsIdentity(const Http::ResponseHeaderMap& headers) {
   return true;
 }
 
-// Converts the finalized accumulator once into the authoritative typed
-// record (envoy.data.ai.v3.TokenUsage). A record with no counts at all is
-// status-only and publishes as FAILED.
-envoy::data::ai::v3::TokenUsage typedUsage(const TokenUsage& usage, bool degraded) {
-  envoy::data::ai::v3::TokenUsage typed;
-  typed.set_llm_protocol(protocolToProto(usage.llm_protocol));
-  if (!usage.model.empty()) {
-    typed.set_model(usage.model);
-  }
-  const auto set = [](const std::optional<uint64_t>& value, auto setter) {
-    if (value.has_value()) {
-      setter(value.value());
-    }
-  };
-  set(usage.input_tokens, [&typed](uint64_t v) { typed.mutable_input_tokens()->set_value(v); });
-  set(usage.output_tokens, [&typed](uint64_t v) { typed.mutable_output_tokens()->set_value(v); });
-  set(usage.total_tokens, [&typed](uint64_t v) { typed.mutable_total_tokens()->set_value(v); });
-  set(usage.cached_input_tokens, [&typed](uint64_t v) {
-    typed.mutable_input_token_details()->mutable_cached_tokens()->set_value(v);
-  });
-  set(usage.cache_creation_input_tokens, [&typed](uint64_t v) {
-    typed.mutable_input_token_details()->mutable_cache_creation_tokens()->set_value(v);
-  });
-  set(usage.tool_use_input_tokens, [&typed](uint64_t v) {
-    typed.mutable_input_token_details()->mutable_tool_use_tokens()->set_value(v);
-  });
-  set(usage.reasoning_tokens, [&typed](uint64_t v) {
-    typed.mutable_output_token_details()->mutable_reasoning_tokens()->set_value(v);
-  });
-  set(usage.provider_total_tokens,
-      [&typed](uint64_t v) { typed.mutable_provider_total_tokens()->set_value(v); });
-  if (!usage.hasAny()) {
-    typed.set_extraction_status(envoy::data::ai::v3::TokenUsage::FAILED);
-  } else {
-    typed.set_extraction_status(degraded ? envoy::data::ai::v3::TokenUsage::PARTIAL
-                                         : envoy::data::ai::v3::TokenUsage::COMPLETE);
-  }
-  return typed;
-}
-
 } // namespace
 
 FilterConfig::FilterConfig(
@@ -158,26 +107,6 @@ FilterConfig::FilterConfig(
       inline_string_threshold_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
           proto.request_handling().limits(), inline_string_threshold_bytes,
           JsonWithExtBufParser::kDefaultInlineStringThresholdBytes)),
-      token_usage_enabled_(proto.response_handling().has_token_usage()),
-      include_unconfigured_routes_(
-          proto.response_handling().token_usage().include_unconfigured_routes()),
-      default_llm_protocol_(
-          protocolFromProto(proto.response_handling().token_usage().default_llm_protocol())),
-      metadata_namespace_(proto.response_handling().token_usage().metadata_namespace().empty()
-                              ? std::string(DefaultTokenUsageNamespace)
-                              : proto.response_handling().token_usage().metadata_namespace()),
-      synthesize_usage_trailers_(proto.response_handling().token_usage().usage_signal() ==
-                                 envoy::extensions::filters::http::ai_protocol_manager::v3::
-                                     TokenUsageExtraction::SYNTHESIZE_TRAILERS),
-      max_sse_event_size_(
-          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
-                                          max_sse_event_size, DefaultMaxSseEventSize)),
-      max_json_body_size_(
-          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
-                                          max_json_body_size, DefaultMaxJsonBodySize)),
-      max_parsed_sse_events_(
-          PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
-                                          max_parsed_sse_events, DefaultMaxParsedSseEvents)),
       ai_filter_factories_(std::move(ai_filter_factories)) {}
 
 absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
@@ -484,34 +413,17 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   // TODO(penguingao): consider add request only / response only AI filter chain
   // when there is a need. Currently, all AI filters handle both request and
   // response.
-  const bool can_filter_response = filter_manager_ != nullptr && !payload_rejected_;
-
-  // Route scoping: only declared AI endpoints are inspected unless the filter
-  // opted into unconfigured routes, so enabling token usage on a mixed
-  // listener does not silently parse unrelated JSON/SSE responses. Resolved
-  // fresh here rather than cached from the decode path: the decode-path copy
-  // is not taken when request handling is disabled, and it could be stale --
-  // a later decode filter may refresh the route (clearRouteCache), and by
-  // response time the route is frozen as the one that actually routed the
-  // request.
-  const RouteConfig* route_config =
-      Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(encoder_callbacks_);
-  const bool want_token_usage = config_->tokenUsageEnabled() &&
-                                (route_config != nullptr || config_->includeUnconfiguredRoutes());
-
-  if (!can_filter_response && !want_token_usage) {
+  if (filter_manager_ == nullptr || payload_rejected_) {
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // Only successful responses carry usage or run response filters; errors and
-  // local replies pass through uninspected.
+  // Only successful responses run response filters; errors and local replies
+  // pass through uninspected.
   const auto status = Http::Utility::getResponseStatusOrNullopt(headers);
   if (!status.has_value() || status.value() < 200 || status.value() >= 300) {
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // Content-type selection first: only responses that would otherwise be
-  // inspected can count an encoding skip.
   const absl::string_view content_type = headers.getContentTypeValue();
   const bool is_sse = contentTypeMatches(content_type, SseContentType);
   const bool is_json = !is_sse && isJsonResponse(headers, end_stream);
@@ -520,97 +432,37 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   }
 
   // A compressed body cannot be inspected here: unless the body is decompressed
-  // before this filter on the encode path, extraction is skipped (the response
-  // is unaffected either way).
+  // before this filter on the encode path, the response filters are skipped
+  // (the response is unaffected either way).
   if (!contentEncodingIsIdentity(headers)) {
-    if (want_token_usage) {
-      config_->stats().unsupported_content_encoding_.inc();
-    }
+    config_->stats().unsupported_content_encoding_.inc();
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // An eligible headers-only response carries no usage: counted like an
-  // empty terminal body, independent of codec framing.
   if (end_stream) {
-    if (want_token_usage) {
-      config_->stats().token_usage_missing_.inc();
-    }
     return Http::FilterHeadersStatus::Continue;
   }
 
-  uint64_t content_length = 0;
-  const bool has_content_length =
-      absl::SimpleAtoi(headers.getContentLengthValue(), &content_length);
-
-  if (can_filter_response && (is_sse || is_json)) {
-    headers.removeContentLength();
-    encode_bridge_ = std::make_unique<EncoderFilterChainBridge>(
-        *encoder_callbacks_, *decoder_callbacks_, config_->stats());
-    encode_manager_ = std::make_shared<BufferManager>(
-        BufferManager::Config{encoder_callbacks_->encoderBufferLimit()}, buffer_factory_,
-        *encode_bridge_);
-    if (is_sse) {
-      filter_manager_->startSseResponse(
-          buffer_factory_, *encode_bridge_, *encode_manager_,
-          [this](absl::Status status) { onEncodeComplete(std::move(status)); });
-    } else if (is_json) {
-      filter_manager_->startUnaryResponse(
-          buffer_factory_, *encode_bridge_, *encode_manager_,
-          [this](absl::Status status) { onEncodeComplete(std::move(status)); });
-    }
-  }
-
-  if (want_token_usage) {
-    // The wire API to extract against, in precedence order: the route's declared
-    // response API, the route's declared request API, the configured fallback;
-    // Unspecified auto-detects from the response shape.
-    LLMProtocol protocol = config_->defaultLLMProtocol();
-    if (route_config != nullptr &&
-        route_config->effectiveResponseProtocol() != LLMProtocol::Unspecified) {
-      protocol = route_config->effectiveResponseProtocol();
-    }
-
-    // Observation buffers charge the stream's memory account when tracking is
-    // enabled; in an upstream installation the decoder callbacks resolve to the
-    // downstream stream's account.
-    const Buffer::BufferMemoryAccountSharedPtr account = decoder_callbacks_->account();
-    if (is_sse) {
-      response_handler_ = std::make_unique<SseResponseHandler>(protocol, config_->maxSseEventSize(),
-                                                               config_->maxParsedSseEvents(),
-                                                               config_->stats(), account);
-    } else {
-      auto handler = std::make_unique<JsonResponseHandler>(protocol, config_->maxJsonBodySize(),
-                                                           config_->stats(), account);
-      // A body already known (from content-length) to exceed the cap abandons
-      // extraction up front, through the same transition the incremental cap
-      // takes -- identical bodies produce the identical outcome regardless of
-      // whether the length was advertised. onData() stays authoritative for
-      // absent or wrong lengths.
-      if (has_content_length && content_length > config_->maxJsonBodySize()) {
-        handler->abandonOverLimit();
-      }
-      response_handler_ = std::move(handler);
-    }
+  headers.removeContentLength();
+  encode_bridge_ = std::make_unique<EncoderFilterChainBridge>(
+      *encoder_callbacks_, *decoder_callbacks_, config_->stats());
+  encode_manager_ = std::make_shared<BufferManager>(
+      BufferManager::Config{encoder_callbacks_->encoderBufferLimit()}, buffer_factory_,
+      *encode_bridge_);
+  if (is_sse) {
+    filter_manager_->startSseResponse(
+        buffer_factory_, *encode_bridge_, *encode_manager_,
+        [this](absl::Status status) { onEncodeComplete(std::move(status)); });
+  } else {
+    filter_manager_->startUnaryResponse(
+        buffer_factory_, *encode_bridge_, *encode_manager_,
+        [this](absl::Status status) { onEncodeComplete(std::move(status)); });
   }
   return Http::FilterHeadersStatus::Continue;
 }
 
 Http::FilterDataStatus AiProtocolManagerFilter::encodeData(Buffer::Instance& data,
                                                            bool end_stream) {
-  if (response_handler_ != nullptr && !response_finalized_) {
-    response_handler_->onData(data);
-    if (end_stream) {
-      response_handler_->onEndStream();
-      if (finalizeResponseHandling() && config_->synthesizeUsageTrailers()) {
-        // Synthesize empty trailers at end of stream to wake trailer-driven consumers.
-        encoder_callbacks_->addEncodedTrailers();
-        config_->stats().usage_trailers_synthesized_.inc();
-        encode_has_trailers_ = true;
-        ENVOY_LOG(trace, "ai_protocol_manager: added end-of-stream trailers to carry usage");
-      }
-    }
-  }
-
   if (encode_manager_ != nullptr) {
     if (encode_rejected_) {
       data.drain(data.length());
@@ -627,14 +479,6 @@ Http::FilterDataStatus AiProtocolManagerFilter::encodeData(Buffer::Instance& dat
 }
 
 Http::FilterTrailersStatus AiProtocolManagerFilter::encodeTrailers(Http::ResponseTrailerMap&) {
-  if (response_handler_ != nullptr && !response_finalized_) {
-    // Trailers end the body: the handler must observe end-of-stream (parsing a
-    // buffered JSON body, resolving a pending SSE terminator) before the
-    // result is finalized.
-    response_handler_->onEndStream();
-    finalizeResponseHandling();
-  }
-
   if (encode_manager_ != nullptr) {
     if (encode_rejected_) {
       return Http::FilterTrailersStatus::StopIteration;
@@ -667,72 +511,6 @@ void AiProtocolManagerFilter::onEncodeComplete(absl::Status status) {
     Buffer::OwnedImpl end_marker;
     encoder_callbacks_->injectEncodedDataToFilterChain(end_marker, /*end_stream=*/true);
   }
-}
-
-bool AiProtocolManagerFilter::finalizeResponseHandling() {
-  response_finalized_ = true;
-
-  TokenUsage usage = response_handler_->usage();
-  finalizeUsage(usage);
-  const bool degraded = response_handler_->degraded() || usage.canonicalizationOverflow();
-  if (!usage.hasAny() && !degraded) {
-    // Legitimately absent usage: e.g. an OpenAI stream without
-    // `stream_options.include_usage`, or an unrecognized response shape.
-    config_->stats().token_usage_missing_.inc();
-    return false;
-  }
-
-  // Two publications for one stream (both-placement installs) would leave
-  // consumers with an ambiguous record. First writer wins: the upstream
-  // instance publishes first, later instances skip.
-  const auto& existing_metadata =
-      encoder_callbacks_->streamInfo().dynamicMetadata().typed_filter_metadata();
-  if (existing_metadata.contains(config_->metadataNamespace())) {
-    ENVOY_LOG(debug,
-              "ai_protocol_manager: namespace {} already published for this stream "
-              "(both-placement installation); skipping duplicate publication",
-              config_->metadataNamespace());
-    config_->stats().token_usage_duplicate_.inc();
-    return false;
-  }
-
-  // Convert the finalized accumulator once into the authoritative typed
-  // record (envoy.data.ai.v3.TokenUsage). When extraction failed outright the
-  // record is status-only (llm_protocol/model/extraction_status, no counts),
-  // letting consumers distinguish "failed to extract" from "no usage
-  // supplied". Only typed metadata is published: consumers with full-fidelity
-  // needs (ext_proc typed forwarding, filters reading typed metadata) share
-  // the proto definition; no untyped Struct mirror is emitted.
-  // TODO(botengyao): move this dynamic-metadata publication into a built-in
-  // AI payload filter once the payload filter manager (the in-filter chain
-  // over the parsed payload) lands. The filter core then only orchestrates
-  // transport, and publication becomes an ordered, configurable chain entry
-  // like any other payload feature.
-  const envoy::data::ai::v3::TokenUsage typed = typedUsage(usage, degraded);
-  // In both roles streamInfo() resolves to the downstream request's
-  // StreamInfo. Under retries/hedging only the router-selected attempt
-  // streams to a clean end of stream, so only the winner reaches this write.
-  Protobuf::Any typed_any;
-  MessageUtil::packFrom(typed_any, typed);
-  encoder_callbacks_->streamInfo().setDynamicTypedMetadata(config_->metadataNamespace(), typed_any);
-
-  if (!usage.hasAny()) {
-    config_->stats().token_usage_failed_.inc();
-    ENVOY_LOG(trace, "ai_protocol_manager: status-only (failed) record published to namespace {}",
-              config_->metadataNamespace());
-    return true;
-  }
-  if (degraded) {
-    config_->stats().token_usage_partial_.inc();
-  }
-  if (usage.provider_total_tokens.has_value() && usage.total_tokens.has_value() &&
-      usage.provider_total_tokens.value() != usage.total_tokens.value()) {
-    config_->stats().token_usage_total_mismatch_.inc();
-  }
-  config_->stats().token_usage_found_.inc();
-  ENVOY_LOG(trace, "ai_protocol_manager: token usage published to namespace {}",
-            config_->metadataNamespace());
-  return true;
 }
 
 } // namespace AiProtocolManager

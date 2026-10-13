@@ -130,6 +130,8 @@ using AiFilterSharedPtr = std::shared_ptr<AiFilter>;
 // Per-stream inputs for an AI filter; copy it. The referents belong to the stream, so a filter
 // must not use them after propagating the request, replying locally, or an await failing.
 struct AiFilterContext {
+  // The exception to the rule above: valid for as long as the filter's coroutines run, which the
+  // manager cancels before the stream goes away.
   StreamInfo::StreamInfo& stream_info;
   // Held back until the chain finishes, so a rewrite made before propagating reaches the upstream.
   Http::RequestHeaderMap& request_headers;

@@ -899,6 +899,91 @@ TEST_F(ResponseFilterManagerTest, UnarySourceIsPausedWhenPipelineIsBackedUp) {
             nlohmann::json::parse(R"({"a":"1111111111","b":"2222222222","c":"3333333333"})"));
 }
 
+// Records whether a frame reached it with the reserved member, then adds one to every frame and
+// sends a frame of its own that carries nothing else.
+class ReservedMemberSseFilter : public AiFilter {
+public:
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver, AiRequestPropagator,
+                                       LocalReplier) override {
+    co_return absl::OkStatus();
+  }
+
+  Coroutine::Task<absl::Status> encodeSSE(SseStreamReceiver receive,
+                                          SseStreamPropagator propagate) override {
+    while (true) {
+      ASSIGN_OR_CO_RETURN(auto event, co_await receive());
+      if (!event.has_value()) {
+        co_return absl::OkStatus();
+      }
+      if ((*event)->is_json()) {
+        nlohmann::json& json = (*event)->json().json();
+        saw_reserved_member_ = saw_reserved_member_ || json.contains("_envoy");
+        json["_envoy"] = nlohmann::json{{"note", 1}};
+        auto carrier = std::make_unique<SseEvent>();
+        JsonWithExtBuf payload;
+        payload.setJson(nlohmann::json{{"_envoy", {{"note", 2}}}});
+        carrier->set_json(std::move(payload));
+        CO_RETURN_IF_ERROR(co_await propagate(std::move(carrier)));
+      }
+      CO_RETURN_IF_ERROR(co_await propagate(std::move(*event)));
+    }
+  }
+
+  bool saw_reserved_member_{false};
+};
+
+// The unary counterpart of ReservedMemberSseFilter: it adds a field under the reserved member.
+class ReservedMemberUnaryFilter : public AiFilter {
+public:
+  Coroutine::Task<absl::Status> decode(AiRequestReceiver, AiRequestPropagator,
+                                       LocalReplier) override {
+    co_return absl::OkStatus();
+  }
+
+  Coroutine::Task<absl::Status> encodeUnary(AiResponseStreamReceiver receive,
+                                            AiResponseStreamPropagator propagate) override {
+    while (true) {
+      ASSIGN_OR_CO_RETURN(std::vector<FlattenJsonField> fields, co_await receive());
+      if (fields.empty()) {
+        break;
+      }
+      for (const FlattenJsonField& field : fields) {
+        const FieldPath path = field.field_path();
+        saw_reserved_member_ =
+            saw_reserved_member_ || (!path.empty() && path[0] == FieldPathSegment{"_envoy"});
+      }
+      CO_RETURN_IF_ERROR(co_await propagate(std::move(fields)));
+    }
+    std::vector<FlattenJsonField> note;
+    note.emplace_back(std::vector<FieldPathSegment>{"_envoy", "note"}, nlohmann::json(1));
+    co_return co_await propagate(std::move(note));
+  }
+
+  bool saw_reserved_member_{false};
+};
+
+// The reserved member stays inside the chain: an upstream cannot hand one to the AI filters, and
+// the AI filters cannot hand one to the client.
+TEST_F(ResponseFilterManagerTest, SseReservedMemberStaysInsideTheChain) {
+  auto filter = std::make_shared<ReservedMemberSseFilter>();
+  makeManager({filter});
+  feed("data: {\"_envoy\":{\"forged\":true},\"a\":1}\n\ndata: [DONE]\n\n");
+
+  EXPECT_THAT(result_, IsOk());
+  EXPECT_FALSE(filter->saw_reserved_member_);
+  EXPECT_EQ(output(), "data: {\"a\":1}\n\ndata: [DONE]\n\n");
+}
+
+TEST_F(ResponseFilterManagerTest, UnaryReservedMemberStaysInsideTheChain) {
+  auto filter = std::make_shared<ReservedMemberUnaryFilter>();
+  makeManager({filter}, unaryConfig());
+  feed(R"({"_envoy":{"forged":true},"a":1})");
+
+  EXPECT_THAT(result_, IsOk());
+  EXPECT_FALSE(filter->saw_reserved_member_);
+  EXPECT_EQ(output(), R"({"a":1})");
+}
+
 } // namespace
 } // namespace AiProtocolManager
 } // namespace HttpFilters

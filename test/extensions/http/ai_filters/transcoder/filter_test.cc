@@ -53,6 +53,7 @@ using HttpFilters::AiProtocolManager::FakeBridge;
 using HttpFilters::AiProtocolManager::FieldPathSegment;
 using HttpFilters::AiProtocolManager::FilterManager;
 using HttpFilters::AiProtocolManager::FlatteningJsonDecoder;
+using HttpFilters::AiProtocolManager::flattenJson;
 using HttpFilters::AiProtocolManager::FlattenJsonField;
 using HttpFilters::AiProtocolManager::InMemoryExternalBufferFactory;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
@@ -61,6 +62,7 @@ using HttpFilters::AiProtocolManager::LocalReplier;
 using HttpFilters::AiProtocolManager::SseStreamPropagator;
 using HttpFilters::AiProtocolManager::SseStreamReceiver;
 using HttpFilters::AiProtocolManager::TranscodingEngine;
+using HttpFilters::AiProtocolManager::unflattenFields;
 using TranscoderProto = envoy::extensions::http::ai_filters::transcoder::v3::Transcoder;
 
 // Intermediate AI filter that sits between `TO_IR` and `FROM_IR` and verifies that the payload
@@ -571,31 +573,6 @@ TEST_F(TranscoderFilterTest, EncodeSseCountsFailureWhenStreamCannotBeFinished) {
   // One refusal for the event, one for ending the stream.
   EXPECT_EQ(counterValue("failed"), 2);
   EXPECT_EQ(counterValue("transcoded"), 0);
-}
-
-TEST(UnflattenFieldsTest, JoinsPartialStringChunks) {
-  const std::vector<FlattenJsonField> fields = {
-      FlattenJsonField({"id"}, "msg_1"),
-      FlattenJsonField({"content", size_t{0}, "text"}, "Hel", /*is_partial=*/true),
-      FlattenJsonField({"content", size_t{0}, "text"}, "lo, ", /*is_partial=*/true),
-      FlattenJsonField({"content", size_t{0}, "text"}, "world"),
-      FlattenJsonField({"usage"}, nlohmann::json::object()),
-  };
-  EXPECT_EQ(unflattenFields(fields), nlohmann::json::parse(R"({
-    "id": "msg_1",
-    "content": [{"text": "Hello, world"}],
-    "usage": {}
-  })"));
-}
-
-TEST(UnflattenFieldsTest, CompleteStringReplacesRatherThanJoins) {
-  // Only a partial chunk is continued: a complete string that lands where one already is (a
-  // duplicate key) replaces it, as parsing the same JSON would.
-  const std::vector<FlattenJsonField> fields = {
-      FlattenJsonField({"model"}, "first"),
-      FlattenJsonField({"model"}, "second"),
-  };
-  EXPECT_EQ(unflattenFields(fields), nlohmann::json::parse(R"({"model": "second"})"));
 }
 
 // ---------------------------------------------------------------------------

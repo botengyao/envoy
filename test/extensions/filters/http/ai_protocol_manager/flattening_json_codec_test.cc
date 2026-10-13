@@ -296,6 +296,31 @@ TEST_F(FlatteningJsonCodecTest, SerializerHandlesEmptyStreamAndRejectsConflictin
   EXPECT_THAT(serializeBatches({conflicting}), HasStatusCode(absl::StatusCode::kInvalidArgument));
 }
 
+TEST(UnflattenFieldsTest, JoinsPartialStringChunks) {
+  const std::vector<FlattenJsonField> fields = {
+      FlattenJsonField({"id"}, "msg_1"),
+      FlattenJsonField({"content", size_t{0}, "text"}, "Hel", /*is_partial=*/true),
+      FlattenJsonField({"content", size_t{0}, "text"}, "lo, ", /*is_partial=*/true),
+      FlattenJsonField({"content", size_t{0}, "text"}, "world"),
+      FlattenJsonField({"usage"}, nlohmann::json::object()),
+  };
+  EXPECT_EQ(unflattenFields(fields), nlohmann::json::parse(R"({
+    "id": "msg_1",
+    "content": [{"text": "Hello, world"}],
+    "usage": {}
+  })"));
+}
+
+TEST(UnflattenFieldsTest, CompleteStringReplacesRatherThanJoins) {
+  // Only a partial chunk is continued: a complete string that lands where one already is (a
+  // duplicate key) replaces it, as parsing the same JSON would.
+  const std::vector<FlattenJsonField> fields = {
+      FlattenJsonField({"model"}, "first"),
+      FlattenJsonField({"model"}, "second"),
+  };
+  EXPECT_EQ(unflattenFields(fields), nlohmann::json::parse(R"({"model": "second"})"));
+}
+
 } // namespace
 } // namespace AiProtocolManager
 } // namespace HttpFilters

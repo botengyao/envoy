@@ -25,7 +25,6 @@ envoy_cc_library(
         "//source/extensions/filters/http/ai_protocol_manager:transcoding_engine_lib",
         "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
-        "@abseil-cpp//absl/types:span",
         "@envoy_api//envoy/extensions/http/ai_filters/transcoder/v3:pkg_cc_proto",
         "@nlohmann_json//:json",
     ],

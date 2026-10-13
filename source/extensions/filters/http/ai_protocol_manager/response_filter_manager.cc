@@ -13,9 +13,12 @@
 #include "source/common/coroutine/leaf_awaitable.h"
 #include "source/common/coroutine/status_macros.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_pipeline.h"
+#include "source/extensions/filters/http/ai_protocol_manager/reserved_member.h"
 #include "source/extensions/filters/http/ai_protocol_manager/task_group.h"
 
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "absl/types/variant.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -33,6 +36,22 @@ public:
 };
 
 namespace {
+
+void removeReservedMember(absl::Span<SseEventPtr> events) {
+  for (SseEventPtr& event : events) {
+    if (event->is_json()) {
+      ReservedMember::remove(event->json().json());
+    }
+  }
+}
+
+void removeReservedFields(std::vector<FlattenJsonField>& fields) {
+  std::erase_if(fields, [](const FlattenJsonField& field) {
+    const FieldPath path = field.field_path();
+    return !path.empty() && absl::holds_alternative<std::string>(path[0]) &&
+           absl::get<std::string>(path[0]) == ReservedMember::Name;
+  });
+}
 
 // Async state machinery, independent of what flows through it. `Item` is one unit of work passed
 // between filters -- an SSE frame here; the unary mode adds a second instantiation carrying
@@ -333,14 +352,26 @@ protected:
   }
 
   absl::Status decode(const Buffer::Instance& data, std::vector<SseEventPtr>& out) override {
-    return decoder_.onData(data, out);
+    const size_t first = out.size();
+    absl::Status status = decoder_.onData(data, out);
+    removeReservedMember(absl::MakeSpan(out).subspan(first));
+    return status;
   }
 
   absl::Status finishDecode(std::vector<SseEventPtr>& out) override {
-    return decoder_.onEndStream(out);
+    const size_t first = out.size();
+    absl::Status status = decoder_.onEndStream(out);
+    removeReservedMember(absl::MakeSpan(out).subspan(first));
+    return status;
   }
 
   Coroutine::Task<absl::Status> serializeItem(SseEventPtr item) override {
+    if (item->is_json()) {
+      if (ReservedMember::isOnlyMember(item->json().json())) {
+        co_return absl::OkStatus();
+      }
+      ReservedMember::remove(item->json().json());
+    }
     co_return co_await SseEventSerializer::serialize(*item, out_buffer_manager_);
   }
 
@@ -417,6 +448,7 @@ protected:
     if (!fields.ok()) {
       return fields.status();
     }
+    removeReservedFields(*fields);
     if (!fields->empty()) {
       out.push_back(std::move(*fields));
     }
@@ -430,6 +462,7 @@ protected:
     if (!fields.ok()) {
       return fields.status();
     }
+    removeReservedFields(*fields);
     if (!fields->empty()) {
       if (out.empty()) {
         out.push_back(std::move(*fields));
@@ -442,6 +475,7 @@ protected:
   }
 
   Coroutine::Task<absl::Status> serializeItem(std::vector<FlattenJsonField> item) override {
+    removeReservedFields(item);
     co_return co_await serializer_.serializeBatch(item);
   }
 
