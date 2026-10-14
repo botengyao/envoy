@@ -19,6 +19,7 @@
 #include "test/test_common/logging.h"
 #include "test/test_common/utility.h"
 
+#include "absl/strings/str_cat.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "nlohmann/json.hpp"
@@ -157,12 +158,18 @@ public:
       envoy::extensions::filters::http::ai_protocol_manager::v3::RequestHandling::
           BodyReserialization reserialize_body =
               envoy::extensions::filters::http::ai_protocol_manager::v3::RequestHandling::ALWAYS) {
-    if (filter_ != nullptr) {
-      filter_->onDestroy();
-    }
     envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
     proto.mutable_request_handling()->set_parse_unconfigured_routes(true);
     proto.mutable_request_handling()->set_reserialize_body(reserialize_body);
+    createFilterWithProto(proto, std::move(ai_filter_factories));
+  }
+
+  void createFilterWithProto(
+      const envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager& proto,
+      AiFilterFactories ai_filter_factories) {
+    if (filter_ != nullptr) {
+      filter_->onDestroy();
+    }
     filter_ = std::make_unique<AiProtocolManagerFilter>(
         factory_, std::make_shared<const FilterConfig>(proto, *stats_store_.rootScope(),
                                                        std::move(ai_filter_factories)));
@@ -1352,6 +1359,44 @@ TEST_F(AiProtocolManagerFilterTest, SseResponseFilterErrorSendsBadGatewayLocalRe
   EXPECT_EQ(filter_->encodeData(sse_chunk, true), Http::FilterDataStatus::StopIterationNoBuffer);
   drain();
 
+  EXPECT_EQ(encode_local_reply_calls_, 1);
+  EXPECT_EQ(encode_local_reply_code_, Http::Code::BadGateway);
+}
+
+// An SSE event of exactly max_sse_event_bytes goes through; one byte more fails the response.
+TEST_F(AiProtocolManagerFilterTest, SseEventOverTheLimitFailsTheResponse) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
+  proto.mutable_request_handling();
+  proto.mutable_response_handling()->mutable_limits()->mutable_max_sse_event_bytes()->set_value(
+      65536);
+  createFilterWithProto(proto, {[](const AiFilterContext&) -> AiFilterSharedPtr {
+                          return std::make_shared<SseTaggingAiFilter>("tagged");
+                        }});
+  setRouteConfig();
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+
+  Buffer::OwnedImpl req_body(R"({"model":"gpt-4","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(req_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+  ASSERT_TRUE(injected_end_stream_);
+
+  Http::TestResponseHeaderMapImpl resp_headers{{":status", "200"},
+                                               {"content-type", "text/event-stream"}};
+  EXPECT_EQ(filter_->encodeHeaders(resp_headers, false), Http::FilterHeadersStatus::Continue);
+
+  // `{"a":"` and `"}` take 8 of the payload's bytes.
+  const auto event = [](size_t payload_bytes) {
+    return absl::StrCat("data: {\"a\":\"", std::string(payload_bytes - 8, 'x'), "\"}\n\n");
+  };
+  Buffer::OwnedImpl at_limit(event(65536));
+  EXPECT_EQ(filter_->encodeData(at_limit, false), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+  EXPECT_EQ(encode_local_reply_calls_, 0);
+  EXPECT_THAT(encoded_injected_.toString(), testing::HasSubstr("\"tagged\":true"));
+
+  Buffer::OwnedImpl over_limit(event(65537));
+  EXPECT_EQ(filter_->encodeData(over_limit, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
   EXPECT_EQ(encode_local_reply_calls_, 1);
   EXPECT_EQ(encode_local_reply_code_, Http::Code::BadGateway);
 }

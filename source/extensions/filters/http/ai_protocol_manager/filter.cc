@@ -17,7 +17,9 @@
 #include "source/extensions/filters/http/ai_protocol_manager/filter_chain_bridge.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/response_filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
+#include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 
 #include "absl/strings/match.h"
 
@@ -107,6 +109,9 @@ FilterConfig::FilterConfig(
       inline_string_threshold_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
           proto.request_handling().limits(), inline_string_threshold_bytes,
           JsonWithExtBufParser::kDefaultInlineStringThresholdBytes)),
+      max_sse_event_bytes_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().limits(),
+                                                           max_sse_event_bytes,
+                                                           SseEventDecoder::kDefaultMaxFrameBytes)),
       ai_filter_factories_(std::move(ai_filter_factories)) {}
 
 absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
@@ -114,6 +119,10 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
     Server::Configuration::ServerFactoryContext& context, Stats::Scope& scope) {
   if (proto.filters_size() > 0 && !proto.has_request_handling()) {
     return absl::InvalidArgumentError("ai_protocol_manager: filters require request_handling");
+  }
+  if (proto.has_response_handling() && !proto.has_request_handling()) {
+    return absl::InvalidArgumentError(
+        "ai_protocol_manager: response_handling requires request_handling");
   }
   AiFilterFactories factories;
   for (const auto& entry : proto.filters()) {
@@ -450,9 +459,11 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
       BufferManager::Config{encoder_callbacks_->encoderBufferLimit()}, buffer_factory_,
       *encode_bridge_);
   if (is_sse) {
+    ResponseFilterManager::Config response_config;
+    response_config.sse.max_frame_bytes = config_->maxSseEventBytes();
     filter_manager_->startSseResponse(
         buffer_factory_, *encode_bridge_, *encode_manager_,
-        [this](absl::Status status) { onEncodeComplete(std::move(status)); });
+        [this](absl::Status status) { onEncodeComplete(std::move(status)); }, response_config);
   } else {
     filter_manager_->startUnaryResponse(
         buffer_factory_, *encode_bridge_, *encode_manager_,

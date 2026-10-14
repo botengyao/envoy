@@ -184,6 +184,24 @@ one SSE event, or one batch of JSON fields, at a time. A response with a
 non-identity ``content-encoding`` cannot be read, and skips them (counted by
 ``unsupported_content_encoding``).
 
+An SSE event is held whole while the AI filters run over it. One larger than
+:ref:`max_sse_event_bytes
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.ResponseParsingLimits.max_sse_event_bytes>`,
+64MiB by default, fails the response. Its headers have normally been forwarded
+by then, so the response is cut off by a stream reset, and events still in the
+AI filters at that point are not delivered.
+
+.. code-block:: yaml
+
+  http_filters:
+  - name: envoy.filters.http.ai_protocol_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+      request_handling: {}
+      response_handling:
+        limits:
+          max_sse_event_bytes: 16777216
+
 Once the AI filters finish, the parsed document is re-serialized as the
 request body by default. With :ref:`reserialize_body
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.reserialize_body>`

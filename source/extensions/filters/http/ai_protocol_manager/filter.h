@@ -50,6 +50,7 @@ public:
   bool parseUnconfiguredRoutes() const { return parse_unconfigured_routes_; }
   bool alwaysSerializeRequest() const { return always_serialize_request_; }
   uint32_t inlineStringThresholdBytes() const { return inline_string_threshold_bytes_; }
+  uint64_t maxSseEventBytes() const { return max_sse_event_bytes_; }
   AiProtocolManagerStats& stats() const { return stats_; }
 
 private:
@@ -60,6 +61,7 @@ private:
   const bool parse_unconfigured_routes_ = false;
   const bool always_serialize_request_ = true;
   const uint32_t inline_string_threshold_bytes_ = 0;
+  const uint64_t max_sse_event_bytes_ = 0;
   const AiFilterFactories ai_filter_factories_;
 };
 

@@ -1733,8 +1733,7 @@ new_features:
     routes carrying an
     :ref:`AiProtocolManagerPerRoute
     <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`
-    configuration, with :ref:`include_unconfigured_routes
-    <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.include_unconfigured_routes>`
+    configuration, with ``include_unconfigured_routes``
     widening it to every route. Extraction behaves identically in the downstream
     and upstream (cluster, e.g. dynamic-forward-proxy egress) installations of
     the filter, and leaving :ref:`request_handling
@@ -1761,10 +1760,8 @@ new_features:
     Completions intermediate representation (``TO_IR`` and ``FROM_IR``).
 - area: ai_protocol_manager
   change: |
-    Added support for :ref:`usage_signal
-    <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.usage_signal>`
-    to :ref:`TokenUsageExtraction
-    <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction>`.
+    Added support for ``usage_signal``
+    to ``TokenUsageExtraction``.
     Setting ``usage_signal`` to ``SYNTHESIZE_TRAILERS`` adds empty response trailers at a
     clean end of stream when the response carries none of its own, allowing trailer-driven
     consumers such as ``ext_proc`` with ``response_trailer_mode: SEND`` to receive the

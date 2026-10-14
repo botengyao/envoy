@@ -39,13 +39,14 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // each speaks — is declared with the :ref:`per-route configuration
 // <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`.
 message AiProtocolManager {
-  reserved 2;
-
-  reserved "response_handling";
-
   // Request-side AI protocol processing. When unset, the decode path is a
   // pure passthrough — including on routes carrying per-route configuration.
   RequestHandling request_handling = 1;
+
+  // Response-side processing configuration. Defaults apply when unset. It
+  // tunes the response processing ``request_handling`` enables, and requires
+  // it.
+  ResponseHandling response_handling = 2;
 
   // AI filters, in order. They run over a declared AI endpoint's parsed request payload
   // before it continues down the HTTP filter chain, and require ``request_handling``.
@@ -112,6 +113,37 @@ message RequestParsingLimits {
   // requires ``model`` inline, so it rejects an offloaded one with a 400.
   google.protobuf.UInt32Value inline_string_threshold_bytes = 1
       [(validate.rules).uint32 = {lte: 1048576 gte: 64}];
+}
+
+// Response-side processing configuration. A 2xx SSE or JSON response, with an
+// identity content encoding, to a request whose payload the filter parsed on a
+// declared AI endpoint is decoded, run through the :ref:`AI filters
+// <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager.filters>`
+// in reverse order, and re-serialized, whether or not this message is set.
+message ResponseHandling {
+  reserved 1;
+
+  reserved "token_usage";
+
+  // Response-path parsing limits. Defaults apply when unset.
+  ResponseParsingLimits limits = 2;
+}
+
+// Per-stream limits for response payload parsing.
+message ResponseParsingLimits {
+  // Maximum size, in bytes, of one SSE event: its ``data`` payload, plus any
+  // comment or unrecognized field lines it carries. Each event is held whole
+  // while the AI filters run over it. An event over the limit fails the
+  // response before any AI filter sees it: the response headers have normally
+  // been forwarded already, so the response is cut off by a stream reset, and
+  // events still in the AI filters at that point are not delivered.
+  //
+  // Defaults to 64MiB, which is also the most it can be set to. OpenAI
+  // Responses API streams end with a lifecycle event that embeds the complete
+  // response object, which reaches megabytes on long generations; lower this
+  // only with that margin in mind.
+  google.protobuf.UInt32Value max_sse_event_bytes = 1
+      [(validate.rules).uint32 = {lte: 67108864 gte: 65536}];
 }
 
 // Per-route configuration. Its presence declares the route an AI endpoint.

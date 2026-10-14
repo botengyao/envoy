@@ -5,6 +5,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/config.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/sse/sse_event_codec.h"
 
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/stats/mocks.h"
@@ -117,6 +118,70 @@ TEST(AiProtocolManagerConfigTest, RejectsOutOfRangeInlineStringThreshold) {
     EXPECT_THROW(factory.createFilterFactoryFromProto(proto_config, "stats", context).IgnoreError(),
                  EnvoyException);
   }
+}
+
+// The SSE event limit keeps the decoder's built-in cap unless response_handling lowers it.
+TEST(AiProtocolManagerConfigTest, MaxSseEventBytesDefaultsAndOverrides) {
+  NiceMock<Stats::MockIsolatedStatsStore> stats_store;
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  proto_config.mutable_request_handling();
+  EXPECT_EQ(
+      FilterConfig(proto_config, *stats_store.rootScope(), AiFilterFactories{}).maxSseEventBytes(),
+      SseEventDecoder::kDefaultMaxFrameBytes);
+
+  proto_config.mutable_response_handling()
+      ->mutable_limits()
+      ->mutable_max_sse_event_bytes()
+      ->set_value(65536);
+  EXPECT_EQ(
+      FilterConfig(proto_config, *stats_store.rootScope(), AiFilterFactories{}).maxSseEventBytes(),
+      65536);
+}
+
+// The limit can only lower the built-in cap, and not below a size that a unit mistake would give.
+TEST(AiProtocolManagerConfigTest, BoundsMaxSseEventBytes) {
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  AiProtocolManagerFilterConfigFactory factory;
+  const auto config_with = [](uint32_t value) {
+    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+    proto_config.mutable_request_handling();
+    proto_config.mutable_response_handling()
+        ->mutable_limits()
+        ->mutable_max_sse_event_bytes()
+        ->set_value(value);
+    return proto_config;
+  };
+  for (const uint32_t value : {65536u, 64u * 1024u * 1024u}) {
+    EXPECT_TRUE(factory.createFilterFactoryFromProto(config_with(value), "stats", context).ok());
+  }
+  for (const uint32_t value : {0u, 64u, 65535u, 64u * 1024u * 1024u + 1u}) {
+    EXPECT_THROW(
+        factory.createFilterFactoryFromProto(config_with(value), "stats", context).IgnoreError(),
+        EnvoyException);
+  }
+}
+
+TEST(AiProtocolManagerConfigTest, RejectsResponseHandlingWithoutRequestHandling) {
+  NiceMock<Server::Configuration::MockFactoryContext> context;
+  NiceMock<Stats::MockIsolatedStatsStore> stats_store;
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  proto_config.mutable_response_handling();
+
+  const auto config =
+      FilterConfig::create(proto_config, context.server_factory_context_, *stats_store.rootScope());
+  EXPECT_EQ(config.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(config.status().message(),
+            "ai_protocol_manager: response_handling requires request_handling");
+}
+
+// Token usage moved to the token usage AI filter. Its field stays reserved, so a 1.40
+// configuration that sets it cannot be read as anything else.
+TEST(AiProtocolManagerConfigTest, ReservesTheRemovedTokenUsageField) {
+  const Protobuf::Descriptor* descriptor =
+      envoy::extensions::filters::http::ai_protocol_manager::v3::ResponseHandling::descriptor();
+  EXPECT_EQ(descriptor->FindFieldByNumber(1), nullptr);
+  EXPECT_TRUE(descriptor->IsReservedNumber(1));
+  EXPECT_TRUE(descriptor->IsReservedName("token_usage"));
 }
 
 // Creating the filter from an upstream factory context yields the same stream
