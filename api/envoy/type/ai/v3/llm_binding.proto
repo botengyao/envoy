@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package envoy.type.ai.v3;
+
+import "google/protobuf/struct.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.type.ai.v3";
+option java_outer_classname = "LlmBindingProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/type/ai/v3;aiv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: LLM binding]
+
+// How a provider carries an :ref:`LLMProtocol <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` on
+// HTTP, where that differs from the API's own.
+//
+// The API -- its request and response schemas, stream events and usage -- is the ``LLMProtocol``,
+// and is the same on every provider. A binding says only what changes around it: the request path,
+// the request fields that path carries in place of the body, and the fields the provider requires
+// in the body that the API does not define. Most providers serve an API in its own shape and need
+// no binding. Hosts, credentials and headers stay with the route and the cluster.
+//
+// Claude on Vertex AI speaks ``ANTHROPIC_MESSAGES`` through the ``vertex_ai`` binding:
+//
+// .. code-block:: yaml
+//
+//   name: vertex_ai
+//   path_variables: { project: my-project, location: us-east5 }
+//
+// which stands for:
+//
+// .. code-block:: yaml
+//
+//   uri_pattern: "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}"
+//   path_variables: { version: v1, project: my-project, location: us-east5 }
+//   path_only_fields: [ model ]
+//   body_fields: { anthropic_version: vertex-2023-10-16 }
+//
+// On the way in, a binding recognizes the client's path and moves what it carries into the
+// API's own document: the path's fields are lifted into the body and ``body_fields`` are removed,
+// so every AI filter sees the API's document whatever the client's provider. On the way out, the
+// backend's binding renders the upstream ``:path`` from that document, removes
+// ``path_only_fields`` and writes ``body_fields``.
+// [#next-free-field: 6]
+message LLMBinding {
+  // A binding Envoy defines for the API it is used with, which supplies every field below that is
+  // not set here. Defined names:
+  //
+  // * ``vertex_ai``: Google Vertex AI. ``ANTHROPIC_MESSAGES`` through ``rawPredict`` and
+  //   ``streamRawPredict``, and ``GEMINI_GENERATE_CONTENT`` through the ``google`` publisher. Needs
+  //   the ``project`` and ``location`` variables.
+  //
+  // When empty, the binding starts from the API's own: ``/v1/chat/completions``,
+  // ``/v1/responses``, ``/v1/messages``, and the Gemini API's
+  // ``/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}``, which also carries
+  // ``model`` and ``stream`` in the path alone.
+  string name = 1;
+
+  // The request path, as a :ref:`URI pattern
+  // <config_http_filters_ai_protocol_manager_transcoder_instructions>`. ``{model}`` is the
+  // request's model, the ``{unary|stream}`` choice its streaming mode, and any other variable is
+  // filled from ``path_variables``. Replaces the named binding's pattern, for example to reach a
+  // provider through a gateway that adds a prefix.
+  string uri_pattern = 2;
+
+  // Values for the pattern's variables other than ``{model}``, such as ``project`` and
+  // ``location``. Merged over the named binding's values.
+  map<string, string> path_variables = 3;
+
+  // The request fields the path carries in place of the body. A field the pattern fills that is
+  // not listed here travels in both. When not empty, replaces the named binding's list.
+  repeated string path_only_fields = 4 [(validate.rules).repeated = {
+    unique: true
+    items {string {in: "model" in: "stream"}}
+  }];
+
+  // Fields the provider requires in the request body that the API does not define, such as
+  // Vertex AI's ``anthropic_version``. A request that arrived in the same binding keeps the values
+  // its client sent. Merged over the named binding's fields.
+  google.protobuf.Struct body_fields = 5;
+}
