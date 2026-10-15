@@ -51,62 +51,82 @@ Also: `RequestPerRoute.binding` and `ResponsePerRoute.binding` (one each), and
 `AiProtocolManager.bindings`, a `map<string, LLMBinding>` that filter state can name. All three are
 hidden until implemented.
 
-| Edit | Mutation |
+A binding has two parts. The URI pattern is a two-way map between the request's path and its
+named values. The mutations edit the body and headers around the API's document. Coming in, the
+client's binding is read and undone, so AI filters see the API's own document; going out, the
+backend's binding is applied. Routing and the host stay with the route and the cluster. Either part
+left empty is the API's own: Gemini's own mutations remove `model` and `stream`, which its path
+carries.
+
+The pattern's syntax is today's: a URI template in `path_match_policy` syntax, at most one
+`{unary|stream}` choice, several layouts separated by spaces (matching tries each, rendering writes
+the first), and a query on a spelling, which is rendered but never read.
+
+### Read rules: coming in, the client's binding
+
+1. **Match.** The client's path, without its query, is matched against the binding's layouts; with
+   no binding given, against the API's own layouts and those Envoy knows for it. The first layout
+   that fits the whole path is used. A given binding that does not match reads nothing, as today.
+2. **Values.** Each named variable gives a value; unnamed wildcards and the query give none, and
+   the query can carry credentials, such as the Gemini API's `key`. Every value must be a token of
+   letters, digits and `-._@`, so none can escape its segment. A path whose values are not tokens
+   does not match.
+3. **Fields.** A value named after a top-level field of the API's request is that field; `model`
+   and `stream` count for every API, and the choice is `stream` (its first spelling false, its
+   second true). It is written into the body. For a field the binding removes, the path is its
+   only home and the path's value wins; otherwise the body's value wins.
+4. **Path variables.** Any other value, such as `{project}`, is recorded on the
+   `envoy.ai.binding.request` object and never written into the body. Filters and access logs read
+   it as `%FILTER_STATE(envoy.ai.binding.request:FIELD:project)%`.
+5. **Undo.** Each body field a mutation writes is removed, and its value kept for rule 11. Header
+   mutations are not undone.
+
+### Mutation rules: going out, the backend's binding
+
+6. **Model.** `envoy.ai.model.resolved`, when set, replaces the body's `model`.
+7. **Validate.** The document is validated against the backend API's schema before any mutation,
+   so a field the API requires and the provider moves into the path (`model` on Vertex AI) is still
+   there.
+8. **Render.** Each variable is filled from the first of: the body field of its name; the path
+   variables given to the backend binding for this request; the path variables read in rule 4. A
+   variable without a value fails the request with a 500 (`unresolved`), and every value must be a
+   token. A variable filled from the client's path is the client's choice, so pin `{project}`
+   unless the client may pick it.
+9. **Mutate,** in order. Each mutation targets a top-level body field or a header:
+
+   | Edit | Mutation |
+   |---|---|
+   | Remove a body field | `{ body_field: model }` |
+   | Replace, or add, a body field | `{ body_field: max_tokens, value: 4096 }` |
+   | Add a body field where absent | `{ body_field: anthropic_version, value: vertex-2023-10-16, keep_existing: true }` |
+   | Set a header | `{ header: x-llm-model, value: "{model}" }` |
+   | Add a header where absent | `{ header: anthropic-version, value: "2023-06-01", keep_existing: true }` |
+   | Remove a header | `{ header: x-api-key }` |
+
+10. **Placeholders.** `{name}` in a string value reads the same values as rule 8, for example a
+    header `x-goog-user-project: {project}`. A header's value must be a string.
+11. **Same binding.** A request leaving in the binding it arrived in is rendered from what rule 4
+    read and gets back the body values rule 5 removed, so only a resolved model changes it.
+
+Nothing in the rules names a provider or a field: `model` and `stream` appear only because every
+API's request has them. A gateway's `/tenants/{tenant}/llm/{model}` reads `tenant` as a path
+variable, and an OpenAI-shaped `/users/{user}/chat/completions` would read the body's `user`.
+
+What the rules replace in today's engine (`transcoding_engine.cc`, `uri_pattern.cc`):
+
+| Today | Rule |
 |---|---|
-| Remove a body field | `{ body_field: model }` |
-| Replace, or add, a body field | `{ body_field: max_tokens, value: 4096 }` |
-| Add a body field where absent | `{ body_field: anthropic_version, value: vertex-2023-10-16, keep_existing: true }` |
-| Set a header | `{ header: x-llm-model, value: "{model}" }` |
-| Add a header where absent | `{ header: anthropic-version, value: "2023-06-01", keep_existing: true }` |
-| Remove a header | `{ header: x-api-key }` |
+| Only `model` and `stream` move between path and body (`kModelField`, `kStreamField`) | 3: any variable named after a request field |
+| Fields leave the body only when the pack has an envelope (`erase_fields = envelope.has_value()`) | 9: removal mutations, per binding |
+| Gemini's layouts compiled into its pack (`DialectTranscodePack::envelope`) | Gemini's own binding, as data |
+| The body always wins over the path (`liftFromRequestPath`) | 3: the path wins for a field the binding removes |
+| `UriPattern::match()` reads only `{model}`; `render()` refuses other variables | 2, 4 and 8: every named variable |
+| The document is validated after `model` and `stream` are erased | 7: validate before mutating |
+| No way to add a body field or a header | 9 |
 
-Either part left empty is the API's own: its path, or its edits (Gemini's remove `model` and
-`stream`, which its path carries). On the way in, the body fields the mutations write are removed.
+### Example
 
-### The URI pattern
-
-**Purpose.** The pattern is the path half of a binding: a two-way map between a request's path and
-its named values. Coming in, it recognizes the client's provider and reads what the path carries.
-Going out, it writes the backend's path. Routing and the host stay with the route and the cluster.
-
-The syntax is today's: a URI template in `path_match_policy` syntax, at most one `{unary|stream}`
-choice, several layouts separated by spaces (matching tries each, rendering writes the first), and
-a query on a spelling, which is rendered but not read.
-
-**The rule**
-
-1. **Values.** Every named variable is a value of the request. Unnamed wildcards (`*`, `**`) and
-   the query are not; the query can carry credentials, such as the Gemini API's `key`.
-2. **Fields and path variables.** A value named after a top-level field of the API's request is
-   that field. `model` and `stream` count for every API, and the choice is `stream`: its first
-   spelling for absent or false, its second for true. Any other value, such as `{project}`,
-   `{location}` or `{version}`, is a path variable: kept beside the body, never in it.
-3. **Tokens.** Every value read or rendered is a token of letters, digits and `-._@`, the check
-   `{model}` has today, so no value can escape its segment. A path whose values fail the check does
-   not match.
-4. **Coming in.** Fields are written into the body. For a field the binding removes, which lives
-   in the path alone, the path's value wins; otherwise the body's is kept. Path variables are
-   recorded in the `envoy.ai.binding.request` object, where filters and access logs read them, for
-   example `%FILTER_STATE(envoy.ai.binding.request:FIELD:location)%`.
-5. **Going out.** Each variable is filled from the first of three sources:
-   1. the body field of its name, after `envoy.ai.model.resolved`;
-   2. the path variables given to the backend binding for this request;
-   3. the path variables read from the client's path.
-
-   A variable left without a value fails the request with a 500 (`unresolved`). Unnamed wildcards
-   cannot be rendered.
-6. **Passing through,** the arrival binding is rendered from what was read, so only a resolved
-   model changes the path.
-7. **A variable filled from the client's path is the client's choice.** Pin `{project}` with a
-   literal or with per-request variables, unless the client may pick it, for example because it
-   sends its own credentials.
-
-In a mutation's string value, `{name}` reads the same values, for example a header
-`x-goog-user-project: {project}`. Nothing in the rule names a provider. A gateway's `/tenants/{tenant}/llm/{model}` reads `tenant` as
-a path variable, and an OpenAI-shaped `/users/{user}/chat/completions` would read the body's
-`user`.
-
-For example, a Vertex AI client of Claude sent to Gemini in the same project and region:
+A Vertex AI client of Claude, sent to Gemini in the same project and region:
 
 ```
 client     POST /v1/projects/acme/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict
