@@ -38,6 +38,7 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // endpoints — and which :ref:`wire API <envoy_v3_api_enum_type.ai.v3.LLMProtocol>`
 // each speaks — is declared with the :ref:`per-route configuration
 // <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`.
+// [#next-free-field: 6]
 message AiProtocolManager {
   // Request-side AI protocol processing. When unset, the decode path is a
   // pure passthrough — including on routes carrying per-route configuration.
@@ -57,6 +58,14 @@ message AiProtocolManager {
   // is used, which does not bound the size of the payload it holds.
   // [#extension-category: envoy.ai_protocol_manager.external_buffer]
   config.core.v3.TypedExtensionConfig external_buffer_config = 4;
+
+  // Bindings that requests through this filter can name, keyed by their name: in the
+  // ``envoy.ai.binding.request`` and ``envoy.ai.binding.response`` filter state objects, and in a
+  // route's ``binding``. An entry can start from a binding Envoy defines, through its own
+  // ``name``, and fix that binding's variables, so a filter ahead can choose a tenant's provider
+  // without writing its project or location. Entries are checked when the configuration loads.
+  // [#not-implemented-hide:]
+  map<string, type.ai.v3.LLMBinding> bindings = 5;
 }
 
 // Request-side processing configuration. A route that carries a

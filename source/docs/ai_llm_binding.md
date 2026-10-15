@@ -26,16 +26,17 @@ the fix must not be specific to Vertex AI.
 
 1. `LLMProtocol` stays the API: schemas, stream events, usage. No per-provider values.
 2. `LLMBinding` (new, `envoy.type.ai.v3`) says how a provider carries an API on HTTP: a URI
-   pattern, its variables, the fields the path carries in place of the body, and the fields the
-   provider adds to the body. Bindings are data. Envoy defines named ones (`vertex_ai`); an
+   pattern, where request fields travel other than the body (a path variable, a query parameter,
+   a header), and the constants the provider requires. Bindings are data. Envoy defines named ones (`vertex_ai`); an
    operator can spell out their own.
 3. The AI Protocol Manager core applies bindings at the two edges of the AI filter chain. Every AI
    filter sees the API's own document. The transcoder only converts between APIs.
 4. Filter state alone can instruct a request: a filter ahead of the AI Protocol Manager sets the
    APIs, the bindings, the path and the model, with no per-route configuration, as behind a
    dynamic forward proxy. Route configuration only supplies defaults. The new `envoy.ai.binding.*`
-   keys carry a binding, by name or whole; the existing `envoy.ai.uri_pattern.*` keys keep setting
-   its path. Existing configurations behave as today.
+   keys name a binding, Envoy's or one in the filter's `bindings`; the existing
+   `envoy.ai.uri_pattern.*` keys keep setting its path. Both hold typed C++ objects, not JSON.
+   Existing configurations behave as today.
 
 ## API
 
@@ -43,69 +44,109 @@ the fix must not be specific to Vertex AI.
 
 ```proto
 message LLMBinding {
+  message FieldBinding {
+    string field = 1;              // a top-level request member: model, stream, ...
+    oneof location {
+      string path_variable = 2;    // a variable of uri_pattern
+      string query_parameter = 3;
+      string header = 4;
+    }
+    bool keep_in_body = 5;         // by default the field leaves the body
+  }
   string name = 1;                         // e.g. vertex_ai; supplies defaults for the rest
   string uri_pattern = 2;                  // the transcoder's URI pattern syntax
-  map<string, string> path_variables = 3;  // project, location, ...
-  repeated string path_only_fields = 4;    // model and/or stream
-  google.protobuf.Struct body_fields = 5;  // e.g. anthropic_version
+  map<string, string> path_variables = 3;  // constants for the pattern: project, location
+  repeated FieldBinding fields = 4;        // request fields outside the body
+  google.protobuf.Struct body_fields = 5;  // constant body fields: anthropic_version
+  map<string, string> headers = 6;         // constant headers: anthropic-version
 }
 ```
 
+A binding moves two kinds of data between the body and the rest of the request:
+
+- **Request fields** (`fields`). Any top-level member of the API's request can travel in a path
+  variable, a query parameter or a header, instead of the body or, with `keep_in_body`, as well as
+  it. On the way in, the core reads each one back into the body.
+- **Constants** the provider requires. `path_variables` fill the pattern's other variables,
+  `body_fields` and `headers` are written, and a constant query goes in the pattern itself
+  (`?api-version=...`). On the way in, `body_fields` are removed.
+
+A pattern variable is filled by the field `fields` places there; else from `path_variables`; else
+from the request field of the same name, which then stays in the body as well. So `{model}` alone
+works as `envoy.ai.uri_pattern.*` does today. The `{unary|stream}` choice is the variable `stream`.
+A variable left unfilled, or a field placed in a variable the pattern does not have, fails the
+request as `unresolved`.
+
 `RequestPerRoute.binding` and `ResponsePerRoute.binding` hold one each. Within a binding, `name`
-supplies the defaults: `uri_pattern` replaces the named pattern, `path_variables` and
-`body_fields` merge over the named ones, and a non-empty `path_only_fields` replaces the named
-list.
+supplies the defaults: `uri_pattern` replaces the named pattern; `path_variables`, `body_fields`
+and `headers` merge over the named ones; and a non-empty `fields` replaces the named list.
 
 Bindings Envoy defines (`{version}` defaults to `v1`):
 
-| API | Name | `uri_pattern` | `path_only_fields` | `body_fields` |
+| API | Name | `uri_pattern` | `fields` | Constants |
 |---|---|---|---|---|
 | `OPENAI_CHAT_COMPLETIONS` | (own) | `/v1/chat/completions` | | |
 | `OPENAI_RESPONSES` | (own) | `/v1/responses` | | |
-| `ANTHROPIC_MESSAGES` | (own) | `/v1/messages` | | |
-| `ANTHROPIC_MESSAGES` | `vertex_ai` | `/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{rawPredict\|streamRawPredict}` | `model` | `anthropic_version: vertex-2023-10-16` |
-| `GEMINI_GENERATE_CONTENT` | (own) | `/v1beta/models/{model}:{generateContent\|streamGenerateContent?alt=sse}` | `model`, `stream` | |
-| `GEMINI_GENERATE_CONTENT` | `vertex_ai` | `/{version}/projects/{project}/locations/{location}/publishers/google/models/{model}:{generateContent\|streamGenerateContent?alt=sse}` | `model`, `stream` | |
+| `ANTHROPIC_MESSAGES` | (own) | `/v1/messages` | | header `anthropic-version: 2023-06-01` |
+| `ANTHROPIC_MESSAGES` | `vertex_ai` | `/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{rawPredict\|streamRawPredict}` | `model` in `{model}` | body `anthropic_version: vertex-2023-10-16` |
+| `GEMINI_GENERATE_CONTENT` | (own) | `/v1beta/models/{model}:{generateContent\|streamGenerateContent?alt=sse}` | `model` in `{model}`, `stream` in `{stream}` | |
+| `GEMINI_GENERATE_CONTENT` | `vertex_ai` | `/{version}/projects/{project}/locations/{location}/publishers/google/models/{model}:{generateContent\|streamGenerateContent?alt=sse}` | `model` in `{model}`, `stream` in `{stream}` | |
 
-The two Gemini rows are today's `DialectTranscodePack::envelope`. One name serves several APIs:
+Vertex AI Claude takes `stream` in the body as well as in the method, so its binding does not
+place `stream`: the field fills `{stream}` and stays. Gemini places it, so it leaves the body. The
+two Gemini rows are today's `DialectTranscodePack::envelope`. One name serves several APIs:
 `vertex_ai` means Vertex AI's layout for whichever API it is used with. Vertex AI's `count-tokens`
 model id is not a match: that endpoint keeps `model` in the body.
 
+Providers Envoy does not define are configuration, not code:
+
+| Provider | `uri_pattern` | `fields` | Constants |
+|---|---|---|---|
+| Bedrock InvokeModel, Claude | `/model/{model}/{invoke\|invoke-with-response-stream}` | `model` in `{model}`, `stream` in `{stream}` | body `anthropic_version: bedrock-2023-05-31` |
+| Azure OpenAI deployment | `/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21` | `model` in `{deployment}`, kept in the body | |
+| A gateway that routes on a header | `/v1/chat/completions` | `model` in header `x-llm-model`, kept in the body | |
+
+InvokeModel also needs its `anthropic-beta` header moved into the body and its event-stream
+framing, which are later primitives (see [Other providers](#other-providers)).
+
 ## Filter state
 
-The keys are complete on their own. A filter ahead of the AI Protocol Manager (ext_proc, Lua,
-`set_filter_state`, a model router) can instruct every request with no per-route configuration
-anywhere; a route's configuration, when there is one, only fills in what the keys leave unset.
+The keys are complete on their own. A filter ahead of the AI Protocol Manager (`set_filter_state`,
+Lua, a dynamic module, a C++ filter such as a model router) can instruct every request with no
+per-route configuration anywhere; a route's configuration, when there is one, only fills in what
+the keys leave unset. No key holds JSON.
 
 | Key | Value | Read | When unset |
 |---|---|---|---|
 | `envoy.ai.llm_protocol.request` | `LLMProtocol` name | AI Protocol Manager `decodeHeaders` | the route's `request.llm_protocol`; with neither, the request is not an AI request |
-| `envoy.ai.binding.request` (new) | binding name, or `LLMBinding` as JSON | before the first AI filter | the route's `request.binding`; else the API's binding whose pattern matches the path; else the API's own |
+| `envoy.ai.binding.request` (new) | binding name | before the first AI filter | the route's `request.binding`; else the API's binding whose pattern matches the path; else the API's own |
 | `envoy.ai.uri_pattern.request` | URI pattern | before the first AI filter | the client binding's pattern |
 | `envoy.ai.llm_protocol.response` | `LLMProtocol` name | the backend-side transcoder leg | the route's `response.llm_protocol`; else the client's API, and nothing is transcoded |
-| `envoy.ai.binding.response` (new) | binding name, or `LLMBinding` as JSON | at the sink, after the last AI filter | the route's `response.binding`; else the binding the request arrived in, when the API did not change; else the backend API's own |
+| `envoy.ai.binding.response` (new) | binding name | at the sink, after the last AI filter | the route's `response.binding`; else the binding the request arrived in, when the API did not change; else the backend API's own |
 | `envoy.ai.uri_pattern.response` | URI pattern | at the sink | the backend binding's pattern |
 | `envoy.ai.model.resolved` | model name | at the sink | the model the request names |
 | `envoy.ai.model.request` | model name | written by request_info | |
 
-- **A binding key instructs; it is not only a lookup.** `vertex_ai` stands for
-  `{"name":"vertex_ai"}`. A value starting with `{` is a whole `LLMBinding`, so a filter ahead can
-  describe a provider that no route and no built-in defines:
-  `{"uri_pattern":"/llm/{model}/{messages|messages-stream}","path_only_fields":["model"],"body_fields":{"anthropic_version":"vertex-2023-10-16"}}`.
+- **Names.** A binding key names one of the AI Protocol Manager's `bindings` or one Envoy
+  defines for the API. The filter's `bindings` are where an operator describes a provider Envoy
+  does not know, or fixes a tenant's variables, and they are checked when the configuration loads.
+  A filter ahead only chooses among them, so a per-request writer can never inject body fields or
+  headers.
 - **Merging.** Each layer is merged field by field over the one below it: filter state over the
-  route over the named defaults. `name` and `uri_pattern` replace, `path_variables` and
-  `body_fields` merge, and a non-empty `path_only_fields` replaces. A `uri_pattern` key replaces
-  the pattern last. So a route can fix a tenant's project and location while a filter ahead picks
+  route over the named defaults. `name` and `uri_pattern` replace; `path_variables`, `body_fields`
+  and `headers` merge; and a non-empty `fields` replaces. A `uri_pattern` key replaces the
+  pattern last. So a route can fix a tenant's project and location while a filter ahead picks
   the binding by name.
-- **Path variables per request** are written into the binding's JSON or as literals in the pattern.
-  Never take them from a client header: the client would choose the project billed under the
-  gateway's credentials. The same holds for `body_fields`: only trusted filters write these keys.
-- **Validation.** A binding the API does not define, JSON that does not parse into an
-  `LLMBinding`, or a pattern that does not parse fails the request with a 500, counted as
-  `unresolved`. The factories accept any non-empty string on purpose: `set_filter_state` drops a
-  value its factory rejects, at debug level, so rejecting there would send the request in the
-  wrong shape instead of failing it. A separate change should build constant `set_filter_state`
-  values at config load and reject the config when that fails; it helps every key.
+- **Path variables per request** come from a named binding, or are written as literals in the
+  pattern key. Never take them from a client header: the client would choose the project billed
+  under the gateway's credentials.
+- **Validation.** A name that neither the filter's `bindings` nor Envoy defines for the API, or a
+  pattern that does not parse, fails the request with a 500, counted as `unresolved`. The
+  factories never reject a non-empty value: a pattern's parse error travels in its object to the
+  point of use, and a name is resolved there. `set_filter_state` drops a value its factory
+  rejects, at debug level, so rejecting there would send the request in the wrong shape instead of
+  failing it. A separate change should build constant `set_filter_state` values once at config
+  load, and reject the config when that fails; it helps every key.
 - **Timing.** `envoy.ai.llm_protocol.request` must be set during an earlier filter's request
   headers, because it decides whether the body is held and parsed at all. The others can be set
   later, up to the point the table names; the response keys can be set by an AI filter.
@@ -115,6 +156,54 @@ anywhere; a route's configuration, when there is one, only fills in what the key
 
 With no binding anywhere and no `envoy.ai.binding.*` key, a pattern key behaves as today: it sets
 the path, and the body keeps the API's own shape.
+
+### Objects
+
+Both key families hold typed C++ objects, so nothing is parsed twice and nothing is JSON:
+
+```cpp
+// The runtime form of an LLMBinding: built once, immutable, shared between requests.
+struct LlmBinding {
+  struct FieldPlacement {
+    enum class Location { PathVariable, QueryParameter, Header };
+    std::string field;
+    Location location;
+    std::string target;  // the variable, parameter or header name
+    bool keep_in_body;
+  };
+  std::string name;
+  std::optional<UriPattern> pattern;  // compiled once
+  absl::flat_hash_map<std::string, std::string> path_variables;
+  std::vector<FieldPlacement> fields;
+  nlohmann::json body_fields;  // an object
+  std::vector<std::pair<Http::LowerCaseString, std::string>> headers;
+};
+
+// envoy.ai.binding.*: a resolved binding, or a name to resolve at the point of use.
+class LlmBindingObject : public Router::StringAccessor {
+public:
+  explicit LlmBindingObject(std::shared_ptr<const LlmBinding> binding);  // from C++
+  explicit LlmBindingObject(std::string name);                            // from the factory
+  absl::string_view asString() const override;  // the name
+};
+
+// envoy.ai.uri_pattern.*: the pattern compiled when the object is created.
+class UriPatternObject : public Router::StringAccessor {
+public:
+  explicit UriPatternObject(absl::StatusOr<UriPattern> pattern);
+  absl::string_view asString() const override;  // the pattern as written
+};
+```
+
+- **C++ writers** build `LlmBinding`s at their own config load and attach the same
+  `shared_ptr` to every request: no parsing per request.
+- **Factory writers** (`set_filter_state`, Lua's `filterState():set()`, dynamic modules' typed
+  setter) get a name resolved through a hash lookup, or a pattern compiled once per write.
+- **String writers** (the Golang filter, dynamic modules' bytes setter) store a plain
+  `Router::StringAccessor`. Readers accept one, and treat its string as the factory would.
+- Both objects are `StringAccessor`s, so `%FILTER_STATE(envoy.ai.uri_pattern.response:PLAIN)%`
+  and other string readers of today's key keep working. Today the transcoder recompiles the
+  pattern on every read; with the typed object it compiles once per write.
 
 ## Without routes
 
@@ -143,10 +232,10 @@ So this design also requires:
 ## Request flow
 
 ```
-client ─▶ core ingress ──────────▶ AI filters ─▶ core egress ──────────────────────▶ upstream
-          match the client binding               validate as the backend API
-          lift its path fields                   render :path
-          remove its body_fields                 remove path_only_fields, write body_fields
+client ─▶ core ingress ─────────────▶ AI filters ─▶ core egress ───────────────▶ upstream
+          match the client binding                  validate as the backend API
+          read its fields into the body             render :path, place its fields
+          remove its body_fields                    write body_fields and headers
 ```
 
 AI filters get the API's own document: `model` and `stream` at the root whenever the request names
@@ -157,8 +246,8 @@ telemetry.
   serialization in `request_filter_manager.cc`.
 - Validate before adapting: Anthropic's schema requires `model`, which Vertex AI's body must not
   carry.
-- A path-only field read from the path wins over a body value; a field the binding carries in both
-  keeps the body's. (Today the body always wins.)
+- A field read from outside the body wins over a body value, unless the binding keeps it in the
+  body too, in which case the body's wins. (Today the body always wins.)
 - A request that leaves in the binding it arrived in gets its client's `body_fields` values back.
   With `reserialize_body: DISABLE` the received bytes are forwarded only in that case; otherwise
   the core serializes.
@@ -343,12 +432,14 @@ or per request, `envoy.ai.binding.response = vertex_ai` with
 ### 7. A provider Envoy does not define: Azure OpenAI
 
 A binding with no name spells everything out. Azure OpenAI names the deployment in the path and
-the API version in the query, and accepts `model` in the body, so nothing is path-only:
+the API version in the query, and accepts `model` in the body as well:
 
 ```yaml
 response:
   llm_protocol: OPENAI_CHAT_COMPLETIONS
-  binding: { uri_pattern: "/openai/deployments/{model}/chat/completions?api-version=2024-10-21" }
+  binding:
+    uri_pattern: "/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21"
+    fields: [ { field: model, path_variable: deployment, keep_in_body: true } ]
 # plus envoy.ai.model.resolved = gpt-4o-prod, the deployment name
 ```
 
@@ -357,16 +448,34 @@ upstream    POST /openai/deployments/gpt-4o-prod/chat/completions?api-version=20
             {"model": "gpt-4o-prod", "messages": [...]}
 ```
 
+Naming the variable `{model}` instead would need no `fields` entry: an unplaced field fills the
+variable of its own name and stays in the body.
+
 ### 8. Behind a dynamic forward proxy, instructed by a filter ahead
 
 One catch-all route to the dynamic forward proxy cluster, and no `typed_per_filter_config` for the
-AI Protocol Manager anywhere. A filter ahead decides each request.
+AI Protocol Manager anywhere. The operator describes the providers once, in the filter's
+`bindings`; a filter ahead picks one per request by name.
 
 ```yaml
 http_filters:
 - name: envoy.filters.http.ext_proc          # decides; see below
 - name: envoy.filters.http.set_filter_state  # copies the decision into the keys
-- name: envoy.filters.http.ai_protocol_manager   # as above
+- name: envoy.filters.http.ai_protocol_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+    request_handling: {}
+    filters: [ ... ]                         # as above
+    bindings:
+      acme_vertex:                           # Vertex AI, with the tenant's project fixed
+        name: vertex_ai
+        path_variables: { project: acme, location: us-east5 }
+      llm_gateway:                           # an internal gateway Envoy has no binding for
+        uri_pattern: "/llm/{model}/{messages|messages-stream}"
+        fields: [ { field: model, path_variable: model } ]
+        body_fields: { anthropic_version: vertex-2023-10-16 }
+      header_gateway:                        # a gateway that routes on a header
+        fields: [ { field: model, header: x-llm-model, keep_in_body: true } ]
 - name: envoy.filters.http.dynamic_forward_proxy
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -387,28 +496,37 @@ For an OpenAI client it sends to Claude on Vertex AI, the keys end up as:
 ```
 envoy.ai.llm_protocol.request  = OPENAI_CHAT_COMPLETIONS
 envoy.ai.llm_protocol.response = ANTHROPIC_MESSAGES
-envoy.ai.binding.response      = {"name":"vertex_ai","path_variables":{"project":"acme","location":"us-east5"}}
+envoy.ai.binding.response      = acme_vertex
 envoy.ai.model.resolved        = claude-sonnet-4-5@20250929
 envoy.upstream.dynamic_host    = us-east5-aiplatform.googleapis.com
 ```
 
 The first key makes the request an AI request, so the AI filters run; the upstream request is
 example 1's. ext_proc cannot write filter state itself: it returns its decision as dynamic
-metadata, and `set_filter_state` copies each value with `%DYNAMIC_METADATA(...)%`. A custom
-filter can write the keys directly. The dynamic forward proxy filter sits after
-the AI Protocol Manager, so an AI filter can still change the host.
+metadata, and `set_filter_state` copies each value with `%DYNAMIC_METADATA(...)%`. A C++ filter
+can instead set the objects directly, with bindings it built at its own config load. The dynamic
+forward proxy filter sits after the AI Protocol Manager, so an AI filter can still change the
+host.
 
-To reach an internal gateway Envoy has no binding for, the same filter writes the binding whole:
-
-```
-envoy.ai.binding.response = {"uri_pattern":"/llm/{model}/{messages|messages-stream}","path_only_fields":["model"],"body_fields":{"anthropic_version":"vertex-2023-10-16"}}
-envoy.upstream.dynamic_host = llm-gateway.internal
-```
+`envoy.ai.binding.response = llm_gateway` with `envoy.upstream.dynamic_host = llm-gateway.internal`
+sends the request to the internal gateway:
 
 ```
 upstream    POST /llm/claude-sonnet-4-5@20250929/messages-stream
             {"anthropic_version": "vertex-2023-10-16", "stream": true, "max_tokens": 512, ...}
 ```
+
+`envoy.ai.binding.response = header_gateway` keeps the Anthropic API's path and adds the header:
+
+```
+upstream    POST /v1/messages
+            x-llm-model: claude-sonnet-4-5@20250929
+            anthropic-version: 2023-06-01
+            {"model": "claude-sonnet-4-5@20250929", ...}
+```
+
+`header_gateway` has no `name`, so it starts from the Anthropic API's own binding, which also
+writes `anthropic-version`.
 
 ### 9. Behind a dynamic forward proxy, observed only
 
@@ -432,10 +550,11 @@ only where the shape changes, and the ways it changes are few:
 
 | Primitive | When | Needed by |
 |---|---|---|
-| `uri_pattern`, `path_variables` | now | Vertex AI, Gemini, Bedrock InvokeModel, Azure OpenAI deployments (`api-version` as the pattern's query) |
-| `path_only_fields` | now | Vertex AI Claude; Gemini and InvokeModel |
-| `body_fields` | now | Vertex AI and Bedrock `anthropic_version` |
-| Header to body, constant headers | later | InvokeModel's `anthropic_beta`; the Anthropic API's `anthropic-version` |
+| `fields`: a request field in a path variable, query parameter or header, moved or copied | now | Vertex AI and Gemini (`model`, `stream`), Bedrock InvokeModel, Azure OpenAI deployments (`model` as `{deployment}`), gateways that route on a header |
+| `path_variables`, and a constant query in the pattern | now | Vertex AI's `project` and `location`; Azure OpenAI's `api-version` |
+| `body_fields`, `headers` | now | Vertex AI's and Bedrock's `anthropic_version`; the Anthropic API's `anthropic-version` |
+| Value maps beyond the `{unary\|stream}` choice; nested field paths | later | none known yet |
+| Header to body | later | InvokeModel's `anthropic_beta` |
 | Response framing | later | Bedrock's event stream |
 
 A new provider is data: a named binding, built in or, later, defined in the filter config. Only a
@@ -458,25 +577,25 @@ provider-specific model ids (`envoy.ai.model.resolved` and the model table), and
 
 ## Plan
 
-1. **API** (this change): `LLMBinding`, the route `binding` fields (hidden until implemented), and
-   `LLMProtocol` docs.
+1. **API** (this change): `LLMBinding`, the route `binding` fields and the filter's `bindings`
+   (hidden until implemented), and `LLMProtocol` docs.
 2. **Requests instructed by filter state alone:** activation by `envoy.ai.llm_protocol.request`,
    the backend API defaulting to the client's with no IR round trip, `envoy.ai.model.resolved` at
    the sink, and one resolver for the instructions. With today's keys this already serves a
    dynamic forward proxy, for example an OpenAI client sent to Gemini.
-3. **Binding table:** the engine's envelopes become bindings; `UriPattern::render()` fills
-   `path_variables` and `match()` captures them. No behavior change.
+3. **Bindings and objects:** the engine's envelopes become built-in bindings; the filter's
+   `bindings`; the C++ `LlmBinding` and the typed objects for both key families;
+   `UriPattern::render()` fills `path_variables` and `match()` captures them. No behavior change.
 4. **Core ingress and `envoy.ai.binding.request`:** Vertex AI clients work with schema validation,
    request_info and the transcoder (examples 3 to 5 and 9), which drop their request-path code. The
    core reads `envoy.ai.uri_pattern.request` in the transcoder's place.
 5. **Core egress and `envoy.ai.binding.response`:** requests reach Claude on Vertex AI (examples 1,
    2 and 6 to 8). The core reads `envoy.ai.uri_pattern.response` in the transcoder's place; the
    route fields are shown.
-6. **More:** bindings defined in the filter config, recognizing an API from the path with no key
-   at all, Bedrock InvokeModel, Azure OpenAI's `/openai/v1` form.
+6. **More:** recognizing an API from the path with no key at all, Bedrock InvokeModel, Azure
+   OpenAI's `/openai/v1` form.
 
 Open questions:
 
-- `path_only_fields`, or its inverse `keep_in_body`.
-- Whether a JSON binding key is worth its parsing cost per request, or a name plus the pattern key
-  covers the providers that matter.
+- When a provider needs them: value maps beyond the `{unary|stream}` choice, and nested field
+  paths such as `generationConfig.responseMimeType`.
