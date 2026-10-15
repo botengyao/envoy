@@ -7,6 +7,7 @@
 
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
@@ -37,11 +38,19 @@ using HttpFilters::AiProtocolManager::FakeBridge;
 using HttpFilters::AiProtocolManager::FilterManager;
 using HttpFilters::AiProtocolManager::InMemoryExternalBufferFactory;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
+using HttpFilters::AiProtocolManager::LlmBindingObject;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
 
 constexpr absl::string_view ChatPayload =
     R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]})";
+// Claude on Vertex AI names the model in the path alone.
+constexpr absl::string_view VertexClaudePayload =
+    R"({"anthropic_version":"vertex-2023-10-16","max_tokens":8,)"
+    R"("messages":[{"role":"user","content":"hi"}]})";
+constexpr absl::string_view VertexClaudePath =
+    "/v1/projects/acme/locations/us-east5/publishers/anthropic/models/"
+    "claude-sonnet-4-5@20250929:rawPredict";
 
 // Stands in for the filters after this one, to show what they are handed.
 class ProtocolRecordingFilter : public Common::SyncAiFilter {
@@ -114,6 +123,12 @@ public:
     EXPECT_FALSE(seen_protocol_.has_value());
     EXPECT_EQ(bridge_.injected_.length(), 0);
     EXPECT_EQ(counterValue("invalid"), 1);
+  }
+
+  void setRequestBinding(std::shared_ptr<LlmBindingObject> binding) {
+    stream_info_.filterState()->setData(
+        HttpFilters::AiProtocolManager::FilterStateKeys::BindingRequest, std::move(binding),
+        StreamInfo::FilterState::LifeSpan::FilterChain);
   }
 
   uint64_t counterValue(const std::string& name) {
@@ -223,6 +238,53 @@ TEST_F(SchemaValidationFilterTest, DeclaredApiOutranksDefaultAndDetection) {
   expectForwarded();
   EXPECT_EQ(seen_protocol_, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(counterValue("llm_protocol_detected"), 0);
+}
+
+// The model the client's path names under a binding Envoy knows counts as the body's, and the
+// body goes on as it came.
+TEST_F(SchemaValidationFilterTest, VertexClaudeBodyTakesTheModelFromItsPath) {
+  run(VertexClaudePayload, LLMProtocol::AnthropicMessages, VertexClaudePath);
+  expectForwarded();
+  EXPECT_EQ(counterValue("valid"), 1);
+  EXPECT_FALSE(nlohmann::json::parse(bridge_.injected_.toString()).contains("model"));
+}
+
+// A path no binding matches names no model, so `model` is still required.
+TEST_F(SchemaValidationFilterTest, VertexClaudeBodyOnAnotherPathIsRejected) {
+  run(VertexClaudePayload, LLMProtocol::AnthropicMessages, "/v1/messages");
+  expectRejected();
+}
+
+// The path is read under the binding a filter ahead named, or the one a request leg recorded.
+TEST_F(SchemaValidationFilterTest, ReadsThePathUnderTheRequestBinding) {
+  setRequestBinding(LlmBindingObject::fromString("/gateway/{model}/messages"));
+  run(VertexClaudePayload, LLMProtocol::AnthropicMessages, "/gateway/claude-haiku-4-5/messages");
+  expectForwarded();
+  EXPECT_EQ(counterValue("valid"), 1);
+}
+
+TEST_F(SchemaValidationFilterTest, UsesTheModelARequestLegRecorded) {
+  std::shared_ptr<LlmBindingObject> binding = LlmBindingObject::fromString("/gateway/{model}");
+  binding->setRead({binding->binding(), "claude-haiku-4-5", {}, {}});
+  setRequestBinding(std::move(binding));
+  run(VertexClaudePayload, LLMProtocol::AnthropicMessages, "/elsewhere");
+  expectForwarded();
+}
+
+// A binding that does not parse names no model; the transcoder reports it.
+TEST_F(SchemaValidationFilterTest, UnparseableRequestBindingNamesNoModel) {
+  setRequestBinding(LlmBindingObject::fromString("/gateway/{model"));
+  run(VertexClaudePayload, LLMProtocol::AnthropicMessages, VertexClaudePath);
+  expectRejected();
+}
+
+// With no API declared, a binding Envoy knows names it from the path.
+TEST_F(SchemaValidationFilterTest, DetectsTheApiFromAKnownBinding) {
+  run(VertexClaudePayload, LLMProtocol::Unspecified, VertexClaudePath);
+  expectForwarded();
+  EXPECT_EQ(seen_protocol_, LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(counterValue("llm_protocol_detected"), 1);
+  EXPECT_EQ(counterValue("valid"), 1);
 }
 
 } // namespace

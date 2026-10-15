@@ -280,6 +280,36 @@ TEST(LlmBindingWriteTest, EditsOnlyAnObjectBody) {
   EXPECT_EQ(write->headers.size(), 1);
 }
 
+TEST(BuiltInBindingsTest, NameTheApiAndTheModelOfAPath) {
+  constexpr absl::string_view vertex_claude =
+      "/v1/projects/p/locations/l/publishers/anthropic/models/claude-sonnet-4-5:rawPredict";
+  constexpr absl::string_view vertex_gemini =
+      "/v1/projects/p/locations/l/publishers/google/models/gemini-2.5-flash:generateContent";
+  EXPECT_EQ(apiOfPath(vertex_claude), LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(apiOfPath(vertex_gemini), LLMProtocol::GeminiGenerateContent);
+  EXPECT_EQ(apiOfPath("/v1beta/models/gemini-2.5-flash:generateContent"),
+            LLMProtocol::GeminiGenerateContent);
+  EXPECT_EQ(apiOfPath("/v1/messages"), LLMProtocol::Unspecified);
+
+  const LLMProtocol anthropic = LLMProtocol::AnthropicMessages;
+  EXPECT_EQ(apiBinding(anthropic), nullptr);
+  EXPECT_EQ(modelFromPath(vertex_claude, nullptr, nullptr, clientBindings(anthropic)),
+            "claude-sonnet-4-5");
+  EXPECT_EQ(modelFromPath("/v1/messages", nullptr, nullptr, clientBindings(anthropic)), "");
+  EXPECT_TRUE(clientBindings(LLMProtocol::OpenAiChatCompletions).empty());
+
+  // A given binding replaces the built-in ones, its empty pattern filled by the API's own.
+  const LlmBindingConstSharedPtr gateway = parseOk("/gw/{model}");
+  EXPECT_EQ(modelFromPath("/gw/m", gateway.get(), nullptr, clientBindings(anthropic)), "m");
+  EXPECT_EQ(modelFromPath(vertex_claude, gateway.get(), nullptr, clientBindings(anthropic)), "");
+  const LlmBindingConstSharedPtr edits_only = parseOk(R"({"mutations": [{"header": "x-a"}]})");
+  const LLMProtocol gemini = LLMProtocol::GeminiGenerateContent;
+  EXPECT_EQ(modelFromPath("/v1beta/models/g:generateContent", edits_only.get(),
+                          apiBinding(gemini).get(), clientBindings(gemini)),
+            "g");
+  EXPECT_EQ(modelFromPath("/x", edits_only.get(), nullptr, {}), "");
+}
+
 } // namespace
 } // namespace AiProtocolManager
 } // namespace HttpFilters

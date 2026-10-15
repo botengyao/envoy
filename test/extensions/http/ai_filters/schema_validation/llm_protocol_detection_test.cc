@@ -32,6 +32,11 @@ TEST(DetectFromHeadersTest, MatchesProviderPathSuffix) {
             LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(fromPath("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"),
             LLMProtocol::GeminiGenerateContent);
+  EXPECT_EQ(fromPath("/v1/projects/p/locations/us-east5/publishers/anthropic/models/"
+                     "claude-sonnet-4-5@20250929:streamRawPredict"),
+            LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(fromPath("/v1/projects/p/locations/l/publishers/anthropic/models/m:countTokens"),
+            LLMProtocol::Unspecified);
   EXPECT_EQ(fromPath("/v2/messages"), LLMProtocol::Unspecified);
   EXPECT_EQ(fromPath("/"), LLMProtocol::Unspecified);
 }

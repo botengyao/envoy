@@ -3,6 +3,7 @@
 #include "source/common/common/macros.h"
 #include "source/common/http/path_utility.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_readers.h"
+#include "source/extensions/filters/http/ai_protocol_manager/llm_binding.h"
 
 #include "absl/algorithm/container.h"
 #include "absl/strings/match.h"
@@ -73,6 +74,10 @@ LLMProtocol detectFromHeaders(const Http::RequestHeaderMap& headers) {
     if (absl::EndsWith(path, suffix)) {
       return protocol;
     }
+  }
+  if (const LLMProtocol protocol = HttpFilters::AiProtocolManager::apiOfPath(path);
+      protocol != LLMProtocol::Unspecified) {
+    return protocol;
   }
   return headers.get(anthropicVersionHeader()).empty() ? LLMProtocol::Unspecified
                                                        : LLMProtocol::AnthropicMessages;

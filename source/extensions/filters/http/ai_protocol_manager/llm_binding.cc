@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <utility>
 
+#include "source/common/common/macros.h"
 #include "source/common/http/header_utility.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
@@ -129,7 +130,97 @@ absl::StatusOr<std::string> fillPlaceholders(absl::string_view text,
   }
 }
 
+// A binding Envoy defines. Its pattern is a constant, so it parses.
+LlmBindingConstSharedPtr builtInBinding(absl::string_view pattern,
+                                        std::vector<LlmBinding::Mutation> mutations) {
+  auto binding = std::make_shared<LlmBinding>();
+  binding->pattern = *UriPattern::parse(pattern);
+  binding->mutations = std::move(mutations);
+  return binding;
+}
+
+// Gemini names the model and the streaming mode in the path alone.
+std::vector<LlmBinding::Mutation> geminiMutations() {
+  return {{.name = std::string(kModelField)}, {.name = std::string(kStreamField)}};
+}
+
 } // namespace
+
+LlmBindingConstSharedPtr apiBinding(LLMProtocol api) {
+  if (api != LLMProtocol::GeminiGenerateContent) {
+    return nullptr;
+  }
+  CONSTRUCT_ON_FIRST_USE(LlmBindingConstSharedPtr,
+                         builtInBinding("/v1beta/models/"
+                                        "{model}:{generateContent|streamGenerateContent?alt=sse}",
+                                        geminiMutations()));
+}
+
+absl::Span<const LlmBindingConstSharedPtr> clientBindings(LLMProtocol api) {
+  switch (api) {
+  case LLMProtocol::AnthropicMessages: {
+    // Claude on Vertex AI: the model in the path alone, and the Vertex API version in the body.
+    static const auto* bindings = new std::vector<LlmBindingConstSharedPtr>{builtInBinding(
+        "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/"
+        "{model}:{rawPredict|streamRawPredict}",
+        {{.name = std::string(kModelField)},
+         {.name = "anthropic_version",
+          .value = nlohmann::json("vertex-2023-10-16"),
+          .keep_existing = true}})};
+    return *bindings;
+  }
+  case LLMProtocol::GeminiGenerateContent: {
+    static const auto* bindings = new std::vector<LlmBindingConstSharedPtr>{builtInBinding(
+        "/{version}/projects/{project}/locations/{location}/publishers/google/models/"
+        "{model}:{generateContent|streamGenerateContent?alt=sse}",
+        geminiMutations())};
+    return *bindings;
+  }
+  default:
+    return {};
+  }
+}
+
+LLMProtocol apiOfPath(absl::string_view path) {
+  for (const LLMProtocol api :
+       {LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent}) {
+    if (const LlmBindingConstSharedPtr own = apiBinding(api);
+        own != nullptr && own->pattern->match(path).has_value()) {
+      return api;
+    }
+    for (const LlmBindingConstSharedPtr& binding : clientBindings(api)) {
+      if (binding->pattern->match(path).has_value()) {
+        return api;
+      }
+    }
+  }
+  return LLMProtocol::Unspecified;
+}
+
+std::string modelFromPath(absl::string_view path, const LlmBinding* binding,
+                          const LlmBinding* api_binding,
+                          absl::Span<const LlmBindingConstSharedPtr> client_bindings) {
+  std::vector<const UriPattern*> patterns;
+  if (binding != nullptr) {
+    patterns.push_back(binding->patternOver(api_binding));
+  } else {
+    if (api_binding != nullptr) {
+      patterns.push_back(api_binding->patternOver(nullptr));
+    }
+    for (const LlmBindingConstSharedPtr& client_binding : client_bindings) {
+      patterns.push_back(client_binding->patternOver(nullptr));
+    }
+  }
+  for (const UriPattern* pattern : patterns) {
+    if (pattern == nullptr) {
+      continue;
+    }
+    if (std::optional<UriPattern::Match> match = pattern->match(path); match.has_value()) {
+      return std::move(match->model);
+    }
+  }
+  return "";
+}
 
 absl::StatusOr<LlmBindingConstSharedPtr>
 LlmBinding::create(const envoy::type::ai::v3::LLMBinding& proto) {

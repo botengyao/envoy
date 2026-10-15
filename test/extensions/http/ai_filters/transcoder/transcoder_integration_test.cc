@@ -270,10 +270,11 @@ std::vector<std::pair<std::string, nlohmann::json>> sseEvents(absl::string_view 
 }
 
 // Partner models on Vertex AI behind one route, in both directions: a Claude on Vertex AI client
-// sent to Gemini on Vertex AI, and a Gemini on Vertex AI client sent to Claude on Vertex AI. The
-// route declares only the client's API; a filter ahead of the AI Protocol Manager names the
-// backend's API, its binding and the model, and the client's path supplies the project and the
-// region. The upstream answers as Vertex AI does, so a request off its spec fails the test.
+// sent to Gemini on Vertex AI, and a Gemini on Vertex AI client sent to Claude on Vertex AI. Schema
+// validation checks the client's body ahead of the transcoder. The route declares only the
+// client's API; a filter ahead of the AI Protocol Manager names the backend's API, its binding and
+// the model, and the client's path supplies the project and the region. The upstream answers as
+// Vertex AI does, so a request off its spec fails the test.
 class TranscoderIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                   public HttpIntegrationTest {
 public:
@@ -350,6 +351,8 @@ public:
     EXPECT_EQ(upstream_request_->headers().getHostValue(), "us-east5-aiplatform.googleapis.com");
     EXPECT_THAT(upstream_request_->headers(), ContainsHeader("x-vertex-location", "us-east5"));
     EXPECT_EQ(nlohmann::json::parse(upstream_body_), body);
+    // The client's body validated against its API, with the model its path names.
+    test_server_->waitForCounter("ai_protocol_manager.schema_validation.valid", testing::Eq(1));
   }
 
 private:
@@ -381,6 +384,9 @@ typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
   request_handling: {}
   filters:
+  - name: envoy.http.ai_filters.schema_validation
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
   - name: envoy.http.ai_filters.transcoder
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder

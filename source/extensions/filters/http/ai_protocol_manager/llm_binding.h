@@ -7,6 +7,7 @@
 
 #include "envoy/type/ai/v3/llm_binding.pb.h"
 
+#include "source/extensions/filters/http/ai_protocol_manager/token_usage.h"
 #include "source/extensions/filters/http/ai_protocol_manager/uri_pattern.h"
 
 #include "absl/container/flat_hash_map.h"
@@ -91,6 +92,20 @@ std::optional<LlmBindingRead> readRequest(const LlmBindingConstSharedPtr& bindin
 absl::StatusOr<LlmBindingWrite> writeRequest(const LlmBinding& binding,
                                              const LlmBinding* api_binding,
                                              const LlmBindingRead* arrived, nlohmann::json& body);
+
+// The API's own binding, when its path carries request values (Gemini's); null otherwise.
+LlmBindingConstSharedPtr apiBinding(LLMProtocol api);
+// Bindings a client of `api` may arrive in besides the API's own, e.g. Claude on Vertex AI.
+absl::Span<const LlmBindingConstSharedPtr> clientBindings(LLMProtocol api);
+// The API whose own or client binding matches `path`; Unspecified when none does.
+LLMProtocol apiOfPath(absl::string_view path);
+
+// The model `path` names under `binding`, with `api_binding` filling a pattern it leaves empty, or,
+// when `binding` is null, under the first of `api_binding` and `client_bindings` that matches.
+// Empty when none matches and names a model.
+std::string modelFromPath(absl::string_view path, const LlmBinding* binding,
+                          const LlmBinding* api_binding,
+                          absl::Span<const LlmBindingConstSharedPtr> client_bindings);
 
 } // namespace AiProtocolManager
 } // namespace HttpFilters

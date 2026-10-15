@@ -1,8 +1,11 @@
 #include "source/extensions/http/ai_filters/schema_validation/filter.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
+#include "source/extensions/filters/http/ai_protocol_manager/llm_binding.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
@@ -16,10 +19,21 @@ namespace SchemaValidation {
 using HttpFilters::AiProtocolManager::AdapterRegistry;
 using HttpFilters::AiProtocolManager::AiFilterContext;
 using HttpFilters::AiProtocolManager::AiRequest;
+using HttpFilters::AiProtocolManager::apiBinding;
+using HttpFilters::AiProtocolManager::clientBindings;
+using HttpFilters::AiProtocolManager::LlmBindingObject;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::llmProtocolName;
 using HttpFilters::AiProtocolManager::LocalReplier;
+using HttpFilters::AiProtocolManager::modelFromPath;
 using HttpFilters::AiProtocolManager::PayloadSchema;
+namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
+
+namespace {
+
+constexpr absl::string_view kModelField = "model";
+
+} // namespace
 
 SchemaValidationFilterConfig::SchemaValidationFilterConfig(
     const envoy::extensions::http::ai_filters::schema_validation::v3::SchemaValidation& proto,
@@ -44,7 +58,11 @@ absl::Status SchemaValidationFilter::decodeSync(AiRequest& request, LocalReplier
 
   // TODO(penguingao): validate as the parser streams, rejecting an invalid field before the
   // payload ends.
+  const bool lifted = liftModelFromPath(request);
   const absl::Status status = schema->validateRequest(request.request_index());
+  if (lifted) {
+    request.json().erase(kModelField);
+  }
   if (status.ok()) {
     config_->stats().valid_.inc();
     return absl::OkStatus();
@@ -56,6 +74,29 @@ absl::Status SchemaValidationFilter::decodeSync(AiRequest& request, LocalReplier
     std::move(reply_locally)(Http::Code::BadRequest, std::string(status.message()));
   }
   return absl::OkStatus();
+}
+
+bool SchemaValidationFilter::liftModelFromPath(AiRequest& request) const {
+  nlohmann::json& json = request.json();
+  if (!json.is_object() || json.contains(kModelField)) {
+    return false;
+  }
+  const std::shared_ptr<const LlmBindingObject> binding = LlmBindingObject::fromFilterState(
+      *context_.stream_info.filterState(), FilterStateKeys::BindingRequest);
+  if (binding != nullptr && !binding->status().ok()) {
+    return false;
+  }
+  std::string model =
+      binding != nullptr && binding->read().has_value()
+          ? binding->read()->model
+          : modelFromPath(context_.request_headers.getPathValue(),
+                          binding != nullptr ? binding->binding().get() : nullptr,
+                          apiBinding(request.protocol()).get(), clientBindings(request.protocol()));
+  if (model.empty()) {
+    return false;
+  }
+  json[kModelField] = std::move(model);
+  return true;
 }
 
 LLMProtocol SchemaValidationFilter::resolveLlmProtocol(const AiRequest& request) const {

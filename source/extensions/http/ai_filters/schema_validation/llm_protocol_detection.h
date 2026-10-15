@@ -12,7 +12,7 @@ namespace AiFilters {
 namespace SchemaValidation {
 
 // The API a request's path names, matched as a suffix so a gateway prefix does not hide it, then
-// the `anthropic-version` header.
+// by a binding Envoy knows (Claude on Vertex AI), then the `anthropic-version` header.
 HttpFilters::AiProtocolManager::LLMProtocol
 detectFromHeaders(const Http::RequestHeaderMap& headers);
 

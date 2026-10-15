@@ -1147,15 +1147,6 @@ StreamGrammar anthropicStreamFromIr() {
   };
 }
 
-// A binding Envoy defines. Its pattern is a constant, so it parses.
-LlmBindingConstSharedPtr builtInBinding(absl::string_view pattern,
-                                        std::vector<LlmBinding::Mutation> mutations) {
-  auto binding = std::make_shared<LlmBinding>();
-  binding->pattern = *UriPattern::parse(pattern);
-  binding->mutations = std::move(mutations);
-  return binding;
-}
-
 // Builds the declarative transcoding pack for Anthropic Messages <-> IR (OpenAI Chat).
 DialectTranscodePack createAnthropicTranscodePack() {
   return DialectTranscodePack{
@@ -1163,20 +1154,9 @@ DialectTranscodePack createAnthropicTranscodePack() {
       .request = {.to_ir = anthropicRequestToIr(), .from_ir = anthropicRequestFromIr()},
       .response = {.to_ir = anthropicResponseToIr(), .from_ir = anthropicResponseFromIr()},
       .stream = {.to_ir = anthropicStreamToIr(), .from_ir = anthropicStreamFromIr()},
-      // Claude on Vertex AI: the model in the path alone, and the Vertex API version in the body.
-      .client_bindings = {builtInBinding(
-          "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/"
-          "{model}:{rawPredict|streamRawPredict}",
-          {{.name = "model"},
-           {.name = "anthropic_version",
-            .value = nlohmann::json("vertex-2023-10-16"),
-            .keep_existing = true}})},
+      .client_bindings = {clientBindings(LLMProtocol::AnthropicMessages).begin(),
+                          clientBindings(LLMProtocol::AnthropicMessages).end()},
   };
-}
-
-// Gemini names the model and the streaming mode in the path alone.
-std::vector<LlmBinding::Mutation> geminiMutations() {
-  return {{.name = "model"}, {.name = "stream"}};
 }
 
 // Gemini GenerateContent request -> IR request.
@@ -1523,13 +1503,9 @@ DialectTranscodePack createGeminiTranscodePack() {
       .stream = {.to_ir = geminiStreamToIr(), .from_ir = geminiStreamFromIr()},
       // The Gemini API's layout. A request leaves in it unless a binding names another, such as
       // Vertex AI's, which nests the same methods under a project and a location.
-      .binding =
-          builtInBinding("/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}",
-                         geminiMutations()),
-      .client_bindings = {builtInBinding(
-          "/{version}/projects/{project}/locations/{location}/publishers/google/models/"
-          "{model}:{generateContent|streamGenerateContent?alt=sse}",
-          geminiMutations())},
+      .binding = apiBinding(LLMProtocol::GeminiGenerateContent),
+      .client_bindings = {clientBindings(LLMProtocol::GeminiGenerateContent).begin(),
+                          clientBindings(LLMProtocol::GeminiGenerateContent).end()},
   };
 }
 
@@ -3058,27 +3034,10 @@ TranscodingEngine::finishStream(const TranscodeLeg& leg, TranscodeContext& ctx) 
 std::string TranscodingEngine::modelFromRequestPath(LLMProtocol dialect, absl::string_view path,
                                                     const LlmBinding* binding) const {
   const auto pack = packs_.find(dialect);
-  const DialectTranscodePack* found = pack != packs_.end() ? &pack->second : nullptr;
-  std::vector<const UriPattern*> patterns;
-  if (binding != nullptr) {
-    patterns.push_back(binding->patternOver(found != nullptr ? found->binding.get() : nullptr));
-  } else if (found != nullptr) {
-    if (found->binding != nullptr) {
-      patterns.push_back(found->binding->patternOver(nullptr));
-    }
-    for (const LlmBindingConstSharedPtr& client_binding : found->client_bindings) {
-      patterns.push_back(client_binding->patternOver(nullptr));
-    }
+  if (pack == packs_.end()) {
+    return modelFromPath(path, binding, nullptr, {});
   }
-  for (const UriPattern* pattern : patterns) {
-    if (pattern == nullptr) {
-      continue;
-    }
-    if (std::optional<UriPattern::Match> match = pattern->match(path); match.has_value()) {
-      return std::move(match->model);
-    }
-  }
-  return "";
+  return modelFromPath(path, binding, pack->second.binding.get(), pack->second.client_bindings);
 }
 
 } // namespace AiProtocolManager

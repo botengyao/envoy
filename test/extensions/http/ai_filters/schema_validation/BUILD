@@ -31,6 +31,7 @@ envoy_extension_cc_test(
     deps = [
         "//source/common/stream_info:stream_info_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:ai_filter_state_lib",
         "//source/extensions/filters/http/ai_protocol_manager:buffer_manager_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_manager_lib",

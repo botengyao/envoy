@@ -123,7 +123,9 @@ envoy_cc_library(
     srcs = ["llm_binding.cc"],
     hdrs = ["llm_binding.h"],
     deps = [
+        ":token_usage_lib",
         ":uri_pattern_lib",
+        "//source/common/common:macros",
         "//source/common/http:header_utility_lib",
         "//source/common/protobuf",
         "//source/common/protobuf:utility_lib",

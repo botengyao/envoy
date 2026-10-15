@@ -61,6 +61,9 @@ public:
 private:
   HttpFilters::AiProtocolManager::LLMProtocol
   resolveLlmProtocol(const HttpFilters::AiProtocolManager::AiRequest& request) const;
+  // Writes the model the client's path names under its binding into a body without one, as the
+  // transcoder reads it, so an API that requires `model` validates. Returns whether it wrote one.
+  bool liftModelFromPath(HttpFilters::AiProtocolManager::AiRequest& request) const;
 
   SchemaValidationFilterConfigSharedPtr config_;
   const HttpFilters::AiProtocolManager::AiFilterContext context_;
