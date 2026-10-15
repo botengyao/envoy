@@ -60,7 +60,8 @@ public:
 
 private:
   HttpFilters::AiProtocolManager::LLMProtocol
-  resolveLlmProtocol(const HttpFilters::AiProtocolManager::AiRequest& request) const;
+  resolveLlmProtocol(const HttpFilters::AiProtocolManager::AiRequest& request);
+  void storeLlmProtocol(HttpFilters::AiProtocolManager::LLMProtocol protocol);
 
   SchemaValidationFilterConfigSharedPtr config_;
   const HttpFilters::AiProtocolManager::AiFilterContext context_;

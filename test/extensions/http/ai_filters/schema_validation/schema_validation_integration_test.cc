@@ -17,7 +17,8 @@ class SchemaValidationIntegrationTest : public testing::TestWithParam<Network::A
 public:
   SchemaValidationIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
-  // The route declares an AI endpoint without naming its API.
+  // The route declares an AI endpoint without naming its API, and sends the request's API upstream
+  // as `x-llm-protocol`.
   void initializeFilters(bool with_filter_state, bool fail_open = false) {
     config_helper_.addConfigModifier([](ConfigHelper::HttpConnectionManager& hcm) {
       envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
@@ -27,6 +28,9 @@ public:
       std::ignore =
           (*route->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
               .PackFrom(per_route);
+      auto* header = route->add_request_headers_to_add()->mutable_header();
+      header->set_key("x-llm-protocol");
+      header->set_value("%FILTER_STATE(envoy.ai.llm_protocol.request:PLAIN)%");
     });
 
     config_helper_.prependFilter(fmt::format(R"EOF(
@@ -98,6 +102,10 @@ TEST_P(SchemaValidationIntegrationTest, DetectedApiPayloadIsForwarded) {
   test_server_->waitForCounter("ai_protocol_manager.schema_validation.valid", testing::Eq(1));
   test_server_->waitForCounter("ai_protocol_manager.schema_validation.llm_protocol_detected",
                                testing::Eq(1));
+  const auto llm_protocol =
+      upstream_request_->headers().get(Http::LowerCaseString("x-llm-protocol"));
+  ASSERT_EQ(llm_protocol.size(), 1);
+  EXPECT_EQ(llm_protocol[0]->value().getStringView(), "ANTHROPIC_MESSAGES");
 }
 
 TEST_P(SchemaValidationIntegrationTest, DetectedApiViolationIsRejected) {

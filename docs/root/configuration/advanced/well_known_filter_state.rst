@@ -108,7 +108,9 @@ The following lists the filter state object keys used by the Envoy extensions to
   Names the request's wire API to the :ref:`AI Protocol Manager <config_http_filters_ai_protocol_manager>`,
   ahead of the route's declaration. Accepts an :ref:`LLMProtocol <envoy_v3_api_enum_type.ai.v3.LLMProtocol>`
   enum-value name as a constructor, e.g. "ANTHROPIC_MESSAGES". Supports field access with
-  ``llm_protocol``.
+  ``llm_protocol``. The :ref:`schema validation AI filter
+  <config_http_filters_ai_protocol_manager_schema_validation>` sets it to an API it detects, unless
+  it is set already.
 
 ``envoy.ai.model.request``
   The model the request names, as the :ref:`request info AI filter

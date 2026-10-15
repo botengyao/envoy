@@ -1,8 +1,12 @@
 #include "source/extensions/http/ai_filters/schema_validation/filter.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
+#include "envoy/stream_info/filter_state.h"
+
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema.h"
@@ -20,6 +24,8 @@ using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::llmProtocolName;
 using HttpFilters::AiProtocolManager::LocalReplier;
 using HttpFilters::AiProtocolManager::PayloadSchema;
+using HttpFilters::AiProtocolManager::RequestLlmProtocol;
+namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
 
 SchemaValidationFilterConfig::SchemaValidationFilterConfig(
     const envoy::extensions::http::ai_filters::schema_validation::v3::SchemaValidation& proto,
@@ -58,7 +64,7 @@ absl::Status SchemaValidationFilter::decodeSync(AiRequest& request, LocalReplier
   return absl::OkStatus();
 }
 
-LLMProtocol SchemaValidationFilter::resolveLlmProtocol(const AiRequest& request) const {
+LLMProtocol SchemaValidationFilter::resolveLlmProtocol(const AiRequest& request) {
   if (request.protocol() != LLMProtocol::Unspecified) {
     return request.protocol();
   }
@@ -71,8 +77,20 @@ LLMProtocol SchemaValidationFilter::resolveLlmProtocol(const AiRequest& request)
   }
   if (detected != LLMProtocol::Unspecified) {
     config_->stats().llm_protocol_detected_.inc();
+    storeLlmProtocol(detected);
   }
   return detected;
+}
+
+void SchemaValidationFilter::storeLlmProtocol(LLMProtocol protocol) {
+  const StreamInfo::FilterStateSharedPtr& filter_state = context_.stream_info.filterState();
+  // A filter ahead may have set the object with another life span, which setData rejects.
+  if (filter_state->hasDataWithName(FilterStateKeys::LlmProtocolRequest)) {
+    return;
+  }
+  filter_state->setData(FilterStateKeys::LlmProtocolRequest,
+                        std::make_shared<RequestLlmProtocol>(protocol),
+                        StreamInfo::FilterState::LifeSpan::FilterChain);
 }
 
 } // namespace SchemaValidation

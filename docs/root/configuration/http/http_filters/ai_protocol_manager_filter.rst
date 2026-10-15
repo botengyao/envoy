@@ -234,7 +234,10 @@ and by default the API is detected from the request: its path, matched as a
 suffix against each provider's REST path (``/chat/completions``,
 ``/responses``, ``/v1/messages``, ``:generateContent``,
 ``:streamGenerateContent``); then the ``anthropic-version`` header; then the
-payload's shape.
+payload's shape. A detected API is also set as the
+``envoy.ai.llm_protocol.request`` filter state object, unless one is set
+already, so access logs and the HTTP filters after the AI Protocol Manager can
+read it.
 
 Chat Completions and Anthropic Messages share the ``messages[]`` request
 shape, so only keys exclusive to one of them tell the two apart. A payload

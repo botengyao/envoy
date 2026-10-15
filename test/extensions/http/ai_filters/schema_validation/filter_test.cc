@@ -7,6 +7,7 @@
 
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
@@ -39,6 +40,8 @@ using HttpFilters::AiProtocolManager::InMemoryExternalBufferFactory;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
+using HttpFilters::AiProtocolManager::RequestLlmProtocol;
+namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
 
 constexpr absl::string_view ChatPayload =
     R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]})";
@@ -122,6 +125,14 @@ public:
     return counter != nullptr ? counter->value() : 0;
   }
 
+  // The API the envoy.ai.llm_protocol.request object names; nullopt when no object is set.
+  std::optional<LLMProtocol> publishedProtocol() {
+    if (!stream_info_.filterState()->hasDataWithName(FilterStateKeys::LlmProtocolRequest)) {
+      return std::nullopt;
+    }
+    return RequestLlmProtocol::fromFilterState(*stream_info_.filterState());
+  }
+
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   InMemoryExternalBufferFactory factory_;
@@ -149,6 +160,7 @@ TEST_F(SchemaValidationFilterTest, ForwardsPayloadMatchingTheDeclaredSchema) {
   EXPECT_EQ(counterValue("valid"), 1);
   EXPECT_EQ(counterValue("invalid"), 0);
   EXPECT_EQ(counterValue("skipped"), 0);
+  EXPECT_EQ(publishedProtocol(), std::nullopt);
 }
 
 TEST_F(SchemaValidationFilterTest, RejectsPayloadViolatingTheDeclaredSchema) {
@@ -191,12 +203,15 @@ TEST_F(SchemaValidationFilterTest, DefaultAppliesWhenNoneIsDeclared) {
   run(ChatPayload, LLMProtocol::Unspecified);
   expectRejected();
   EXPECT_EQ(counterValue("llm_protocol_detected"), 0);
+  EXPECT_EQ(publishedProtocol(), std::nullopt);
 }
 
+// The detected API is published even for a payload that is then rejected.
 TEST_F(SchemaValidationFilterTest, DetectsTheApiFromThePath) {
   run(ChatPayload, LLMProtocol::Unspecified, "/anthropic/v1/messages");
   expectRejected();
   EXPECT_EQ(counterValue("llm_protocol_detected"), 1);
+  EXPECT_EQ(publishedProtocol(), LLMProtocol::AnthropicMessages);
 }
 
 TEST_F(SchemaValidationFilterTest, DetectsTheApiFromThePayload) {
@@ -206,6 +221,7 @@ TEST_F(SchemaValidationFilterTest, DetectsTheApiFromThePayload) {
   EXPECT_EQ(seen_protocol_, LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(counterValue("llm_protocol_detected"), 1);
   EXPECT_EQ(counterValue("valid"), 1);
+  EXPECT_EQ(publishedProtocol(), LLMProtocol::GeminiGenerateContent);
 }
 
 TEST_F(SchemaValidationFilterTest, UndetectedApiIsForwardedUnvalidated) {
@@ -214,6 +230,22 @@ TEST_F(SchemaValidationFilterTest, UndetectedApiIsForwardedUnvalidated) {
   EXPECT_EQ(seen_protocol_, LLMProtocol::Unspecified);
   EXPECT_EQ(counterValue("llm_protocol_detected"), 0);
   EXPECT_EQ(counterValue("skipped"), 1);
+  EXPECT_EQ(publishedProtocol(), std::nullopt);
+}
+
+// The core ignores an object that names no API, so detection still runs; the object stays, even
+// with a life span the filter would not have given it.
+TEST_F(SchemaValidationFilterTest, KeepsTheObjectAFilterAheadSet) {
+  const auto preset = std::make_shared<RequestLlmProtocol>(LLMProtocol::Unspecified);
+  stream_info_.filterState()->setData(FilterStateKeys::LlmProtocolRequest, preset,
+                                      StreamInfo::FilterState::LifeSpan::Request);
+  run(ChatPayload, LLMProtocol::Unspecified);
+  expectForwarded();
+  EXPECT_EQ(seen_protocol_, LLMProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(counterValue("llm_protocol_detected"), 1);
+  EXPECT_EQ(stream_info_.filterState()->getDataReadOnly<RequestLlmProtocol>(
+                FilterStateKeys::LlmProtocolRequest),
+            preset.get());
 }
 
 // Neither the default nor detection second-guesses a declared API.
@@ -223,6 +255,7 @@ TEST_F(SchemaValidationFilterTest, DeclaredApiOutranksDefaultAndDetection) {
   expectForwarded();
   EXPECT_EQ(seen_protocol_, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(counterValue("llm_protocol_detected"), 0);
+  EXPECT_EQ(publishedProtocol(), std::nullopt);
 }
 
 } // namespace
