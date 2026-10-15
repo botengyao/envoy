@@ -19,103 +19,55 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#protodoc-title: LLM binding]
 
 // How a provider carries an :ref:`LLMProtocol <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` on
-// HTTP, where that differs from the API's own.
+// HTTP, where that differs from the API's own: the request path, and edits to the request body and
+// headers. The API itself -- its schemas, stream events and usage -- does not change.
 //
-// The API -- its request and response schemas, stream events and usage -- is the ``LLMProtocol``,
-// and is the same on every provider. A binding says only what changes around it: the request path,
-// where request fields travel other than the body, and what the provider requires that the API
-// does not define. Most providers serve an API in its own shape and need no binding. Hosts and
-// credentials stay with the route and the cluster.
-//
-// Claude on Vertex AI speaks ``ANTHROPIC_MESSAGES`` through the ``vertex_ai`` binding:
+// Claude on Vertex AI:
 //
 // .. code-block:: yaml
 //
-//   name: vertex_ai
-//   path_variables: { project: my-project, location: us-east5 }
+//   uri_pattern: "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}"
+//   mutations:
+//   - { body_field: model }
+//   - { body_field: anthropic_version, value: vertex-2023-10-16, keep_existing: true }
 //
-// which stands for:
-//
-// .. code-block:: yaml
-//
-//   uri_pattern: "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}"
-//   path_variables: { version: v1, project: my-project, location: us-east5 }
-//   fields: [ { field: model, path_variable: model } ]
-//   body_fields: { anthropic_version: vertex-2023-10-16 }
-//
-// On the way in, a binding recognizes the client's path and turns the request back into the API's
-// own document: each field it places outside the body is read back into the body, and
-// ``body_fields`` are removed, so every AI filter sees the API's document whatever the client's
-// provider. On the way out, the backend's binding renders the upstream ``:path``, places each
-// field, and writes ``body_fields`` and ``headers``.
-// [#next-free-field: 7]
+// On the way out, the path is rendered from the request and the mutations are applied in order.
+// On the way in, the model and streaming mode the path names are written into the body and the
+// body fields the mutations write are removed, so every AI filter sees the API's own document.
 message LLMBinding {
-  // Where one request field travels other than in the body.
-  // [#next-free-field: 6]
-  message FieldBinding {
-    // A top-level member of the API's request, such as ``model`` or ``stream``. It is written as
-    // text: a string as it is, a number or a boolean as its JSON.
-    string field = 1 [(validate.rules).string = {min_len: 1}];
-
-    oneof location {
+  // One edit to the request: a body field or a header is written, or removed when ``value`` is
+  // unset.
+  message Mutation {
+    oneof target {
       option (validate.required) = true;
 
-      // A variable of ``uri_pattern``. The ``{unary|stream}`` choice is the variable ``stream``.
-      string path_variable = 2 [(validate.rules).string = {min_len: 1}];
+      // A top-level member of the request body.
+      string body_field = 1 [(validate.rules).string = {min_len: 1}];
 
-      // A query parameter.
-      string query_parameter = 3 [(validate.rules).string = {min_len: 1}];
-
-      // A request header.
-      string header = 4
+      // A request header. Its value must be a string.
+      string header = 2
           [(validate.rules).string = {well_known_regex: HTTP_HEADER_NAME strict: false}];
     }
 
-    // Whether the field also stays in the body. By default it leaves the body.
-    bool keep_in_body = 5;
+    // The value to write. In a string, ``{name}`` is replaced by the request's value of that name,
+    // as ``uri_pattern`` defines them: a body field such as ``{model}``, or a path variable such as
+    // ``{project}``. When unset, the target is removed.
+    google.protobuf.Value value = 3;
+
+    // Write ``value`` only where the target is absent, rather than replace it.
+    bool keep_existing = 4;
   }
 
-  // The binding this one starts from, which supplies every field below that is not set here: one
-  // Envoy defines for the API it is used with or, outside the AI Protocol Manager's own
-  // ``bindings``, one that table defines. Names Envoy defines:
-  //
-  // * ``vertex_ai``: Google Vertex AI. ``ANTHROPIC_MESSAGES`` through ``rawPredict`` and
-  //   ``streamRawPredict``, and ``GEMINI_GENERATE_CONTENT`` through the ``google`` publisher. Needs
-  //   the ``project`` and ``location`` variables.
-  //
-  // When empty, the binding starts from the API's own: ``/v1/chat/completions``,
-  // ``/v1/responses``, ``/v1/messages``, and the Gemini API's
-  // ``/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}``, which carries
-  // ``model`` and ``stream`` in the path alone.
-  string name = 1;
-
   // The request path, as a :ref:`URI pattern
-  // <config_http_filters_ai_protocol_manager_transcoder_instructions>`. Each variable is filled by
-  // the field ``fields`` places there; else from ``path_variables``; else by the request field of
-  // the same name, which then also stays in the body. The ``{unary|stream}`` choice is the variable
-  // ``stream``: its first side for a request that does not stream, its second for one that does.
-  // Replaces the named binding's pattern, for example to reach a provider through a gateway that
-  // adds a prefix.
-  string uri_pattern = 2;
+  // <config_http_filters_ai_protocol_manager_transcoder_instructions>`: a two-way map between the
+  // path and the request's named values. A variable named after a top-level field of the API's
+  // request is that field (``{model}``; the ``{unary|stream}`` choice is ``stream``); any other,
+  // such as ``{project}``, is a path variable, kept beside the body and never in it. Coming in,
+  // the pattern reads the client's path into those values; going out, it is rendered from them.
+  // Unnamed wildcards and the query are never read. When empty, the API's own path is used.
+  string uri_pattern = 1;
 
-  // Values for the pattern's variables that no request field fills, such as ``project`` and
-  // ``location``. Merged over the named binding's values.
-  map<string, string> path_variables = 3;
-
-  // The request fields the provider takes outside the body: in a path variable, a query parameter
-  // or a header. When not empty, replaces the named binding's list.
-  repeated FieldBinding fields = 4;
-
-  // Fields the provider requires in the request body that the API does not define, such as
-  // Vertex AI's ``anthropic_version``. A request that arrived in the same binding keeps the values
-  // its client sent. Merged over the named binding's fields.
-  google.protobuf.Struct body_fields = 5;
-
-  // Headers to write when the request does not carry them, such as the ``anthropic-version`` the
-  // Anthropic API requires. Not for credentials, which stay with the route. Merged over the named
-  // binding's headers.
-  map<string, string> headers = 6 [(validate.rules).map = {
-    keys {string {well_known_regex: HTTP_HEADER_NAME strict: false}}
-    values {string {well_known_regex: HTTP_HEADER_VALUE strict: false}}
-  }];
+  // Edits to the request, applied in order. When empty, the API's own edits apply, such as
+  // removing ``model`` and ``stream`` for Gemini.
+  repeated Mutation mutations = 2;
 }

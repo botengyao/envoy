@@ -59,12 +59,10 @@ message AiProtocolManager {
   // [#extension-category: envoy.ai_protocol_manager.external_buffer]
   config.core.v3.TypedExtensionConfig external_buffer_config = 4;
 
-  // Bindings that requests through this filter can name, keyed by their name: in the
-  // ``envoy.ai.binding.request`` and ``envoy.ai.binding.response`` filter state objects, and in a
-  // route's ``binding``. Naming one is an optimization: a filter state object can also spell a
-  // binding out for one request. An entry can start from a binding Envoy defines, through its own
-  // ``name``, and fix that binding's variables, so a filter ahead can choose a tenant's provider
-  // without writing its project or location. Entries are checked when the configuration loads.
+  // Bindings that the ``envoy.ai.binding.request`` and ``envoy.ai.binding.response`` filter state
+  // objects can name. Naming one is an optimization: it is built and checked once, when the
+  // configuration loads, while a filter state object can also spell a binding out for one
+  // request.
   // [#not-implemented-hide:]
   map<string, type.ai.v3.LLMBinding> bindings = 5;
 }
@@ -274,8 +272,7 @@ message RequestPerRoute {
   // client's path is matched against the API's own binding and the bindings
   // Envoy defines for it, so one route takes clients of the Anthropic API and
   // of Claude on Vertex AI alike. For one request, the
-  // ``envoy.ai.binding.request`` filter state object is merged over it, and
-  // ``envoy.ai.uri_pattern.request`` replaces its pattern.
+  // ``envoy.ai.binding.request`` filter state object replaces it.
   // [#not-implemented-hide:]
   type.ai.v3.LLMBinding binding = 2;
 }
@@ -290,8 +287,7 @@ message ResponsePerRoute {
   // How the backend carries its API on HTTP. When unset, a request whose
   // backend speaks the client's API leaves in the binding it arrived in, and
   // any other request in the backend API's own. For one request, the
-  // ``envoy.ai.binding.response`` filter state object is merged over it, and
-  // ``envoy.ai.uri_pattern.response`` replaces its pattern.
+  // ``envoy.ai.binding.response`` filter state object replaces it.
   // [#not-implemented-hide:]
   type.ai.v3.LLMBinding binding = 2;
 }
