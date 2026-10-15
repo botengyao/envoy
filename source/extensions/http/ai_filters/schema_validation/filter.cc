@@ -34,7 +34,7 @@ namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
 
 namespace {
 
-constexpr absl::string_view kModelField = "model";
+constexpr absl::string_view ModelField = "model";
 
 } // namespace
 
@@ -64,7 +64,7 @@ absl::Status SchemaValidationFilter::decodeSync(AiRequest& request, LocalReplier
   const bool lifted = liftModelFromPath(request);
   const absl::Status status = schema->validateRequest(request.request_index());
   if (lifted) {
-    request.json().erase(kModelField);
+    request.json().erase(ModelField);
   }
   if (status.ok()) {
     config_->stats().valid_.inc();
@@ -81,7 +81,7 @@ absl::Status SchemaValidationFilter::decodeSync(AiRequest& request, LocalReplier
 
 bool SchemaValidationFilter::liftModelFromPath(AiRequest& request) const {
   nlohmann::json& json = request.json();
-  if (!json.is_object() || json.contains(kModelField)) {
+  if (!json.is_object() || json.contains(ModelField)) {
     return false;
   }
   const StreamInfo::FilterState& filter_state = *context_.stream_info.filterState();
@@ -106,7 +106,7 @@ bool SchemaValidationFilter::liftModelFromPath(AiRequest& request) const {
   if (model.empty()) {
     return false;
   }
-  json[kModelField] = std::move(model);
+  json[ModelField] = std::move(model);
   return true;
 }
 
