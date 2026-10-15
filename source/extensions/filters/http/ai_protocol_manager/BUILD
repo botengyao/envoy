@@ -126,7 +126,6 @@ envoy_cc_library(
         ":token_usage_lib",
         ":uri_pattern_lib",
         "//source/common/common:macros",
-        "//source/common/http:header_utility_lib",
         "//source/common/protobuf",
         "//source/common/protobuf:utility_lib",
         "@abseil-cpp//absl/container:flat_hash_map",

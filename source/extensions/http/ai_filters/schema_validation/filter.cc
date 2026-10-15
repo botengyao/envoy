@@ -21,12 +21,15 @@ using HttpFilters::AiProtocolManager::AiFilterContext;
 using HttpFilters::AiProtocolManager::AiRequest;
 using HttpFilters::AiProtocolManager::apiBinding;
 using HttpFilters::AiProtocolManager::clientBindings;
+using HttpFilters::AiProtocolManager::LlmBindingConstSharedPtr;
 using HttpFilters::AiProtocolManager::LlmBindingObject;
+using HttpFilters::AiProtocolManager::LlmBindingRead;
+using HttpFilters::AiProtocolManager::LlmBindingReadObject;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::llmProtocolName;
 using HttpFilters::AiProtocolManager::LocalReplier;
-using HttpFilters::AiProtocolManager::modelFromPath;
 using HttpFilters::AiProtocolManager::PayloadSchema;
+using HttpFilters::AiProtocolManager::readClientPath;
 namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
 
 namespace {
@@ -81,17 +84,25 @@ bool SchemaValidationFilter::liftModelFromPath(AiRequest& request) const {
   if (!json.is_object() || json.contains(kModelField)) {
     return false;
   }
-  const std::shared_ptr<const LlmBindingObject> binding = LlmBindingObject::fromFilterState(
-      *context_.stream_info.filterState(), FilterStateKeys::BindingRequest);
-  if (binding != nullptr && !binding->status().ok()) {
-    return false;
+  const StreamInfo::FilterState& filter_state = *context_.stream_info.filterState();
+  std::string model;
+  if (const LlmBindingRead* read = LlmBindingReadObject::fromFilterState(filter_state);
+      read != nullptr) {
+    model = read->model;
+  } else {
+    const absl::StatusOr<LlmBindingConstSharedPtr> binding =
+        LlmBindingObject::fromFilterState(filter_state, FilterStateKeys::BindingRequest);
+    if (!binding.ok()) {
+      return false;
+    }
+    nlohmann::json scratch = nlohmann::json::object();
+    std::optional<LlmBindingRead> path_read =
+        readClientPath(*binding, apiBinding(request.protocol()), clientBindings(request.protocol()),
+                       context_.request_headers.getPathValue(), scratch);
+    if (path_read.has_value()) {
+      model = std::move(path_read->model);
+    }
   }
-  std::string model =
-      binding != nullptr && binding->read().has_value()
-          ? binding->read()->model
-          : modelFromPath(context_.request_headers.getPathValue(),
-                          binding != nullptr ? binding->binding().get() : nullptr,
-                          apiBinding(request.protocol()).get(), clientBindings(request.protocol()));
   if (model.empty()) {
     return false;
   }

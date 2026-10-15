@@ -39,6 +39,8 @@ using HttpFilters::AiProtocolManager::FilterManager;
 using HttpFilters::AiProtocolManager::InMemoryExternalBufferFactory;
 using HttpFilters::AiProtocolManager::JsonWithExtBuf;
 using HttpFilters::AiProtocolManager::LlmBindingObject;
+using HttpFilters::AiProtocolManager::LlmBindingRead;
+using HttpFilters::AiProtocolManager::LlmBindingReadObject;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using HttpFilters::AiProtocolManager::LocalReplier;
 
@@ -125,10 +127,10 @@ public:
     EXPECT_EQ(counterValue("invalid"), 1);
   }
 
-  void setRequestBinding(std::shared_ptr<LlmBindingObject> binding) {
+  void setRequestBinding(absl::string_view value) {
     stream_info_.filterState()->setData(
-        HttpFilters::AiProtocolManager::FilterStateKeys::BindingRequest, std::move(binding),
-        StreamInfo::FilterState::LifeSpan::FilterChain);
+        HttpFilters::AiProtocolManager::FilterStateKeys::BindingRequest,
+        std::make_shared<LlmBindingObject>(value), StreamInfo::FilterState::LifeSpan::FilterChain);
   }
 
   uint64_t counterValue(const std::string& name) {
@@ -257,23 +259,24 @@ TEST_F(SchemaValidationFilterTest, VertexClaudeBodyOnAnotherPathIsRejected) {
 
 // The path is read under the binding a filter ahead named, or the one a request leg recorded.
 TEST_F(SchemaValidationFilterTest, ReadsThePathUnderTheRequestBinding) {
-  setRequestBinding(LlmBindingObject::fromString("/gateway/{model}/messages"));
+  setRequestBinding("/gateway/{model}/messages");
   run(VertexClaudePayload, LLMProtocol::AnthropicMessages, "/gateway/claude-haiku-4-5/messages");
   expectForwarded();
   EXPECT_EQ(counterValue("valid"), 1);
 }
 
 TEST_F(SchemaValidationFilterTest, UsesTheModelARequestLegRecorded) {
-  std::shared_ptr<LlmBindingObject> binding = LlmBindingObject::fromString("/gateway/{model}");
-  binding->setRead({binding->binding(), "claude-haiku-4-5", {}, {}});
-  setRequestBinding(std::move(binding));
+  stream_info_.filterState()->setData(
+      HttpFilters::AiProtocolManager::FilterStateKeys::BindingRead,
+      std::make_shared<LlmBindingReadObject>(LlmBindingRead{nullptr, "claude-haiku-4-5", {}, {}}),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
   run(VertexClaudePayload, LLMProtocol::AnthropicMessages, "/elsewhere");
   expectForwarded();
 }
 
 // A binding that does not parse names no model; the transcoder reports it.
 TEST_F(SchemaValidationFilterTest, UnparseableRequestBindingNamesNoModel) {
-  setRequestBinding(LlmBindingObject::fromString("/gateway/{model"));
+  setRequestBinding("/gateway/{model");
   run(VertexClaudePayload, LLMProtocol::AnthropicMessages, VertexClaudePath);
   expectRejected();
 }

@@ -2708,43 +2708,22 @@ std::string irModel(const nlohmann::json& json) {
   return model != json.end() && model->is_string() ? model->get<std::string>() : "";
 }
 
-// Request `ToIr`: reads the client's path under the binding a filter named, or else under the
-// first of the dialect's own and client bindings that matches it.
-//
-// TODO(ginama): `readGeminiTarget()` in the request_info AI filter's extractor.cc parses the same
-// paths for the same reason. Have it read them through the engine rather than keep its own copy.
-std::optional<LlmBindingRead> readClientPath(const DialectTranscodePack& pack,
-                                             const TranscodeContext& ctx, nlohmann::json& json) {
-  if (ctx.request_binding != nullptr) {
-    return readRequest(ctx.request_binding, pack.binding.get(), ctx.request_path, json);
-  }
-  if (pack.binding != nullptr) {
-    if (std::optional<LlmBindingRead> read =
-            readRequest(pack.binding, nullptr, ctx.request_path, json);
-        read.has_value()) {
-      return read;
-    }
-  }
-  for (const LlmBindingConstSharedPtr& binding : pack.client_bindings) {
-    if (std::optional<LlmBindingRead> read = readRequest(binding, nullptr, ctx.request_path, json);
-        read.has_value()) {
-      return read;
-    }
-  }
-  return std::nullopt;
-}
-
 // Runs a request leg, reading the client's binding into the body before the rules (`ToIr`), or
 // applying the backend's to the body after them (`FromIr`).
 absl::Status transcodeRequest(const DialectTranscodePack& pack, TranscodeDirection direction,
                               TranscodeContext& ctx, nlohmann::json& json) {
   const bool is_ir = pack.protocol == TranscodingEngine::kIrProtocol;
   ctx.rewritten_path.reset();
-  ctx.header_mutations.clear();
   ctx.read.reset();
+  ctx.unresolved = false;
   if (direction == TranscodeDirection::ToIr) {
     // The rules then see what the path names as if the body had named it.
-    ctx.read = readClientPath(pack, ctx, json);
+    //
+    // TODO(ginama): `readGeminiTarget()` in the request_info AI filter's extractor.cc parses the
+    // same paths for the same reason. Have it read them through the engine rather than keep its own
+    // copy.
+    ctx.read = readClientPath(ctx.request_binding, pack.binding, pack.client_bindings,
+                              ctx.request_path, json);
     if (!is_ir) {
       absl::Status status = pack.request.to_ir.execute(json, &ctx);
       if (!status.ok()) {
@@ -2753,6 +2732,16 @@ absl::Status transcodeRequest(const DialectTranscodePack& pack, TranscodeDirecti
     }
     ctx.ir_model = irModel(json);
     return absl::OkStatus();
+  }
+
+  const LlmBinding* binding =
+      ctx.response_binding != nullptr ? ctx.response_binding : pack.binding.get();
+  if (binding != nullptr) {
+    if (absl::Status status = checkResolvable(*binding, pack.binding.get(), ctx.arrived);
+        !status.ok()) {
+      ctx.unresolved = true;
+      return status;
+    }
   }
 
   // What the client asked for is reported back first: the response echoes it, and the gateway
@@ -2776,18 +2765,15 @@ absl::Status transcodeRequest(const DialectTranscodePack& pack, TranscodeDirecti
       return status;
     }
   }
-  const LlmBinding* binding =
-      ctx.response_binding != nullptr ? ctx.response_binding : pack.binding.get();
   if (binding == nullptr) {
     return absl::OkStatus();
   }
-  absl::StatusOr<LlmBindingWrite> write =
+  absl::StatusOr<std::optional<std::string>> path =
       writeRequest(*binding, pack.binding.get(), ctx.arrived, json);
-  if (!write.ok()) {
-    return write.status();
+  if (!path.ok()) {
+    return path.status();
   }
-  ctx.rewritten_path = std::move(write->path);
-  ctx.header_mutations = std::move(write->headers);
+  ctx.rewritten_path = *std::move(path);
   return absl::OkStatus();
 }
 
@@ -3032,12 +3018,14 @@ TranscodingEngine::finishStream(const TranscodeLeg& leg, TranscodeContext& ctx) 
 }
 
 std::string TranscodingEngine::modelFromRequestPath(LLMProtocol dialect, absl::string_view path,
-                                                    const LlmBinding* binding) const {
+                                                    const LlmBindingConstSharedPtr& binding) const {
   const auto pack = packs_.find(dialect);
-  if (pack == packs_.end()) {
-    return modelFromPath(path, binding, nullptr, {});
-  }
-  return modelFromPath(path, binding, pack->second.binding.get(), pack->second.client_bindings);
+  nlohmann::json scratch = nlohmann::json::object();
+  std::optional<LlmBindingRead> read =
+      pack != packs_.end() ? readClientPath(binding, pack->second.binding,
+                                            pack->second.client_bindings, path, scratch)
+                           : readClientPath(binding, nullptr, {}, path, scratch);
+  return read.has_value() ? std::move(read->model) : "";
 }
 
 } // namespace AiProtocolManager

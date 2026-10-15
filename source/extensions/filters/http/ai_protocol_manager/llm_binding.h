@@ -11,6 +11,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/uri_pattern.h"
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -23,16 +24,14 @@ namespace AiProtocolManager {
 
 // The runtime form of an `envoy.type.ai.v3.LLMBinding`: how a provider carries an API on HTTP,
 // where that differs from the API's own. Built once, then shared and never changed.
-struct LlmBinding {
+class LlmBinding {
+public:
   struct Mutation {
-    enum class Target { BodyField, Header };
-
-    Target target{Target::BodyField};
-    // A top-level body member, or a lower-case header name.
-    std::string name;
-    // nullopt removes the target. `{name}` in a string is filled as a path variable is.
+    // A top-level body member.
+    std::string body_field;
+    // nullopt removes the field. In a string, `{name}` is replaced by that request value.
     std::optional<nlohmann::json> value;
-    // Write only where the target is absent.
+    // Write only where the field is absent.
     bool keep_existing{false};
   };
 
@@ -41,17 +40,31 @@ struct LlmBinding {
   // A filter state value: a URI pattern (`/...`), or an LLMBinding in JSON (`{...}`).
   static absl::StatusOr<std::shared_ptr<const LlmBinding>> parse(absl::string_view text);
 
-  // `pattern`, or `api_binding`'s when this one has none; null when neither has one.
-  const UriPattern* patternOver(const LlmBinding* api_binding) const;
-  // `mutations`, or `api_binding`'s when this one has none.
-  absl::Span<const Mutation> mutationsOver(const LlmBinding* api_binding) const;
+  // `pattern` nullopt: the API's own path. `mutations` empty: the API's own edits.
+  LlmBinding(std::optional<UriPattern> pattern, std::vector<Mutation> mutations);
 
-  // nullopt: the API's own path.
-  std::optional<UriPattern> pattern;
-  // Empty: the API's own edits.
-  std::vector<Mutation> mutations;
+  const std::optional<UriPattern>& pattern() const { return pattern_; }
+  const std::vector<Mutation>& mutations() const { return mutations_; }
+  // Whether a mutation removes `model` or `stream`, which the path then carries alone.
+  bool removesModel() const { return removes_model_; }
+  bool removesStream() const { return removes_stream_; }
+  // The names the mutations' `{name}` placeholders read, other than `model`.
+  const std::vector<std::string>& placeholders() const { return placeholders_; }
+
+private:
+  std::optional<UriPattern> pattern_;
+  std::vector<Mutation> mutations_;
+  bool removes_model_{false};
+  bool removes_stream_{false};
+  std::vector<std::string> placeholders_;
 };
 using LlmBindingConstSharedPtr = std::shared_ptr<const LlmBinding>;
+
+// The pattern `binding` reads and renders: its own, or `api_binding`'s when it has none. Null
+// when neither has one.
+const UriPattern* patternOf(const LlmBinding& binding, const LlmBinding* api_binding);
+// The binding whose mutations apply: `binding`, or `api_binding` when `binding` has none.
+const LlmBinding& editsOf(const LlmBinding& binding, const LlmBinding* api_binding);
 
 // What a request's path and body held under the binding it arrived in.
 struct LlmBindingRead {
@@ -64,18 +77,6 @@ struct LlmBindingRead {
   absl::flat_hash_map<std::string, nlohmann::json> written_fields;
 };
 
-// A header edit for the caller to apply: nullopt `value` removes the header.
-struct HeaderMutation {
-  std::string name;
-  std::optional<std::string> value;
-  bool keep_existing{false};
-};
-
-struct LlmBindingWrite {
-  std::optional<std::string> path;
-  std::vector<HeaderMutation> headers;
-};
-
 // Reads `path` under `binding` into `body`: `{model}` and the `{unary|stream}` choice become the
 // body's `model` and `stream`, which the path overrides for a field the binding removes, and the
 // body fields the binding writes are taken out. `api_binding` fills the parts `binding` leaves
@@ -84,14 +85,27 @@ std::optional<LlmBindingRead> readRequest(const LlmBindingConstSharedPtr& bindin
                                           const LlmBinding* api_binding, absl::string_view path,
                                           nlohmann::json& body);
 
-// Renders the path for `body` under `binding` and applies its mutations, in order. A variable is
-// filled from the body field of its name, else from `arrived`'s path variables. When the request
+// Reads `path` under `binding`, or, when it is null, under the first of `api_binding` and
+// `client_bindings` that matches.
+std::optional<LlmBindingRead>
+readClientPath(const LlmBindingConstSharedPtr& binding, const LlmBindingConstSharedPtr& api_binding,
+               absl::Span<const LlmBindingConstSharedPtr> client_bindings, absl::string_view path,
+               nlohmann::json& body);
+
+// Fails when `writeRequest()` under `binding` would need a value the client's path did not
+// supply: a variable or placeholder other than `model` missing from `arrived`'s path variables,
+// or an unnamed wildcard. Such a failure is the proxy's configuration at fault.
+absl::Status checkResolvable(const LlmBinding& binding, const LlmBinding* api_binding,
+                             const LlmBindingRead* arrived);
+
+// Renders the path for `body` under `binding` and applies its mutations, in order. `{model}` is
+// the body's model; any other variable is one of `arrived`'s path variables. When the request
 // leaves in the binding it arrived in, the body fields that binding wrote get the client's values
-// back. Fails with `kFailedPrecondition` on a variable without a value, and `kInvalidArgument` on
-// a value that cannot fill one.
-absl::StatusOr<LlmBindingWrite> writeRequest(const LlmBinding& binding,
-                                             const LlmBinding* api_binding,
-                                             const LlmBindingRead* arrived, nlohmann::json& body);
+// back. Returns nullopt when there is no pattern to render.
+absl::StatusOr<std::optional<std::string>> writeRequest(const LlmBinding& binding,
+                                                        const LlmBinding* api_binding,
+                                                        const LlmBindingRead* arrived,
+                                                        nlohmann::json& body);
 
 // The API's own binding, when its path carries request values (Gemini's); null otherwise.
 LlmBindingConstSharedPtr apiBinding(LLMProtocol api);
@@ -99,13 +113,6 @@ LlmBindingConstSharedPtr apiBinding(LLMProtocol api);
 absl::Span<const LlmBindingConstSharedPtr> clientBindings(LLMProtocol api);
 // The API whose own or client binding matches `path`; Unspecified when none does.
 LLMProtocol apiOfPath(absl::string_view path);
-
-// The model `path` names under `binding`, with `api_binding` filling a pattern it leaves empty, or,
-// when `binding` is null, under the first of `api_binding` and `client_bindings` that matches.
-// Empty when none matches and names a model.
-std::string modelFromPath(absl::string_view path, const LlmBinding* binding,
-                          const LlmBinding* api_binding,
-                          absl::Span<const LlmBindingConstSharedPtr> client_bindings);
 
 } // namespace AiProtocolManager
 } // namespace HttpFilters
