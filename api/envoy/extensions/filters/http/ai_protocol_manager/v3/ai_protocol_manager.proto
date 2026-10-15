@@ -61,7 +61,8 @@ message AiProtocolManager {
 
   // Bindings that requests through this filter can name, keyed by their name: in the
   // ``envoy.ai.binding.request`` and ``envoy.ai.binding.response`` filter state objects, and in a
-  // route's ``binding``. An entry can start from a binding Envoy defines, through its own
+  // route's ``binding``. Naming one is an optimization: a filter state object can also spell a
+  // binding out for one request. An entry can start from a binding Envoy defines, through its own
   // ``name``, and fix that binding's variables, so a filter ahead can choose a tenant's provider
   // without writing its project or location. Entries are checked when the configuration loads.
   // [#not-implemented-hide:]

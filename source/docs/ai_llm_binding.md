@@ -34,9 +34,9 @@ the fix must not be specific to Vertex AI.
 4. Filter state alone can instruct a request: a filter ahead of the AI Protocol Manager sets the
    APIs, the bindings, the path and the model, with no per-route configuration, as behind a
    dynamic forward proxy. Route configuration only supplies defaults. The new `envoy.ai.binding.*`
-   keys name a binding, Envoy's or one in the filter's `bindings`; the existing
-   `envoy.ai.uri_pattern.*` keys keep setting its path. Both hold typed C++ objects, not JSON.
-   Existing configurations behave as today.
+   keys hold a binding for the request, which filters can set and update: by name, a lookup that
+   is the fast path, or spelled out. The existing `envoy.ai.uri_pattern.*` keys keep setting its
+   path. Both hold typed C++ objects. Existing configurations behave as today.
 
 ## API
 
@@ -114,42 +114,58 @@ framing, which are later primitives (see [Other providers](#other-providers)).
 The keys are complete on their own. A filter ahead of the AI Protocol Manager (`set_filter_state`,
 Lua, a dynamic module, a C++ filter such as a model router) can instruct every request with no
 per-route configuration anywhere; a route's configuration, when there is one, only fills in what
-the keys leave unset. No key holds JSON.
+the keys leave unset.
 
 | Key | Value | Read | When unset |
 |---|---|---|---|
 | `envoy.ai.llm_protocol.request` | `LLMProtocol` name | AI Protocol Manager `decodeHeaders` | the route's `request.llm_protocol`; with neither, the request is not an AI request |
-| `envoy.ai.binding.request` (new) | binding name | before the first AI filter | the route's `request.binding`; else the API's binding whose pattern matches the path; else the API's own |
+| `envoy.ai.binding.request` (new) | a binding: see below | before the first AI filter | the route's `request.binding`; else the API's binding whose pattern matches the path; else the API's own |
 | `envoy.ai.uri_pattern.request` | URI pattern | before the first AI filter | the client binding's pattern |
 | `envoy.ai.llm_protocol.response` | `LLMProtocol` name | the backend-side transcoder leg | the route's `response.llm_protocol`; else the client's API, and nothing is transcoded |
-| `envoy.ai.binding.response` (new) | binding name | at the sink, after the last AI filter | the route's `response.binding`; else the binding the request arrived in, when the API did not change; else the backend API's own |
+| `envoy.ai.binding.response` (new) | a binding: see below | at the sink, after the last AI filter | the route's `response.binding`; else the binding the request arrived in, when the API did not change; else the backend API's own |
 | `envoy.ai.uri_pattern.response` | URI pattern | at the sink | the backend binding's pattern |
 | `envoy.ai.model.resolved` | model name | at the sink | the model the request names |
 | `envoy.ai.model.request` | model name | written by request_info | |
 
-- **Names.** A binding key names one of the AI Protocol Manager's `bindings` or one Envoy
-  defines for the API. The filter's `bindings` are where an operator describes a provider Envoy
-  does not know, or fixes a tenant's variables, and they are checked when the configuration loads.
-  A filter ahead only chooses among them, so a per-request writer can never inject body fields or
-  headers.
-- **Merging.** Each layer is merged field by field over the one below it: filter state over the
-  route over the named defaults. `name` and `uri_pattern` replace; `path_variables`, `body_fields`
-  and `headers` merge; and a non-empty `fields` replaces. A `uri_pattern` key replaces the
-  pattern last. So a route can fix a tenant's project and location while a filter ahead picks
-  the binding by name.
-- **Path variables per request** come from a named binding, or are written as literals in the
-  pattern key. Never take them from a client header: the client would choose the project billed
+### The binding object
+
+`envoy.ai.binding.*` holds a binding for one request, which filters can set and update until it is
+read. A name is only the fastest way to start one.
+
+| Written as | Cost per request | Use |
+|---|---|---|
+| `acme_vertex` | a hash lookup, then a shared pointer | a binding the filter's `bindings` or Envoy defines: the common case, checked at config load |
+| `vertex_ai?project=acme&location=us-east5` | a short parse | a defined binding with the variables chosen per request |
+| `{"uri_pattern":"/llm/{model}/{messages\|messages-stream}","fields":[...],"body_fields":{...}}` | a JSON parse and a pattern compile | a binding no configuration defines, spelled out per request: an `LLMBinding` in JSON |
+| a C++ `LlmBinding` | none, when built at the writer's config load | a C++ filter, which can also update the object in place |
+
+- **The lookup is an optimization.** Whatever a name stands for can also be written out per
+  request, or built in C++. Names are resolved where the binding is read, against the filter's
+  `bindings` and then Envoy's, because an object factory cannot see the filter's configuration.
+- **Updates.** A later filter can replace the object by writing the key again, or change only the
+  path with `envoy.ai.uri_pattern.*`. A C++ filter can also update it in place
+  (`getDataMutable<LlmBindingObject>()`), for example to move a request to another location after
+  reading its body; the object copies its shared starting point on the first change, so a
+  binding shared between requests is never modified. Changes count until the read point in the
+  table; an AI filter can still change the backend's binding, which is read at the sink.
+- **Merging.** Each layer is merged field by field over the one below it: the filter state object
+  over the route over the named defaults. `name` and `uri_pattern` replace; `path_variables`,
+  `body_fields` and `headers` merge; and a non-empty `fields` replaces. A `uri_pattern` key
+  replaces the pattern last. So a route can fix a tenant's project and location while a filter
+  ahead picks the binding by name.
+- **Trust.** Only trusted filters write these keys: a binding can set body fields and headers.
+  Never fill path variables from a client header: the client would choose the project billed
   under the gateway's credentials.
-- **Validation.** A name that neither the filter's `bindings` nor Envoy defines for the API, or a
-  pattern that does not parse, fails the request with a 500, counted as `unresolved`. The
-  factories never reject a non-empty value: a pattern's parse error travels in its object to the
-  point of use, and a name is resolved there. `set_filter_state` drops a value its factory
+- **Validation.** A name that neither the filter's `bindings` nor Envoy defines for the API, a
+  binding that does not parse or validate, or a pattern that does not parse fails the request
+  with a 500, counted as `unresolved`. The factories never reject a non-empty value: an error
+  travels in the object to the point of use. `set_filter_state` drops a value its factory
   rejects, at debug level, so rejecting there would send the request in the wrong shape instead of
   failing it. A separate change should build constant `set_filter_state` values once at config
   load, and reject the config when that fails; it helps every key.
 - **Timing.** `envoy.ai.llm_protocol.request` must be set during an earlier filter's request
   headers, because it decides whether the body is held and parsed at all. The others can be set
-  later, up to the point the table names; the response keys can be set by an AI filter.
+  later, up to the point the table names.
 - **Not AI keys.** The host stays with routing: behind a dynamic forward proxy the same filter sets
   `envoy.upstream.dynamic_host` (with `allow_dynamic_host_from_filter_state`) or `:authority`, and
   the provider's credentials.
@@ -159,10 +175,9 @@ the path, and the body keeps the API's own shape.
 
 ### Objects
 
-Both key families hold typed C++ objects, so nothing is parsed twice and nothing is JSON:
-
 ```cpp
-// The runtime form of an LLMBinding: built once, immutable, shared between requests.
+// The runtime form of an LLMBinding. Built from configuration once and shared between requests,
+// or built for one request.
 struct LlmBinding {
   struct FieldPlacement {
     enum class Location { PathVariable, QueryParameter, Header };
@@ -179,12 +194,15 @@ struct LlmBinding {
   std::vector<std::pair<Http::LowerCaseString, std::string>> headers;
 };
 
-// envoy.ai.binding.*: a resolved binding, or a name to resolve at the point of use.
+// envoy.ai.binding.*: one request's binding, copied from its shared starting point on first change.
 class LlmBindingObject : public Router::StringAccessor {
 public:
   explicit LlmBindingObject(std::shared_ptr<const LlmBinding> binding);  // from C++
-  explicit LlmBindingObject(std::string name);                            // from the factory
-  absl::string_view asString() const override;  // the name
+  static std::unique_ptr<LlmBindingObject> fromBytes(absl::string_view value);  // the factory
+  // The binding with the name resolved; an error when it does not resolve or did not parse.
+  absl::StatusOr<const LlmBinding*> resolve(const BindingTable& named, LLMProtocol api) const;
+  LlmBinding& mutableBinding();       // copy on write
+  absl::string_view asString() const override;  // the value as written, or the name
 };
 
 // envoy.ai.uri_pattern.*: the pattern compiled when the object is created.
@@ -195,12 +213,10 @@ public:
 };
 ```
 
-- **C++ writers** build `LlmBinding`s at their own config load and attach the same
-  `shared_ptr` to every request: no parsing per request.
 - **Factory writers** (`set_filter_state`, Lua's `filterState():set()`, dynamic modules' typed
-  setter) get a name resolved through a hash lookup, or a pattern compiled once per write.
+  setter) write any form in the table above as text.
 - **String writers** (the Golang filter, dynamic modules' bytes setter) store a plain
-  `Router::StringAccessor`. Readers accept one, and treat its string as the factory would.
+  `Router::StringAccessor`. Readers accept one, and read its string as the factory would.
 - Both objects are `StringAccessor`s, so `%FILTER_STATE(envoy.ai.uri_pattern.response:PLAIN)%`
   and other string readers of today's key keep working. Today the transcoder recompiles the
   pattern on every read; with the typed object it compiles once per write.
@@ -528,6 +544,26 @@ upstream    POST /v1/messages
 `header_gateway` has no `name`, so it starts from the Anthropic API's own binding, which also
 writes `anthropic-version`.
 
+The names are only the fast path. The same filter can choose per request what no configuration
+names:
+
+```
+# another tenant's project, on the defined vertex_ai binding
+envoy.ai.binding.response = vertex_ai?project=globex&location=europe-west4
+
+# the internal gateway, spelled out instead of named
+envoy.ai.binding.response = {"uri_pattern":"/llm/{model}/{messages|messages-stream}","fields":[{"field":"model","path_variable":"model"}],"body_fields":{"anthropic_version":"vertex-2023-10-16"}}
+```
+
+And a C++ AI filter that reads the body can still move the request before it leaves, for example
+to keep a tenant's data in Europe:
+
+```cpp
+auto* binding = filter_state.getDataMutable<LlmBindingObject>("envoy.ai.binding.response");
+binding->mutableBinding().path_variables["location"] = "europe-west4";
+// and envoy.upstream.dynamic_host = europe-west4-aiplatform.googleapis.com
+```
+
 ### 9. Behind a dynamic forward proxy, observed only
 
 A Vertex AI client calls `us-east5-aiplatform.googleapis.com` through the proxy, and a filter ahead
@@ -584,8 +620,9 @@ provider-specific model ids (`envoy.ai.model.resolved` and the model table), and
    the sink, and one resolver for the instructions. With today's keys this already serves a
    dynamic forward proxy, for example an OpenAI client sent to Gemini.
 3. **Bindings and objects:** the engine's envelopes become built-in bindings; the filter's
-   `bindings`; the C++ `LlmBinding` and the typed objects for both key families;
-   `UriPattern::render()` fills `path_variables` and `match()` captures them. No behavior change.
+   `bindings`; the C++ `LlmBinding`, and the typed objects for both key families with the three
+   text forms and copy-on-write updates; `UriPattern::render()` fills `path_variables` and
+   `match()` captures them. No behavior change.
 4. **Core ingress and `envoy.ai.binding.request`:** Vertex AI clients work with schema validation,
    request_info and the transcoder (examples 3 to 5 and 9), which drop their request-path code. The
    core reads `envoy.ai.uri_pattern.request` in the transcoder's place.
