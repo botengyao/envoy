@@ -1,0 +1,18 @@
+== POST /v1/projects/acme/locations/us-east5/publishers/google/models/gemini-2.5-flash:generateContent
+{"candidates":[{"content":{"parts":[{"text":"Envoy matches the request to a route, runs that route's HTTP filters, and forwards it to a host the route's cluster picks."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","usageMetadata":{"candidatesTokenCount":24,"promptTokenCount":27,"totalTokenCount":51}}
+== POST /v1/projects/acme/locations/us-east5/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse
+data: {"candidates":[{"content":{"parts":[{"text":""}],"role":"model"},"index":0}],"modelVersion":"gemini-2.5-flash"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"Envoy matches the request to a route, "}],"role":"model"},"index":0}],"modelVersion":"gemini-2.5-flash"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"runs that route's HTTP filters, "}],"role":"model"},"index":0}],"modelVersion":"gemini-2.5-flash"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"and forwards it to a host the route's cluster picks."}],"role":"model"},"index":0}],"modelVersion":"gemini-2.5-flash"}
+
+data: {"candidates":[{"content":{"parts":[{"text":""}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","usageMetadata":{"candidatesTokenCount":24,"promptTokenCount":27,"totalTokenCount":51}}
+
+== counters
+ai_protocol_manager.route_binding_unused: 0
+ai_protocol_manager.transcoder.failed: 0
+ai_protocol_manager.transcoder.transcoded: 17
+ai_protocol_manager.transcoder.unresolved: 0
