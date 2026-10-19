@@ -1,37 +1,25 @@
-# Gemini Interactions on the AI Protocol Manager
+# Gemini Interactions in the AI Protocol Manager
 
 Design only, no code. Base: upstream/main `d7b74bd624` (2026-10-19).
 
-Clients speak Google's Gemini Interactions API, and so does the backend. Envoy recognizes the API,
-meters its usage, and changes one thing in a request: the model name, when
-`envoy.ai.model.resolved` names one. Nothing is converted to or from another API, and requests
-that name an `agent` instead of a `model` are out of scope.
+## Summary
 
-## Examples
+The Gemini Interactions API (`POST /v1beta/interactions`) is Google's newer API for Gemini models.
+This design teaches Envoy's AI Protocol Manager to recognize it, record its token usage, and
+change the model a request asks for, so a gateway can choose which Gemini model serves a client.
+Envoy does not convert Interactions requests to or from any other API.
 
-### 1. Envoy changes the model
+## Background
 
-The route sets `envoy.ai.model.resolved` to `gemini-3-flash-preview`. The client asks for
-`assistant-default`:
+### The Interactions API
 
-```
-POST /v1beta/interactions
-host: assistant.example.com
-
-{"model": "assistant-default", "input": "Explain Envoy overload manager."}
-```
-
-Envoy sends Google the request with the model replaced and the gateway's own key:
+A request names a model and an input. The response lists the steps the model took, the last one
+being its answer, and the tokens it used:
 
 ```
 POST /v1beta/interactions
-host: generativelanguage.googleapis.com
-x-goog-api-key: <gateway key>
-
-{"input": "Explain Envoy overload manager.", "model": "gemini-3-flash-preview"}
+{"model": "gemini-3-flash-preview", "input": "Explain Envoy overload manager."}
 ```
-
-Google answers:
 
 ```json
 {"id": "v1_Chd...", "object": "interaction", "model": "gemini-3-flash-preview", "status": "completed",
@@ -41,51 +29,155 @@ Google answers:
            "total_cached_tokens": 0, "total_tool_use_tokens": 0, "total_tokens": 49}}
 ```
 
-The client gets the same response with `"model": "assistant-default"`: as for every API, the
-response names the model the client asked for. The gateway keeps the one that ran:
+- `"stream": true` in the request body streams the response as server-sent events instead.
+- A request names either a `model` or an `agent`, such as Deep Research.
+- Stored interactions can be read back with `GET /v1beta/interactions/{id}`, deleted with
+  `DELETE`, and cancelled with `POST /v1beta/interactions/{id}/cancel`. The same paths exist under
+  `/v1`.
+
+Unlike `generateContent`, the model is in the body rather than the path, and the request and
+response bodies have a different shape.
+
+### What Envoy has today
+
+- The **AI Protocol Manager** parses the request body on routes that declare an AI API
+  (`AiProtocolManagerPerRoute`). It runs AI filters over the parsed body and records token usage
+  from responses as typed metadata (`envoy.ai.token_usage`).
+- The **request info** AI filter records the model the client asked for (`envoy.ai.model.request`).
+- The **transcoder** AI filter converts a request and its response between two APIs. Before it
+  sends a request, it replaces the model with `envoy.ai.model.resolved` when a filter ahead of it
+  sets that filter state. The client still sees the model it asked for in the response.
+- The APIs known today are OpenAI Chat Completions, OpenAI Responses (usage only), Anthropic
+  Messages and Gemini `generateContent`. Interactions is not one of them.
+
+## Goals
+
+1. Recognize Interactions requests and responses, as a new API: `GEMINI_INTERACTIONS`.
+2. Record token usage of unary and streamed responses.
+3. Let the gateway change the model name, and leave everything else in the request as it is.
+
+Not goals: converting between Interactions and other APIs; agent requests; sending a request to a
+backend by its model.
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant E as Envoy
+    participant G as Gemini API
+    C->>E: POST /v1beta/interactions, model "assistant-default"
+    Note over E: The route picks the cluster and sets<br/>envoy.ai.model.resolved = gemini-3-flash-preview
+    Note over E: Cluster filters: add x-goog-api-key, parse the body,<br/>record "assistant-default", write the new model
+    E->>G: POST /v1beta/interactions, model "gemini-3-flash-preview"
+    G->>E: response, model "gemini-3-flash-preview", usage
+    Note over E: Record usage for gemini-3-flash-preview,<br/>put "assistant-default" back
+    E->>C: response, model "assistant-default"
+```
+
+Step by step:
+
+1. The router matches the route and picks the Gemini cluster. If the route pins a model,
+   `set_filter_state` sets `envoy.ai.model.resolved`.
+2. The cluster's upstream filters run:
+   - The credential injector sets the gateway's `x-goog-api-key`.
+   - The AI Protocol Manager holds the request and parses its JSON body. The route declares
+     `GEMINI_INTERACTIONS`, so a body that is not valid JSON is rejected.
+   - Request info records the client's model and the other request attributes.
+   - The transcoder writes `envoy.ai.model.resolved` into `model` and checks the result against
+     the Interactions schema. Nothing else in the body changes, and the path stays as the client
+     sent it.
+   - The body is written back out, with its Content-Length corrected, and sent to Google.
+3. On the way back:
+   - The AI Protocol Manager reads usage as the response passes: `usage` in a unary body, or the
+     `interaction.completed` event in a stream. It records usage with the model Google reports.
+   - The transcoder puts the client's model name back into the response.
+
+### Why the transcoder changes the model
+
+The transcoder is already the filter that applies `envoy.ai.model.resolved`, for every API it
+knows. It normally runs as a pair: one instance for the client's side and one for the backend's,
+which is the one that writes the model.
+
+Each API is an entry in the transcoder's engine, holding the rules that convert it. The
+Interactions entry has no conversion rules, so requests and responses keep their shape. Its only
+rules restore the client's model in responses. No filter code changes.
+
+### Where it runs
+
+The AI Protocol Manager runs in the cluster's upstream filter chain, once per attempt, after the
+cluster and host are picked. Every attempt reads the same filter state, so the model is set
+before the router and does not change between attempts. The same configuration also works in the
+downstream chain.
+
+## Examples
+
+### 1. Envoy changes the model
+
+The route pins `gemini-3-flash-preview`. The client asks for `assistant-default`:
+
+```
+POST /v1beta/interactions
+host: assistant.example.com
+
+{"model": "assistant-default", "input": "Explain Envoy overload manager."}
+```
+
+Envoy sends Google:
+
+```
+POST /v1beta/interactions
+host: generativelanguage.googleapis.com
+x-goog-api-key: <gateway key>
+
+{"input": "Explain Envoy overload manager.", "model": "gemini-3-flash-preview"}
+```
+
+Google answers with the response shown in [The Interactions API](#the-interactions-api). The
+client gets the same response with `"model": "assistant-default"`. The gateway still knows which
+model ran:
 
 | Where | Model |
 |---|---|
-| `envoy.ai.model.request`, `RequestInfo.model` | `assistant-default` |
+| `envoy.ai.model.request`, request info | `assistant-default` |
 | `envoy.ai.model.resolved` | `gemini-3-flash-preview` |
-| `TokenUsage` in `envoy.ai.token_usage` | `gemini-3-flash-preview`; input 7, output 42 (20 + 22 thought), total 49 |
+| `envoy.ai.token_usage` | `gemini-3-flash-preview`: input 7, output 42 (20 + 22 thought), total 49 |
 
 ### 2. Streaming
 
-With `"stream": true` in the body, Google streams named events. Envoy replaces the model in the
-two events that carry it, and reads usage from the last one:
+With `"stream": true`, the client receives Google's events. Google named `gemini-3-flash-preview`
+in the two events that carry a model, and Envoy replaces it:
 
 ```
 event: interaction.created
-data: {"event_type": "interaction.created", "interaction": {"id": "v1_...", "model": "assistant-default", "status": "in_progress"}}
+data: {"event_type": "interaction.created", "interaction": {"id": "v1_...", "model": "assistant-default", "object": "interaction", "status": "in_progress"}}
 
 event: step.delta
 data: {"delta": {"text": "The overload", "type": "text"}, "event_type": "step.delta", "index": 1}
 
 event: interaction.completed
-data: {"event_type": "interaction.completed", "interaction": {"id": "v1_...", "model": "assistant-default", "status": "completed", "usage": {...}}}
+data: {"event_type": "interaction.completed", "interaction": {"id": "v1_...", "model": "assistant-default", "object": "interaction", "status": "completed", "usage": {"total_input_tokens": 11, "total_output_tokens": 90, "total_thought_tokens": 245, "total_tokens": 346}}}
 
 event: done
 data: [DONE]
 ```
 
-Every other event goes out with the content it came with.
+Every other event keeps its content. Usage comes from `interaction.completed`.
 
-### 3. The client's model goes through
+### 3. The client picks the model
 
-A route that declares only the response API: Envoy does not hold or parse the request, and only
-reads the response for usage. Its client picks the model.
+A route that declares only the response API. Envoy does not hold or parse the request, and only
+reads the response for usage.
 
 ### 4. Get, delete and cancel
 
-`GET` and `DELETE /v1beta/interactions/{id}`, and `POST /v1beta/interactions/{id}/cancel`, are
-plain routes with no AI config. A get returns the stored interaction with its `usage`, so a
-configured route would meter that usage a second time.
+These are plain routes with no AI config. A get returns a stored interaction, which can carry the
+usage of the request that created it; a configured route would count that usage a second time.
 
 ## Configuration
 
 `GEMINI_INTERACTIONS` does not exist yet. With it replaced by `GEMINI_GENERATE_CONTENT` and the CA
-path adjusted, this file passes `envoy --mode validate` on a build of `d5eb7030ad` (PR #48376).
+path adjusted, this file passes `envoy --mode validate` on a build of `d5eb7030ad`.
 
 ```yaml
 static_resources:
@@ -230,120 +322,87 @@ static_resources:
             "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
 ```
 
-- The AI config sits in the cluster's upstream chain, so it runs once per attempt, after the host
-  is picked. Upstream instances read the downstream filter state, so `envoy.ai.model.resolved` is
-  set before the router and is the same for every attempt. The same AI config also works in the
-  downstream chain.
-- The per-route config is keyed by the upstream filter's name, which `mostSpecificPerFilterConfig()`
-  resolves by (`source/common/http/filter_manager.cc:343-349`).
-- `accept-encoding` is stripped because a compressed response is neither rewritten nor metered
-  (`filter.cc:598-603`). `authorization` is stripped so the client's credential never reaches
-  Google, and the credential injector writes `x-goog-api-key` over any the client sent.
+- `request_headers_to_remove` drops two client headers:
+  - `authorization`, so the client's own credential never reaches Google. The credential injector
+    also writes `x-goog-api-key` over any key the client sent.
+  - `accept-encoding`, so Google answers uncompressed. Envoy can neither read nor change a
+    compressed response.
+- The route's AI config is keyed by the filter's name, `envoy.filters.http.ai_protocol_manager`,
+  which is how upstream filters find their route config too.
 - Vertex AI serves the same API at
-  `aiplatform.googleapis.com/v1beta1/projects/{project}/locations/global/interactions`: the same
-  routes, with its host and a Bearer token, e.g. from `gcp_authn`.
+  `aiplatform.googleapis.com/v1beta1/projects/{project}/locations/global/interactions`. It takes
+  the same routes, with its own host and a Bearer token, e.g. from `gcp_authn`.
 
-## How it works
+## Changes in Envoy
 
-**The protocol.** `GEMINI_INTERACTIONS` is a new `LLMProtocol` value, since the API shares no
-request, response or stream shape with `GEMINI_GENERATE_CONTENT`:
+| Part | Change |
+|---|---|
+| API (`llm_protocol.proto`) | A new value, `GEMINI_INTERACTIONS = 5` |
+| Protocol plumbing (`token_usage.{h,cc}`, `llm_protocol_conversion.h`) | The value in the internal enum, its name and its conversions |
+| Request schema (`schema/gemini_interactions.{h,cc}`) | One of `model` and `agent`, both kept inline. `input` as a string, a content item, or a list of content items or steps. Large text, media and thought signatures may be offloaded. Unknown fields are allowed. |
+| Usage (`llm_protocol_adapters.cc`) | Read `usage`, or `interaction.usage` in a stream event, as in the table below. Recognize an Interactions response by `object: "interaction"` or an `event_type`. |
+| Stream reading (`response_handler.cc`) | Skip `step.*` events without parsing them: usage is only in `interaction.completed` |
+| Schema validation (`llm_protocol_detection.cc`) | Detect the path suffix `/interactions`. Today a body with `system_instruction` or `generation_config` reads as `generateContent`, and is then rejected for lacking `contents`. Read a body without `contents` as Interactions when it has `previous_interaction_id`, `agent`, or `input` with one of those two. |
+| Request info (`extractor.cc`) | Read `model`, `stream`, `generation_config.max_output_tokens`, the message count and the tool count |
+| Transcoder engine (`transcoding_engine.cc`) | An Interactions entry with no request rules and no path template. Its response rules restore the client's model: `model` in a unary body, and `interaction.model` in `interaction.created` and `interaction.completed`. |
+| Docs and release note | The new API, the four examples |
 
-- A request schema: exactly one of `model` and `agent`, both inline; `input` as a string, Content,
-  or an array of Content or steps; text, media data and thought signatures offloadable. Unknown
-  fields are allowed, as in the generateContent schema.
-- A usage adapter. It reads `usage` at the root, or under `interaction` in stream events. Output
-  is `total_output_tokens + total_thought_tokens`, since Google reports thought tokens apart (7 +
-  20 + 22 = 49). Cached and tool-use counts are parts of the totals, not added to them, and
-  `total_tokens` is kept as the provider total. Extraction ends at `interaction.completed`, and an
-  `error` event marks the record partial.
-- The response handler skips `step.*` events before parsing them.
-- Schema validation detects the API by the path suffix `/interactions`. Today its payload check
-  reads `system_instruction` and `generation_config` as generateContent and then rejects the body
-  for lacking `contents`. It changes to name a body without `contents` Interactions when it
-  carries `previous_interaction_id`, `agent`, or `input` with `system_instruction` or
-  `generation_config`.
-- Request info reads `model`, `stream`, `generation_config.max_output_tokens`, the message count
-  and the tool count.
+Usage maps onto Envoy's token-usage record like this:
 
-**The model change.** The two transcoder instances run as they do for any API, over a Gemini
-Interactions pack that has no conversion rules:
+| Envoy | Interactions |
+|---|---|
+| input | `total_input_tokens` |
+| output | `total_output_tokens + total_thought_tokens`: Google counts thought tokens apart (20 + 22 = 42) |
+| reasoning | `total_thought_tokens` |
+| cached input | `total_cached_tokens`, a part of input |
+| tool-use input | `total_tool_use_tokens`, a part, not added |
+| provider total | `total_tokens` |
 
-- The `FROM_IR` leg writes `envoy.ai.model.resolved` into the body before any rule would run
-  (`transcoding_engine.cc:2763-2766`), and validates the result against the Interactions schema.
-- The pack has no binding, so `:path` is left as the client sent it.
-- On the response, the pack's only rules put the client's model back: `model` in a unary body, and
-  `interaction.model` in `interaction.created` and `interaction.completed`.
-- Without `envoy.ai.model.resolved`, the request goes out with the same content; the parsed body is
-  still re-serialized.
+There is no change to the AI Protocol Manager filter or the transcoder filter, and no new filter
+state.
 
-**Limits.**
+## Plan
 
-- An `agent` request on a model-change route is a 400: with the model written in, it names both.
-- A route with Interactions on one side and another API on the other is not converted. An
-  Interactions request fails the other API's schema in Envoy. Another API's request reaches Google
-  and fails there, with a 400 that names the unknown field.
-
-## Changes
-
-| File | Change | PR |
-|---|---|---|
-| `api/envoy/type/ai/v3/llm_protocol.proto` | `GEMINI_INTERACTIONS = 5`: the Interactions API, e.g. `/v1beta/interactions` on the Gemini API | 1 |
-| `ai_protocol_manager/token_usage.{h,cc}`, `llm_protocol_conversion.h` | the value in the enum, its name and both conversions | 1 |
-| `ai_protocol_manager/schema/gemini_interactions.{h,cc}`, `schema/BUILD` | request schema | 1 |
-| `ai_protocol_manager/llm_protocol_adapters.cc`, `json_readers.h` | usage adapter, registry entry, `detect()` on `object: "interaction"` and `event_type` | 1 |
-| `ai_protocol_manager/response_handler.cc` | skip `step.*` before parsing | 1 |
-| `http/ai_filters/schema_validation/llm_protocol_detection.cc` | path suffix and payload markers | 1 |
-| `http/ai_filters/request_info/extractor.cc` | Interactions reader | 1 |
-| `ai_protocol_manager/transcoding_engine.cc` | `createGeminiInteractionsTranscodePack()`: no request rules, response rules that restore the client's model; registered in `createDefault()` | 2 |
-| `ai_protocol_manager_filter.rst`, `well_known_filter_state.rst`, `changelogs/current/new_features/` | the new API in the API lists, the four examples, a release note | 1, 2 |
-
-There is no change to the AI Protocol Manager filter, the transcoder filter, bindings or filter
-state keys.
-
-## PRs and tests
-
-1. `ai_protocol_manager: add the Gemini Interactions protocol`. The tests:
-   - the adapter on Google's unary response and stream, including an `error` event;
-   - the response handler, with frames split at every byte;
-   - the schema, with `model` xor `agent` and every `input` form;
-   - detection, including a regression test that an Interactions body is no longer read as
-     generateContent;
+1. **`ai_protocol_manager: add the Gemini Interactions protocol`**: everything above except the
+   transcoder entry. The tests:
+   - usage from unary and streamed responses, including a stream that ends in an error;
+   - the schema;
+   - detection, including a regression test that an Interactions body no longer reads as
+     `generateContent`;
    - request info;
-   - an integration test on the upstream chain. Example 3 meters usage once, unary and streamed
-     and across a retry, and example 4 meters nothing.
-2. `ai_protocol_manager: change the model of Gemini Interactions requests`. The tests:
-   - engine tests: only `model` changes in the request, an `agent` request is refused, and the
-     client's model returns in unary responses and in the two stream events;
-   - an integration test on the upstream chain, for example 1. The upstream sees the pinned model,
-     the client sees its own, and usage reports the one that ran.
+   - an integration test of examples 3 and 4 on the upstream chain: usage is recorded once, also
+     across a retry, and a get records none.
+2. **`ai_protocol_manager: change the model of Gemini Interactions requests`**: the transcoder
+   entry. The tests:
+   - only `model` changes in the request;
+   - the client's model comes back in unary and streamed responses;
+   - an agent request is refused;
+   - an integration test of example 1.
 
-## Differences from the RFC
+## Limits
 
-- Dropped: Chat Completions to Interactions transcoding. With it go the Chat mapping, the forced
-  `store: false`, SSE conversion, and the fail-closed fallback it needed.
-- Kept: a new protocol value with its own schema and adapter; usage, detection and request info;
-  no new filter; a response-only route for passthrough; and no model routing in the upstream
-  chain, which runs after the host is picked.
-- Corrected:
-  - `Api-Revision` has been ignored since 2026-06-08.
-  - Thought tokens are reported apart from output tokens, and tool-use tokens must not be added.
-  - Streaming is `stream: true` in the body, without `?alt=sse`.
-- Added:
-  - Lifecycle routes carry no AI config.
-  - `accept-encoding` is stripped.
-  - The payload misdetection is fixed.
-  - The response handler skips stream deltas.
-  - The model change reuses the transcoder pair with a rule-free pack, instead of new code.
+- **Agent requests.** On a route that changes the model, an agent request is rejected with a 400.
+  Once the model is written in, it names both a model and an agent.
+- **No conversion.** A route with Interactions on one side and another API on the other is not
+  converted. An Interactions request fails the other API's schema in Envoy. Another API's request
+  reaches Google, which rejects it with a 400 that names the unknown field.
+- **Re-written bodies.** On a route that runs the transcoder, the request body is parsed and
+  written back out, even when the model does not change. Its content stays the same; its
+  formatting may not.
 
 ## Open questions
 
-| # | Question | Recommendation |
-|---|---|---|
-| 1 | Should the response name the client's model or the one Google ran? | The client's, as `envoy.ai.model.resolved` documents for every API |
-| 2 | Should another API's request on an Interactions route fail in Envoy, not at Google? | Not for now. Google's 400 names the field; a transcoder check that refuses a cross-API leg for a pack without rules is about ten lines if wanted |
-| 3 | How is the model picked per client model, such as an alias table? | Later. It needs the model before the transcoder, so ext_proc or a model router; on main, the model is pinned per route or virtual host |
+1. Should the response name the client's model, or the one Google ran? This design says the
+   client's: that is what `envoy.ai.model.resolved` does for every other API.
+2. Should another API's request on an Interactions route fail in Envoy instead of at Google? A
+   transcoder check could refuse it in about ten lines; this design leaves it to Google's 400.
+3. How should the model be picked from the client's model, for example from an alias table? The
+   choice needs the client's model before the transcoder runs, so it would come from ext_proc or a
+   model router. With this design, the model is pinned per route or virtual host.
 
-Sources, fetched 2026-10-19: https://ai.google.dev/api/interactions-api,
-https://ai.google.dev/gemini-api/docs/streaming,
-https://ai.google.dev/gemini-api/docs/interactions-breaking-changes-may-2026,
-https://ai.google.dev/gemini-api/docs/interactions-overview.
+## References
+
+- Interactions API reference: https://ai.google.dev/api/interactions-api, and v1:
+  https://ai.google.dev/api/interactions-api-v1
+- Streaming: https://ai.google.dev/gemini-api/docs/streaming
+- Overview: https://ai.google.dev/gemini-api/docs/interactions-overview
