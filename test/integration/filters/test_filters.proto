@@ -86,6 +86,8 @@ message SendGoawayFilterConfig {
 }
 message StopInHeadersContinueInBodyFilterConfig {
 }
+message HoldRequestTrailersFilterConfig {
+}
 message ClearRouteCacheFilterConfig {
 }
 message Encode1xxLocalReplyFilterConfig {

@@ -3575,6 +3575,143 @@ TEST_F(RouterTest, RetryRequestDuringBodyTrailerBetweenAttempts) {
   EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
 }
 
+// A filter ahead of the router that holds the request trailers and then resumes makes the filter
+// manager pass the decoding buffer to the router again. Only bytes not yet forwarded go upstream.
+TEST_F(RouterTest, RetryDecodingBufferPassedBackToRouter) {
+  Buffer::OwnedImpl decoding_buffer;
+  EXPECT_CALL(callbacks_, decodingBuffer()).WillRepeatedly(Return(&decoding_buffer));
+  EXPECT_CALL(callbacks_, addDecodedData(_, true))
+      .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) {
+        if (&data != &decoding_buffer) {
+          decoding_buffer.move(data);
+        }
+      }));
+
+  NiceMock<Http::MockRequestEncoder> encoder1;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder1, &response_decoder, Http::Protocol::Http10);
+  expectResponseTimerCreate();
+
+  Http::TestRequestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"}, {"x-envoy-internal", "true"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, false);
+  EXPECT_CALL(*router_->retry_state_, enabled()).WillRepeatedly(Return(true));
+
+  EXPECT_CALL(encoder1, encodeData(BufferString("body1"), false));
+  Buffer::OwnedImpl body1("body1");
+  router_->decodeData(body1, false);
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer,
+            router_->decodeData(decoding_buffer, false));
+
+  // A filter ahead of the router stopped and buffered more body before resuming.
+  decoding_buffer.add("body2");
+  EXPECT_CALL(encoder1, encodeData(BufferString("body2"), false));
+  router_->decodeData(decoding_buffer, false);
+  EXPECT_EQ("body1body2", decoding_buffer.toString());
+
+  Http::TestRequestTrailerMapImpl trailers{{"some", "trailer"}};
+  EXPECT_CALL(encoder1, encodeTrailers(HeaderMapEqualRef(&trailers)));
+  router_->decodeTrailers(trailers);
+
+  router_->retry_state_->expectResetRetry();
+  encoder1.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectNewStreamWithImmediateEncoder(encoder2, &response_decoder, Http::Protocol::Http10);
+  EXPECT_CALL(encoder2, encodeData(BufferString("body1body2"), false));
+  EXPECT_CALL(encoder2, encodeTrailers(HeaderMapEqualRef(&trailers)));
+  router_->retry_state_->callback_();
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true));
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+  EXPECT_TRUE(verifyHostUpstreamStats(1, 1));
+}
+
+// Same as above after the router stopped buffering for retries: the bytes already forwarded are
+// drained from the decoding buffer and the rest goes upstream.
+TEST_F(RouterTest, DecodingBufferPassedBackToRouterAfterRetriesDisabled) {
+  Buffer::OwnedImpl decoding_buffer;
+  EXPECT_CALL(callbacks_, decodingBuffer()).WillRepeatedly(Return(&decoding_buffer));
+  EXPECT_CALL(callbacks_, addDecodedData(_, true))
+      .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) {
+        if (&data != &decoding_buffer) {
+          decoding_buffer.move(data);
+        }
+      }));
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+  expectResponseTimerCreate();
+
+  Http::TestRequestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"}, {"x-envoy-internal", "true"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, false);
+  EXPECT_CALL(*router_->retry_state_, enabled())
+      .WillOnce(Return(true))
+      .WillRepeatedly(Return(false));
+
+  EXPECT_CALL(encoder, encodeData(BufferString("body1"), false));
+  Buffer::OwnedImpl body1("body1");
+  router_->decodeData(body1, false);
+
+  decoding_buffer.add("body2");
+  EXPECT_CALL(encoder, encodeData(BufferString("body2"), false))
+      .WillOnce(Invoke([](Buffer::Instance& data, bool) { data.drain(data.length()); }));
+  router_->decodeData(decoding_buffer, false);
+  EXPECT_EQ(0, decoding_buffer.length());
+
+  decoding_buffer.add("body3");
+  EXPECT_CALL(encoder, encodeData(BufferString("body3"), true));
+  router_->decodeData(decoding_buffer, true);
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true));
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
+TEST_F(RouterTest, DecodingBufferPassedBackToRouterRuntimeGuardDisabled) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.router_skip_replayed_request_body", "false"}});
+  Buffer::OwnedImpl decoding_buffer;
+  EXPECT_CALL(callbacks_, decodingBuffer()).WillRepeatedly(Return(&decoding_buffer));
+  EXPECT_CALL(callbacks_, addDecodedData(_, true))
+      .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) {
+        if (&data != &decoding_buffer) {
+          decoding_buffer.move(data);
+        }
+      }));
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+  expectResponseTimerCreate();
+
+  Http::TestRequestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"}, {"x-envoy-internal", "true"}};
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, false);
+  EXPECT_CALL(*router_->retry_state_, enabled()).WillRepeatedly(Return(true));
+
+  // The previous behavior forwards the whole decoding buffer again.
+  EXPECT_CALL(encoder, encodeData(BufferString("body1"), false)).Times(2);
+  Buffer::OwnedImpl body1("body1");
+  router_->decodeData(body1, false);
+  router_->decodeData(decoding_buffer, false);
+
+  Http::TestRequestTrailerMapImpl trailers{{"some", "trailer"}};
+  EXPECT_CALL(encoder, encodeTrailers(HeaderMapEqualRef(&trailers)));
+  router_->decodeTrailers(trailers);
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true));
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+  response_decoder->decodeHeaders(std::move(response_headers), true);
+}
+
 // Test retrying a request, when the first attempt fails while the client
 // is sending the body, with the rest of the request arriving in between upstream
 // request attempts, but exceeding the buffer limit causing a downstream request abort.

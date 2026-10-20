@@ -1144,6 +1144,19 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
       (decoding_buffer != &data) ? getLength(decoding_buffer) + data.length() : data.length();
   const bool would_exceed_buffer = (payload_length > effective_buffer_limit);
 
+  // A filter ahead of the router that resumes iteration (e.g. after holding the request trailers)
+  // makes the filter manager pass the router its own buffered body again. The router has already
+  // handled its first decoding_buffer_length_ bytes.
+  const uint64_t forwarded_length =
+      (decoding_buffer == &data && decoding_buffer_length_ > 0 &&
+       Runtime::runtimeFeatureEnabled(
+           "envoy.reloadable_features.router_skip_replayed_request_body"))
+          ? std::min(decoding_buffer_length_, data.length())
+          : 0;
+  if (forwarded_length > 0 && forwarded_length == data.length() && !end_stream) {
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
   // Handle buffer overflow.
   if (buffering && would_exceed_buffer) {
     ENVOY_LOG(debug,
@@ -1184,6 +1197,7 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
       shadow_stream->removeWatermarkCallbacks();
     }
     Buffer::OwnedImpl copy(data);
+    copy.drain(forwarded_length);
     shadow_stream->sendData(copy, end_stream);
   }
   if (end_stream) {
@@ -1192,6 +1206,7 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   if (buffering) {
     if (!upstream_requests_.empty()) {
       Buffer::OwnedImpl copy(data);
+      copy.drain(forwarded_length);
       upstream_requests_.front()->acceptDataFromRouter(copy, end_stream);
     }
 
@@ -1202,9 +1217,14 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
     // potentially shadow. Additionally, we can't do a copy here because there's a check down
     // this stack for whether `data` is the same buffer as already buffered data.
     callbacks_->addDecodedData(data, true);
+    decoding_buffer_length_ = getLength(callbacks_->decodingBuffer());
   } else {
     if (!upstream_requests_.empty()) {
+      data.drain(forwarded_length);
       upstream_requests_.front()->acceptDataFromRouter(data, end_stream);
+      if (decoding_buffer == &data) {
+        decoding_buffer_length_ = data.length();
+      }
     } else {
       // not buffering any data for retry, shadow, and internal redirect, and there will be
       // no more upstream request, abort the request and clean up.

@@ -689,6 +689,9 @@ private:
 
   // Keep small members (bools and enums) at the end of class, to reduce alignment overhead.
   uint64_t request_body_buffer_limit_{std::numeric_limits<uint64_t>::max()};
+  // Leading bytes of the decoding buffer that the router has already sent upstream or kept for a
+  // retry.
+  uint64_t decoding_buffer_length_{0};
   uint32_t attempt_count_{0};
   uint32_t pending_retries_{0};
   Http::Code timeout_response_code_ = Http::Code::GatewayTimeout;
