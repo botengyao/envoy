@@ -1,6 +1,5 @@
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
@@ -12,8 +11,6 @@
 #include "test/integration/http_protocol_integration.h"
 #include "test/test_common/simulated_time_system.h"
 
-#include "absl/strings/str_split.h"
-#include "absl/strings/strip.h"
 #include "absl/synchronization/notification.h"
 #include "nlohmann/json.hpp"
 
@@ -617,24 +614,6 @@ typed_config:
 class AiProtocolManagerResolvedModelIntegrationTest
     : public AiProtocolManagerResponseIntegrationTest {
 protected:
-  // Each event's name and payload, parsed when it is JSON. The response pipeline re-renders an
-  // event's JSON canonically, so the client gets the events' content, not their bytes.
-  static std::vector<std::pair<std::string, nlohmann::json>> sseEvents(absl::string_view stream) {
-    std::vector<std::pair<std::string, nlohmann::json>> events;
-    for (absl::string_view frame : absl::StrSplit(stream, "\n\n", absl::SkipEmpty())) {
-      auto& [name, data] = events.emplace_back();
-      for (absl::string_view line : absl::StrSplit(frame, '\n')) {
-        if (absl::ConsumePrefix(&line, "event: ")) {
-          name = std::string(line);
-        } else if (absl::ConsumePrefix(&line, "data: ")) {
-          data = nlohmann::json::accept(line) ? nlohmann::json::parse(line)
-                                              : nlohmann::json(std::string(line));
-        }
-      }
-    }
-    return events;
-  }
-
   void initializeForInteractions() {
     config_helper_.addConfigModifier([](ConfigHelper::HttpConnectionManager& hcm) {
       envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
@@ -710,7 +689,7 @@ TEST_P(AiProtocolManagerResolvedModelIntegrationTest, UpstreamInstanceSendsTheRe
 
   ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ(sseEvents(events), sseEvents(response->body()));
+  EXPECT_EQ(events, response->body());
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_found"), 1);
 }
 

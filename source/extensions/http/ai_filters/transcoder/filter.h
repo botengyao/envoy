@@ -119,6 +119,8 @@ public:
 
   HttpFilters::AiProtocolManager::BindingUse bindingUse() const override;
 
+  bool handlesResponses() const override;
+
 private:
   // The transcoding instructions the request legs follow, from filter state or else the route;
   // each is unset when neither names it.

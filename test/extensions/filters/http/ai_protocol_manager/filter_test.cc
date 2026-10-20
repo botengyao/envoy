@@ -2125,6 +2125,8 @@ public:
   explicit SseTaggingAiFilter(std::string tag, bool fail = false)
       : tag_(std::move(tag)), fail_(fail) {}
 
+  bool handlesResponses() const override { return true; }
+
   Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
                                        AiRequestPropagator propagate_request,
                                        LocalReplier) override {
@@ -2240,6 +2242,8 @@ public:
   explicit UnaryTaggingAiFilter(std::string tag, std::vector<std::string>* order = nullptr,
                                 bool fail = false)
       : tag_(std::move(tag)), order_(order), fail_(fail) {}
+
+  bool handlesResponses() const override { return true; }
 
   Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,
                                        AiRequestPropagator propagate_request,
@@ -2448,6 +2452,113 @@ TEST_F(AiProtocolManagerFilterTest,
   EXPECT_EQ(
       encoded_injected_.toString(),
       R"({"model":"gpt-4","usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12},"tagged":true})");
+}
+
+// An instance that ran its request chain, with token usage extraction on.
+class AiProtocolManagerUnhandledResponseTest : public AiProtocolManagerFilterTest {
+public:
+  // Bodies the response pipeline would re-render compactly, so a pass through it shows.
+  static constexpr absl::string_view SseBody =
+      "data: {\"object\": \"chat.completion.chunk\", \"model\": \"gpt-4o\", \"choices\": [], "
+      "\"usage\": {\"prompt_tokens\": 19, \"completion_tokens\": 10, \"total_tokens\": 29}}\n\n"
+      "data: [DONE]\n\n";
+  static constexpr absl::string_view JsonBody =
+      "{\"object\": \"chat.completion\", \"model\": \"gpt-4o\", \"choices\": [], "
+      "\"usage\": {\"prompt_tokens\": 19, \"completion_tokens\": 10, \"total_tokens\": 29}}";
+
+  // AI filters that, like schema validation and request info, only read the request.
+  static AiFilterFactories readOnlyChain() {
+    const AiFilterFactoryCb read_only = [](const AiFilterContext&) -> AiFilterSharedPtr {
+      return std::make_shared<PassThroughAiFilter>();
+    };
+    return {read_only, read_only};
+  }
+
+  void runRequest(AiFilterFactories ai_filter_factories) {
+    filter_->onDestroy();
+    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
+    proto.mutable_request_handling();
+    proto.mutable_response_handling()->mutable_token_usage();
+    filter_ = std::make_unique<AiProtocolManagerFilter>(std::make_shared<const FilterConfig>(
+        proto, *stats_store_.rootScope(), std::move(ai_filter_factories), factory_));
+    filter_->setDecoderFilterCallbacks(callbacks_);
+    filter_->setEncoderFilterCallbacks(encoder_callbacks_);
+    ON_CALL(encoder_callbacks_.stream_info_, setDynamicTypedMetadata(testing::_, testing::_))
+        .WillByDefault(Invoke([this](const std::string&, const Protobuf::Any& value) {
+          EXPECT_TRUE(value.UnpackTo(&usage_));
+          ++usage_writes_;
+        }));
+    setRouteConfig();
+    ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+    Buffer::OwnedImpl body(R"({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]})");
+    ASSERT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+    drain();
+    ASSERT_TRUE(injected_end_stream_);
+  }
+
+  // Sends `body` as the response, expects it through byte for byte with its content length, and
+  // expects its usage published.
+  void expectResponseLeftAlone(absl::string_view content_type, absl::string_view body) {
+    const std::string content_length = std::to_string(body.size());
+    Http::TestResponseHeaderMapImpl headers{{":status", "200"},
+                                            {"content-type", std::string(content_type)},
+                                            {"content-length", content_length}};
+    EXPECT_EQ(filter_->encodeHeaders(headers, false), Http::FilterHeadersStatus::Continue);
+    EXPECT_EQ(headers.getContentLengthValue(), content_length);
+
+    Buffer::OwnedImpl data(body);
+    EXPECT_EQ(filter_->encodeData(data, true), Http::FilterDataStatus::Continue);
+    drain();
+    EXPECT_EQ(data.toString(), body);
+    EXPECT_EQ(encoded_inject_calls_, 0);
+
+    EXPECT_EQ(counterValue("token_usage_found"), 1);
+    EXPECT_EQ(usage_writes_, 1);
+    EXPECT_EQ(usage_.input_tokens().value(), 19);
+    EXPECT_EQ(usage_.output_tokens().value(), 10);
+  }
+
+  envoy::data::ai::v3::TokenUsage usage_;
+  int usage_writes_{0};
+};
+
+TEST_F(AiProtocolManagerUnhandledResponseTest, LeavesSseResponseWithoutAiFilters) {
+  runRequest({});
+  expectResponseLeftAlone("text/event-stream", SseBody);
+}
+
+TEST_F(AiProtocolManagerUnhandledResponseTest, LeavesJsonResponseWithoutAiFilters) {
+  runRequest({});
+  expectResponseLeftAlone("application/json", JsonBody);
+}
+
+TEST_F(AiProtocolManagerUnhandledResponseTest, LeavesSseResponseOfReadOnlyAiFilters) {
+  runRequest(readOnlyChain());
+  expectResponseLeftAlone("text/event-stream", SseBody);
+}
+
+TEST_F(AiProtocolManagerUnhandledResponseTest, LeavesJsonResponseOfReadOnlyAiFilters) {
+  runRequest(readOnlyChain());
+  expectResponseLeftAlone("application/json", JsonBody);
+}
+
+// One AI filter that handles responses is enough for the response to run through the chain.
+TEST_F(AiProtocolManagerUnhandledResponseTest, RunsResponseThroughChainOneAiFilterHandles) {
+  AiFilterFactories chain = readOnlyChain();
+  chain.push_back([](const AiFilterContext&) -> AiFilterSharedPtr {
+    return std::make_shared<SseTaggingAiFilter>("tagged");
+  });
+  runRequest(std::move(chain));
+
+  Http::TestResponseHeaderMapImpl headers{{":status", "200"},
+                                          {"content-type", "text/event-stream"}};
+  EXPECT_EQ(filter_->encodeHeaders(headers, false), Http::FilterHeadersStatus::Continue);
+  Buffer::OwnedImpl data(SseBody);
+  EXPECT_EQ(filter_->encodeData(data, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_THAT(encoded_injected_.toString(), testing::HasSubstr(R"("tagged":true)"));
+  EXPECT_EQ(counterValue("token_usage_found"), 1);
 }
 
 } // namespace

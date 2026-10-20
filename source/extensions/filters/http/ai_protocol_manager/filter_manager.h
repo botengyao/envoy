@@ -56,6 +56,9 @@ public:
   void startUnaryResponse(ExternalBufferFactory& buffer_factory, FilterChainBridge& bridge,
                           BufferManager& out_buffer_manager, OnCompleteFn on_complete);
 
+  // Whether any of the stream's AI filters handles responses.
+  bool handlesResponses() const;
+
   // Feeds response body bytes to the active response filter manager.
   void onResponseData(Buffer::Instance& data, bool end_stream);
 

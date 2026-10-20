@@ -111,6 +111,10 @@ public:
   // applies is counted, since nothing else shows it is ignored.
   virtual BindingUse bindingUse() const { return {}; }
 
+  // Whether the filter handles responses, in encodeSSE() or encodeUnary(). A response no filter of
+  // the chain handles passes through unparsed, as it arrived.
+  virtual bool handlesResponses() const { return false; }
+
   // Invoked when an AI request arrives.
   // Returns absl::OkStatus() on normal completion, or an error status on failure.
   virtual Coroutine::Task<absl::Status> decode(AiRequestReceiver receive_request,

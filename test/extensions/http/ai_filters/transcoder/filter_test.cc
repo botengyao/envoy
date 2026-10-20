@@ -625,6 +625,18 @@ TEST_F(TranscoderFilterTest, AppliesTheBindingsOfItsRequestLeg) {
   EXPECT_FALSE(use(TranscoderProto::DIRECTION_UNSPECIFIED).response);
 }
 
+// Only an instance with a response leg needs the AI Protocol Manager to parse the response.
+TEST_F(TranscoderFilterTest, HandlesResponsesWithAResponseLeg) {
+  const auto handles = [this](TranscoderProto::Direction response_handling) {
+    return TranscoderFilter(makeConfig(TranscoderProto::TO_IR, response_handling),
+                            makeContext(LLMProtocol::OpenAiChatCompletions))
+        .handlesResponses();
+  };
+  EXPECT_TRUE(handles(TranscoderProto::TO_IR));
+  EXPECT_TRUE(handles(TranscoderProto::FROM_IR));
+  EXPECT_FALSE(handles(TranscoderProto::DIRECTION_UNSPECIFIED));
+}
+
 // The route's request binding reads the client's path when filter state names none.
 TEST_F(TranscoderFilterTest, RouteRequestBindingLiftsTheModelFromTheClientsPath) {
   route_request_binding_ = *LlmBinding::parse("/anthropic/{model}/{messages|stream}");

@@ -191,6 +191,12 @@ set to ``DISABLE``, the received body is forwarded byte for byte instead, and
 edits AI filters make to the document are not sent; use it only with AI filters
 that read the request.
 
+A 2xx JSON or SSE response runs through the AI filters, in reverse order, when
+one of them handles responses, as a transcoder with :ref:`response_handling
+<envoy_v3_api_field_extensions.http.ai_filters.transcoder.v3.Transcoder.response_handling>`
+set does, and is re-serialized after them. A response no AI filter handles is
+forwarded byte for byte.
+
 .. _config_http_filters_ai_protocol_manager_schema_validation:
 
 Schema validation
