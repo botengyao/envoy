@@ -21,8 +21,8 @@ The first release serves Gemini models, not agents, and lets the gateway change 
 
 ## Principles
 
-1. **AI filters work on the IR.** Only schema validation reads the client's own API: it checks
-   what the client sent, before that is converted.
+1. **AI filters work on the IR.** The exceptions are the transcoders, which convert, and schema
+   validation, which checks what the client sent before it is converted.
 2. **The IR loses nothing on a same-API hop.** A request that goes from API A into the IR and back
    to A comes out as it came in, except for intended edits such as the model. A request going from
    A to another API B keeps what B can express, and is refused when B cannot serve it.
@@ -42,7 +42,7 @@ The first release serves Gemini models, not agents, and lets the gateway change 
 | Server-side tools | none | search, code execution, URL context, file search, maps and MCP, whose calls and results are steps |
 | Media | image, audio and file parts | image, audio, video and document content, by data or by URI |
 | Generation | `max_completion_tokens`, `temperature`, `top_p`, `stop`, `seed`, `reasoning_effort` | `generation_config`: `max_output_tokens`, `stop_sequences`, `seed`, `thinking_level`, `thinking_summaries` |
-| Server-side state | none | `store` (true by default), `previous_interaction_id`, `background` |
+| Server-side state | none: `store` keeps a copy for OpenAI's evals, not the conversation | `store` (true by default), `previous_interaction_id`, `background` |
 | Response | `choices[].message`, `finish_reason` | `steps[]`, `status` |
 | Usage | `completion_tokens` includes reasoning | `total_output_tokens` and `total_thought_tokens` are separate |
 | Stream | unnamed chunks, ending in `data: [DONE]` | named events (`interaction.created`, `step.start`, `step.delta`, `step.stop`, `interaction.completed`, `error`), ending in `event: done` and `data: [DONE]` |
@@ -78,7 +78,10 @@ The rules:
    its IR fields, filter edits included, plus what `_envoy.<API>` kept.
 4. **Another API leaves `_envoy.<API>` behind.** Where leaving it would change the meaning, as
    `previous_interaction_id` or `agent` would, the request is refused instead.
-5. **`_envoy` never leaves Envoy.** The AI Protocol Manager removes it before sending.
+5. **Only Envoy writes `_envoy`, and it never leaves Envoy.** A client's request and a backend's
+   response lose any `_envoy` they arrive with. Otherwise a Chat client, whose request already is
+   the IR, could forge thoughts or another API's fields. Before sending, the AI Protocol Manager
+   removes `_envoy`, and drops a stream chunk that holds nothing else.
 
 An Interactions request:
 
@@ -130,7 +133,8 @@ if one is set.
 | response `usage` | IR `usage`, with output including thought tokens |
 | stream event | one chunk: `step.delta` text as `delta.content`, thought deltas as `delta._envoy.reasoning`, `interaction.completed` as the closing chunk with usage; other events carry only `_envoy` |
 
-A chunk that carries only `_envoy` is dropped for a client of another API.
+A chunk that carries only `_envoy` becomes an Interactions event again for an Interactions
+client, and is dropped for any other (rule 5).
 
 ### When to convert
 
@@ -197,11 +201,12 @@ These come from schema validation's path detection and the transcoder's built-in
 as Claude on Vertex AI's. The table moves into the AI Protocol Manager, which needs the API before
 it decides to hold the body.
 
-Everything else passes untouched, and is neither held nor parsed:
+With `parse_unconfigured_routes` off, its default, everything else passes untouched, and is
+neither held nor parsed:
 
 - a get or a delete, which has no body;
 - a cancel, whose path ends in `/cancel`;
-- a file upload, which is not JSON;
+- a file upload, whose path names no API;
 - a call of an API that is not listed.
 
 ### What the recognized API decides
@@ -219,7 +224,8 @@ Everything else passes untouched, and is neither held nor parsed:
 Listing an API sends all of its calls through the transcoders. Until an API converts to the IR and
 back without loss, that would change its traffic: today's IR drops Anthropic thinking and tool-use
 blocks from responses, for example. Chat Completions is safe to list, since it is the IR's shape.
-Gemini Interactions is safe once its conversion lands.
+Gemini Interactions is safe once its conversion lands. OpenAI Responses cannot be listed yet: it
+has no conversion, so the transcoders would refuse its calls.
 
 ### By the payload, later
 
@@ -237,8 +243,9 @@ every JSON `POST`, so it is an option, off by default.
 | The backend's request | The backend-side transcoder, before sending; it does this today | The backend's API |
 
 Schema validation runs first because it checks what the client sent, which the conversion
-replaces. Naming the API moves out of it, into the AI Protocol Manager, so schema validation only
-validates.
+replaces. Detection by path moves out of it, into the AI Protocol Manager, which needs the API
+before it holds the body. Schema validation keeps its other detection, by the `anthropic-version`
+header and then the payload, for a route that declares `request` without naming an API.
 
 ## Examples
 
@@ -289,7 +296,8 @@ counted twice.
 One route sends everything to the DFP cluster, and the AI Protocol Manager on the cluster decides
 what is an AI call. `endpoint_recognition` and `GEMINI_INTERACTIONS` are proposed. With the first
 removed, the second replaced by `GEMINI_GENERATE_CONTENT`, and the CA path adjusted, this file
-passes `envoy --mode validate` on a build of `d5eb7030ad`.
+passes `envoy --mode validate` on a build of `d5eb7030ad`. The config protos it uses are the same on
+today's main.
 
 ```yaml
 static_resources:
@@ -386,6 +394,9 @@ static_resources:
   provider keys.
 - `accept-encoding` is removed on the route, so for all traffic, because Envoy can neither read nor
   convert a compressed response.
+- Request info sits between the transcoders, where it reads the IR (PR 5). Until then, put it
+  before the client-side transcoder. It reads each API natively today, and the transcoder does not
+  relabel the request's API after converting, so between them it would misread the IR.
 - To have the gateway pick the model, a filter ahead sets `envoy.ai.model.resolved`: ext_proc or a
   model router, for example. A virtual host for one provider's host can also set it with
   `set_filter_state`.
@@ -396,7 +407,7 @@ static_resources:
 |---|---|
 | 1. `ai_protocol_manager: add the Gemini Interactions protocol` | `GEMINI_INTERACTIONS = 5`; the Interactions request schema; usage from unary and streamed responses (output plus thought tokens, read at `interaction.completed`); the path suffix `/interactions` in schema validation's detection, and a fix for bodies it reads today as `generateContent`; request info's Interactions reader |
 | 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when `envoy.ai.llm_protocol.request` names its API, on any route; when its route declares one; or when recognition does. The first of these wins. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API is recorded in `envoy.ai.llm_protocol.request`. |
-| 3. `ai_protocol_manager: carry what the IR has no field for` | The `_envoy` member: engine rules that move unmapped members into `_envoy.<API>` and back; the AI Protocol Manager removes `_envoy` before sending; the IR schema accepts it |
+| 3. `ai_protocol_manager: carry what the IR has no field for` | The `_envoy` member: engine rules that move unmapped members into `_envoy.<API>` and back. The AI Protocol Manager drops any `_envoy` a client or backend sends, removes `_envoy` before sending, and drops a stream chunk left with nothing else. The IR schema accepts it. |
 | 4. `ai_protocol_manager: transcode Gemini Interactions to and from the IR` | Request, response and stream, in both directions: text, instructions, generation settings and thoughts; everything else in `_envoy`; the gateway's model on the way out and the client's on the way back |
 | 5. `request_info: read the IR` | One reader for every API, between the transcoders, in place of today's per-API readers |
 
@@ -416,6 +427,9 @@ metered, while a get, a cancel and a file upload pass untouched.
   because it would then name both a model and an agent.
 - **Tools and media.** Same-API requests carry them, held in `_envoy`, but they are not converted
   to other APIs yet.
+- **Other APIs.** The Anthropic and Gemini conversions do not map the fields Interactions fills in
+  the IR yet. `reasoning_effort` reaches those APIs as is, and they reject it, as they do for a
+  Chat client's today.
 - **Recognition is by path.** A call on a gateway path that names no API is not an AI call until
   recognition by payload exists.
 - **Get, delete and cancel.** These calls are not recognized, and are forwarded without AI
