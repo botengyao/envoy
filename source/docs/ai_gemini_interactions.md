@@ -382,16 +382,19 @@ schema.
   to other APIs yet.
 - **Get, delete and cancel.** These calls are forwarded without AI processing or usage records.
 
+## Decisions
+
+- **The IR's form** (2026-10-19): Chat Completions' shape plus `_envoy`. A new Envoy-defined
+  format would be cleaner, but every conversion would be rewritten, and Chat clients would convert
+  too.
+
 ## Open questions
 
-1. **The IR's form.** This design keeps Chat Completions' shape plus `_envoy`. A new
-   Envoy-defined format would be cleaner, but every conversion would be rewritten, and Chat
-   clients would convert too.
-2. **Where thoughts live.** `_envoy.reasoning` cannot clash with a future OpenAI field. Other
+1. **Where thoughts live.** `_envoy.reasoning` cannot clash with a future OpenAI field. Other
    gateways put thoughts in a top-level field, such as `reasoning_content` or `reasoning_details`.
-3. **Converting only when needed.** Should filters declare that they read the IR, or should the
+2. **Converting only when needed.** Should filters declare that they read the IR, or should the
    transcoder pair always convert?
-4. **State-bound fields.** Should a cross-API request carrying `previous_interaction_id` or `agent`
+3. **State-bound fields.** Should a cross-API request carrying `previous_interaction_id` or `agent`
    be refused? Doing so needs a refuse rule in the engine.
 
 ## References
