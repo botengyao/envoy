@@ -831,6 +831,7 @@ void UpstreamRequest::disableDataFromDownstreamForFlowControl() {
   parent_.cluster()->trafficStats()->upstream_flow_control_backed_up_total_.inc();
   parent_.callbacks()->onDecoderFilterAboveWriteBufferHighWatermark();
   ++downstream_data_disabled_;
+  parent_.onUpstreamRequestBodyFlowControl(*this, true);
 }
 
 void UpstreamRequest::enableDataFromDownstreamForFlowControl() {
@@ -840,6 +841,7 @@ void UpstreamRequest::enableDataFromDownstreamForFlowControl() {
   if (downstream_data_disabled_ > 0) {
     --downstream_data_disabled_;
   }
+  parent_.onUpstreamRequestBodyFlowControl(*this, false);
 }
 
 Http::RequestHeaderMapOptRef UpstreamRequestFilterManagerCallbacks::requestHeaders() {

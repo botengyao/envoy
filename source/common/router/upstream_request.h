@@ -172,6 +172,8 @@ public:
   bool encodeComplete() const { return router_sent_end_stream_; }
   // Exposes streamInfo for the upstream stream.
   StreamInfo::StreamInfo& streamInfo() { return stream_info_; }
+  // Whether this request is pushing back on the request body the router sends it.
+  bool bodyFlowControlled() const { return downstream_data_disabled_ > 0; }
   bool hadUpstream() const { return had_upstream_; }
   // Disable per-try timeouts for websocket upgrades after successful handshake
   void disablePerTryTimeoutForWebsocketUpgrade();
@@ -329,11 +331,15 @@ public:
   // the router to resume the flow of data from downstream.
   void onDecoderFilterBelowWriteBufferLowWatermark() override {
     upstream_request_.onBelowWriteBufferLowWatermark();
+    // Upstream filters that send request data of their own (e.g. replay a buffered body) pace on
+    // the same signal, as downstream filters do through the HCM.
+    upstream_request_.filter_manager_->callUpstreamLowWatermarkCallbacks();
   }
   // If the filter manager determines a decoder filter has too much data, tell
   // the router to stop the flow of data from downstream.
   void onDecoderFilterAboveWriteBufferHighWatermark() override {
     upstream_request_.onAboveWriteBufferHighWatermark();
+    upstream_request_.filter_manager_->callUpstreamHighWatermarkCallbacks();
   }
 
   // These functions are delegated to the downstream HCM/FM

@@ -224,6 +224,8 @@ FilterConfig::FilterConfig(
       max_parsed_sse_events_(
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
                                           max_parsed_sse_events, DefaultMaxParsedSseEvents)),
+      retry_body_log_(proto.request_handling().retry_body_log()),
+      retry_body_log_max_bytes_(proto.request_handling().retry_body_log_max_bytes()),
       ai_filter_factories_(std::move(ai_filter_factories)),
       buffer_factory_(std::move(buffer_factory)) {
   ASSERT(buffer_factory_ != nullptr);
@@ -292,6 +294,11 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
+  // Lent whether or not this filter inspects the request: the router writes the log either way.
+  if (config_->retryBodyLog()) {
+    lendRetryBodyLog();
+  }
+
   // Copy what the route declared; see the note on route_has_request_ for why the
   // config is not held by pointer.
   if (const RouteConfig* route_config =
@@ -339,8 +346,19 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // A request small enough that the chain would have buffered it anyway is held in memory and
   // replayed from there, so it costs no storage IO at all. Past that the chain would have pushed
   // back, which is exactly the point at which offloading starts to pay for itself.
+  ExternalBufferFactory* decode_factory = &config_->bufferFactory();
+  // Upstream, the frames this filter receives are the ones the router appends to the log.
+  if (retry_body_log_ != nullptr && decoder_callbacks_->upstreamCallbacks().has_value()) {
+    std::optional<uint64_t> content_length;
+    if (uint64_t length; absl::SimpleAtoi(headers.getContentLengthValue(), &length)) {
+      content_length = length;
+    }
+    decode_buffer_factory_ = std::make_unique<BorrowingExternalBufferFactory>(
+        retry_body_log_, config_->bufferFactory(), content_length);
+    decode_factory = decode_buffer_factory_.get();
+  }
   decode_manager_ = std::make_shared<BufferManager>(
-      BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, config_->bufferFactory(),
+      BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, *decode_factory,
       *decode_bridge_);
 
   // Pin the headers so routing and admission filters do not act on them before
@@ -349,6 +367,22 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // for an empty/trailer-only body, when the manager continues iteration).
   ENVOY_LOG(trace, "ai_protocol_manager: holding headers until payload is offloaded");
   return Http::FilterHeadersStatus::StopIteration;
+}
+
+void AiProtocolManagerFilter::lendRetryBodyLog() {
+  // The log lives in the downstream stream's filter state, which upstream filters share, so it
+  // outlasts the attempt whose filter created it. FilterChain keeps a stream recreated for an
+  // internal redirect from inheriting it.
+  StreamInfo::FilterState& filter_state = *decoder_callbacks_->streamInfo().filterState();
+  retry_body_log_ = std::dynamic_pointer_cast<Http::RequestBodyLog>(
+      filter_state.getDataSharedMutableGeneric(Http::RequestBodyLog::key()));
+  if (retry_body_log_ == nullptr) {
+    retry_body_log_ = std::make_shared<ExternalBufferRequestBodyLog>(
+        decoder_callbacks_->dispatcher(), config_->bufferFactoryShared(),
+        decoder_callbacks_->decoderBufferLimit(), config_->retryBodyLogMaxBytes());
+    filter_state.setData(Http::RequestBodyLog::key(), retry_body_log_,
+                         StreamInfo::FilterState::LifeSpan::FilterChain);
+  }
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {

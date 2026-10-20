@@ -903,11 +903,18 @@ bool Filter::continueDecodeHeaders(Http::RequestHeaderMap& headers, bool end_str
   // will never transition from false to true.
   bool can_use_http3 =
       !transport_socket_options_ || !transport_socket_options_->http11ProxyInfo().has_value();
+  if (cross_cluster_retry_ &&
+      Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.restore_request_headers_on_cross_cluster_retry")) {
+    original_request_headers_ = Http::createHeaderMap<Http::RequestHeaderMapImpl>(headers);
+  }
   UpstreamRequestPtr upstream_request = std::make_unique<UpstreamRequest>(
       *this, std::move(generic_conn_pool), can_send_early_data, can_use_http3,
       allow_multiplexed_upstream_half_close_ /*enable_half_close*/);
   LinkedList::moveIntoList(std::move(upstream_request), upstream_requests_);
   upstream_requests_.front()->acceptHeadersFromRouter(end_stream);
+  // The attempt's upstream filters have run decodeHeaders, so a log one of them created exists now.
+  maybeUseBodyLog(end_stream);
 
   // If the upstream HTTP filters dropped this request by sending a local reply, we should not
   // start any shadow streams since the request won't be proxied upstream.
@@ -1129,6 +1136,48 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   // a backoff timer..
   ASSERT(upstream_requests_.size() <= 1);
 
+  if (body_log_ != nullptr) {
+    for (const Buffer::RawSlice& slice : data.getRawSlices()) {
+      received_body_crc_ = absl::ExtendCrc32c(
+          received_body_crc_, absl::string_view(static_cast<const char*>(slice.mem_), slice.len_));
+    }
+    received_body_length_ += data.length();
+    // Logged before it is forwarded, so an upstream filter reading the log finds every byte it
+    // has been sent.
+    if (body_log_writer_ != nullptr && !body_log_failed_) {
+      Buffer::OwnedImpl logged(data);
+      body_log_writer_->append(logged);
+      if (end_stream && !body_log_failed_) {
+        body_log_writer_->end();
+      }
+    }
+    if (body_replay_target_ != nullptr) {
+      body_replay_cb_->scheduleCallbackCurrentIteration();
+    }
+    for (auto* shadow_stream : shadow_streams_) {
+      if (end_stream) {
+        shadow_stream->removeDestructorCallback();
+        shadow_stream->removeWatermarkCallbacks();
+      }
+      Buffer::OwnedImpl copy(data);
+      shadow_stream->sendData(copy, end_stream);
+    }
+    if (end_stream) {
+      shadow_streams_.clear();
+    }
+    // While a retry waits for or replays the log, frames arriving behind it are read back from the
+    // log rather than forwarded here.
+    if (!upstream_requests_.empty() && body_replay_target_ == nullptr) {
+      upstream_requests_.front()->acceptDataFromRouter(data, end_stream);
+    } else {
+      data.drain(data.length());
+    }
+    if (end_stream) {
+      onRequestComplete();
+    }
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
   const bool retry_enabled = retry_state_ && retry_state_->enabled();
   const bool redirect_enabled = route_entry_ && route_entry_->internalRedirectPolicy().enabled();
   const uint64_t effective_buffer_limit = calculateEffectiveBufferLimit();
@@ -1239,7 +1288,11 @@ Http::FilterTrailersStatus Filter::decodeTrailers(Http::RequestTrailerMap& trail
   // a backoff timer.
   ASSERT(upstream_requests_.size() <= 1);
   downstream_trailers_ = &trailers;
-  if (!upstream_requests_.empty()) {
+  if (body_log_writer_ != nullptr && !body_log_failed_ && !body_log_->ended()) {
+    body_log_writer_->end();
+  }
+  // A replay in progress sends the trailers once it has caught up.
+  if (!upstream_requests_.empty() && body_replay_target_ == nullptr) {
     upstream_requests_.front()->acceptTrailersFromRouter(trailers);
   }
 
@@ -1289,6 +1342,7 @@ void Filter::cleanup() {
   ASSERT(upstream_requests_.empty());
 
   ENVOY_LOG(debug, "Executing cleanup(): resetting retry_state_ and disabling timers");
+  stopBodyReplay();
   retry_state_.reset();
   if (response_timeout_) {
     response_timeout_->disableTimer();
@@ -1374,6 +1428,13 @@ void Filter::onRequestComplete() {
   Event::Dispatcher& dispatcher = callbacks_->dispatcher();
   downstream_request_complete_time_ = dispatcher.timeSource().monotonicTime();
 
+  if (body_log_ != nullptr) {
+    body_logged_ = true;
+    if (body_replay_target_ != nullptr) {
+      body_replay_cb_->scheduleCallbackCurrentIteration();
+    }
+  }
+
   // Possible that we got an immediate reset.
   if (!upstream_requests_.empty()) {
     // Even if we got an immediate reset, we could still shadow, but that is a riskier change and
@@ -1396,6 +1457,9 @@ void Filter::onDestroy() {
   if (host_selection_cancelable_) {
     host_selection_cancelable_->cancel();
   }
+
+  stopBodyReplay();
+  body_log_writer_.reset();
 
   // Reset any in-flight upstream requests.
   resetAll();
@@ -1884,6 +1948,7 @@ void Filter::onUpstream1xxHeaders(Http::ResponseHeaderMapPtr&& headers,
 }
 
 void Filter::resetAll() {
+  stopBodyReplay();
   while (!upstream_requests_.empty()) {
     auto request_ptr = upstream_requests_.back()->removeFromList(upstream_requests_);
     request_ptr->resetStream();
@@ -2175,7 +2240,11 @@ void Filter::onUpstreamMetadata(Http::MetadataMapPtr&& metadata_map) {
 }
 
 void Filter::onUpstreamComplete(UpstreamRequest& upstream_request) {
-  if (!downstream_end_stream_) {
+  if (body_replay_target_ == &upstream_request) {
+    // The response finished before the replayed body did; the attempt must not stay half open.
+    stopBodyReplay();
+    upstream_request.resetStream();
+  } else if (!downstream_end_stream_) {
     if (allow_multiplexed_upstream_half_close_) {
       // Continue request if downstream is not done yet.
       return;
@@ -2421,6 +2490,213 @@ bool Filter::convertRequestHeadersForInternalRedirect(
   return true;
 }
 
+void Filter::onUpstreamRequestBodyFlowControl(UpstreamRequest& upstream_request, bool above) {
+  // Only a replay that actually stopped resumes here: an attempt whose filters pause and resume
+  // within one send must not re-arm a replay that already yielded for the pass.
+  if (!above && &upstream_request == body_replay_target_ && body_replay_blocked_ &&
+      !upstream_request.bodyFlowControlled()) {
+    body_replay_blocked_ = false;
+    // Resume off this stack: the low watermark fires inside upstream decodeData and cleanUp().
+    body_replay_cb_->scheduleCallbackCurrentIteration();
+  }
+}
+
+void Filter::maybeUseBodyLog(bool end_stream) {
+  if (end_stream || retry_state_ == nullptr || !retry_state_->enabled() ||
+      route_entry_->internalRedirectPolicy().enabled() ||
+      hedging_params_.hedge_on_per_try_timeout_ ||
+      Http::HeaderUtility::isConnect(*downstream_headers_) ||
+      Http::Utility::isUpgrade(*downstream_headers_)) {
+    // Internal redirects re-run the filter chain over the decoding buffer, hedged attempts would
+    // each need a replay, and tunnels do not end their request bodies.
+    return;
+  }
+  auto log = std::dynamic_pointer_cast<Http::RequestBodyLog>(
+      callbacks_->streamInfo().filterState()->getDataSharedMutableGeneric(
+          Http::RequestBodyLog::key()));
+  if (log == nullptr || log->failed()) {
+    return;
+  }
+  if (uint64_t content_length;
+      log->maxLength() != 0 &&
+      absl::SimpleAtoi(downstream_headers_->getContentLengthValue(), &content_length) &&
+      content_length > log->maxLength()) {
+    // Too long for the log; the in-memory buffer decides about retrying it, as without a log.
+    return;
+  }
+  body_log_writer_ = log->attachWriter(*this);
+  if (body_log_writer_ == nullptr) {
+    return;
+  }
+  body_log_ = std::move(log);
+  ENVOY_STREAM_LOG(debug, "writing the request body to a request body log for retries",
+                   *callbacks_);
+  stats_.retry_body_logged_.inc();
+  body_replay_cb_ = callbacks_->dispatcher().createSchedulableCallback(
+      [this]() -> void { continueBodyReplay(); });
+}
+
+void Filter::onLogAboveHighWatermark() {
+  callbacks_->onDecoderFilterAboveWriteBufferHighWatermark();
+}
+
+void Filter::onLogBelowLowWatermark() { callbacks_->onDecoderFilterBelowWriteBufferLowWatermark(); }
+
+void Filter::onLogFailed() {
+  // This can run inside append(); act on it from the replay continuation.
+  body_log_failed_ = true;
+  body_replay_cb_->scheduleCallbackCurrentIteration();
+}
+
+void Filter::handleBodyLogFailure() {
+  ENVOY_STREAM_LOG(debug, "the request body log failed after {} bytes; giving up on retries",
+                   *callbacks_, received_body_length_);
+  stats_.retry_body_log_failed_.inc();
+  cluster_->trafficStats()->retry_or_shadow_abandoned_.inc();
+  // A retry waiting in backoff, or one already replaying, has no body left to send. Otherwise the
+  // live attempt goes on with the bytes the router forwards itself, and its response, whatever it
+  // is, reaches the client.
+  const bool retry_needs_body =
+      body_replay_target_ != nullptr ||
+      (upstream_requests_.empty() && retry_state_ != nullptr && !downstream_response_started_);
+  body_log_writer_.reset();
+  body_log_ = nullptr;
+  retry_state_.reset();
+  if (retry_needs_body) {
+    failBodyReplay("retry_body_log_failed");
+  }
+}
+
+void Filter::startBodyReplay(UpstreamRequest& upstream_request) {
+  ENVOY_STREAM_LOG(debug, "replaying {} request body bytes into the retry{}", *callbacks_,
+                   received_body_length_,
+                   body_logged_ ? "" : ", following the log as the rest arrives");
+  stopBodyReplay();
+  body_replay_target_ = &upstream_request;
+  ++body_replay_generation_;
+  body_replay_offset_ = 0;
+  body_replay_crc_ = absl::crc32c_t{0};
+  body_replay_chunks_this_pass_ = 0;
+  continueBodyReplay();
+}
+
+void Filter::continueBodyReplay() {
+  if (body_log_failed_ && body_log_ != nullptr) {
+    handleBodyLogFailure();
+    return;
+  }
+  if (body_replay_target_ == nullptr || body_replay_read_ != nullptr) {
+    return;
+  }
+  if (upstream_requests_.empty() || upstream_requests_.front().get() != body_replay_target_) {
+    stopBodyReplay();
+    return;
+  }
+  if (body_replay_target_->bodyFlowControlled()) {
+    body_replay_blocked_ = true;
+    return;
+  }
+  if (body_replay_offset_ == received_body_length_) {
+    // Caught up with the log. decodeData() wakes the replay when more arrives, and
+    // onRequestComplete() once the body is whole.
+    if (body_logged_) {
+      finishBodyReplay();
+    }
+    return;
+  }
+  constexpr uint64_t ReplayChunkSize = 64 * 1024;
+  const uint64_t generation = body_replay_generation_;
+  Http::RequestBodyLog::ReadHandlePtr read = body_log_->read(
+      body_replay_offset_, std::min(ReplayChunkSize, received_body_length_ - body_replay_offset_),
+      [this, generation](absl::StatusOr<Buffer::InstancePtr> data) {
+        onBodyReplayRead(generation, std::move(data));
+      });
+  if (read != nullptr && body_replay_target_ != nullptr && generation == body_replay_generation_) {
+    body_replay_read_ = std::move(read);
+  }
+}
+
+void Filter::onBodyReplayRead(uint64_t generation, absl::StatusOr<Buffer::InstancePtr> data) {
+  if (generation != body_replay_generation_ || body_replay_target_ == nullptr) {
+    return;
+  }
+  body_replay_read_.reset();
+  if (upstream_requests_.empty() || upstream_requests_.front().get() != body_replay_target_) {
+    // The attempt ended while an asynchronous read was outstanding.
+    stopBodyReplay();
+    return;
+  }
+  if (!data.ok()) {
+    ENVOY_STREAM_LOG(debug, "request body replay failed: {}", *callbacks_, data.status().message());
+    stats_.retry_body_replay_error_.inc();
+    failBodyReplay("retry_body_replay_error");
+    return;
+  }
+  Buffer::Instance& chunk = **data;
+  ASSERT(chunk.length() > 0 && chunk.length() <= received_body_length_ - body_replay_offset_);
+  for (const Buffer::RawSlice& slice : chunk.getRawSlices()) {
+    body_replay_crc_ = absl::ExtendCrc32c(
+        body_replay_crc_, absl::string_view(static_cast<const char*>(slice.mem_), slice.len_));
+  }
+  body_replay_offset_ += chunk.length();
+  // Send the chunk read before this one and hold this one back: the chunk that completes the
+  // request on a Content-Length upstream goes out only once the replay is verified.
+  if (body_replay_held_.length() > 0) {
+    body_replay_target_->acceptDataFromRouter(body_replay_held_, false);
+  }
+  body_replay_held_.move(chunk);
+  // The attempt can fail inside acceptDataFromRouter(); the continuation checks it is still live.
+  // Bound the chunks a synchronous store replays in one event-loop pass.
+  if (++body_replay_chunks_this_pass_ < 8) {
+    body_replay_cb_->scheduleCallbackCurrentIteration();
+  } else {
+    body_replay_chunks_this_pass_ = 0;
+    body_replay_cb_->cancel();
+    body_replay_cb_->scheduleCallbackNextIteration();
+  }
+}
+
+void Filter::finishBodyReplay() {
+  UpstreamRequest* target = body_replay_target_;
+  body_replay_target_ = nullptr;
+  if (body_replay_crc_ != received_body_crc_) {
+    stats_.retry_body_replay_mismatch_.inc();
+    failBodyReplay("retry_body_replay_mismatch");
+    return;
+  }
+  if (downstream_trailers_ == nullptr) {
+    target->acceptDataFromRouter(body_replay_held_, true);
+    return;
+  }
+  if (body_replay_held_.length() > 0) {
+    target->acceptDataFromRouter(body_replay_held_, false);
+  }
+  if (!upstream_requests_.empty() && upstream_requests_.front().get() == target) {
+    target->acceptTrailersFromRouter(*downstream_trailers_);
+  }
+}
+
+void Filter::stopBodyReplay() {
+  body_replay_target_ = nullptr;
+  body_replay_read_.reset();
+  body_replay_held_.drain(body_replay_held_.length());
+  body_replay_blocked_ = false;
+  ++body_replay_generation_;
+  if (body_replay_cb_ != nullptr) {
+    body_replay_cb_->cancel();
+  }
+}
+
+void Filter::failBodyReplay(absl::string_view details) {
+  stopBodyReplay();
+  resetAll();
+  cleanup();
+  callbacks_->streamInfo().setResponseCodeDetails(details);
+  callbacks_->sendLocalReply(Http::Code::ServiceUnavailable,
+                             "request body could not be replayed for a retry", modify_headers_,
+                             std::nullopt, details);
+}
+
 void Filter::runRetryOptionsPredicates(UpstreamRequest& retriable_request) {
   for (const auto& options_predicate : getEffectiveRetryPolicy()->retryOptionsPredicates()) {
     const Upstream::RetryOptionsPredicate::UpdateOptionsParameters parameters{
@@ -2445,6 +2721,11 @@ void Filter::doRetry(bool can_send_early_data, bool can_use_http3, TimeoutRetry 
     // attempt before potentially creating a new one.
     host_selection_cancelable_->cancel();
     host_selection_cancelable_.reset();
+  }
+
+  if (original_request_headers_ != nullptr) {
+    downstream_headers_->clear();
+    Http::RequestHeaderMapImpl::copyFrom(*downstream_headers_, *original_request_headers_);
   }
 
   if (cross_cluster_retry_) {
@@ -2547,12 +2828,31 @@ void Filter::continueDoRetry(bool can_send_early_data, bool can_use_http3,
 
   UpstreamRequest* upstream_request_tmp = upstream_request.get();
   LinkedList::moveIntoList(std::move(upstream_request), upstream_requests_);
-  upstream_requests_.front()->acceptHeadersFromRouter(
-      !callbacks_->decodingBuffer() && !downstream_trailers_ && downstream_end_stream_);
+  if (body_log_ != nullptr && downstream_end_stream_ && !response_timeout_ &&
+      timeout_.global_timeout_.count() > 0) {
+    // The body ended while no attempt was live, so onRequestComplete() armed no global timeout.
+    response_timeout_ =
+        callbacks_->dispatcher().createTimer([this]() -> void { onResponseTimeout(); });
+    response_timeout_->enableTimer(
+        std::max(std::chrono::milliseconds(1), timeout_.global_timeout_ - elapsed_time));
+  }
+  const bool has_body = body_log_ != nullptr
+                            ? (received_body_length_ > 0 || !downstream_end_stream_)
+                            : callbacks_->decodingBuffer() != nullptr;
+  upstream_requests_.front()->acceptHeadersFromRouter(!has_body && !downstream_trailers_ &&
+                                                      downstream_end_stream_);
   // It's possible we got immediately reset which means the upstream request we just
   // added to the front of the list might have been removed, so we need to check to make
   // sure we don't send data on the wrong request.
-  if (!upstream_requests_.empty() && (upstream_requests_.front().get() == upstream_request_tmp)) {
+  if (!upstream_requests_.empty() && (upstream_requests_.front().get() == upstream_request_tmp) &&
+      body_log_ != nullptr) {
+    if (has_body) {
+      startBodyReplay(*upstream_request_tmp);
+    } else if (downstream_trailers_) {
+      upstream_request_tmp->acceptTrailersFromRouter(*downstream_trailers_);
+    }
+  } else if (!upstream_requests_.empty() &&
+             (upstream_requests_.front().get() == upstream_request_tmp)) {
     if (callbacks_->decodingBuffer()) {
       // If we are doing a retry we need to make a copy.
       Buffer::OwnedImpl copy(*callbacks_->decodingBuffer());

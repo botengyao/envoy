@@ -123,6 +123,21 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "retry_body_log_test",
+    srcs = ["retry_body_log_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:retry_body_log_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/test_common:status_utility_lib",
+        "@abseil-cpp//absl/crc:crc32c",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "llm_protocol_adapters_test",
     srcs = ["llm_protocol_adapters_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

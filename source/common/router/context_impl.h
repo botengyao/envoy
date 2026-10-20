@@ -25,6 +25,10 @@ namespace Router {
   COUNTER(rq_redirect)                                                                             \
   COUNTER(rq_reset_after_downstream_response_started)                                              \
   COUNTER(rq_total)                                                                                \
+  COUNTER(retry_body_log_failed)                                                                   \
+  COUNTER(retry_body_logged)                                                                       \
+  COUNTER(retry_body_replay_error)                                                                 \
+  COUNTER(retry_body_replay_mismatch)                                                              \
   STATNAME(retry)
 
 MAKE_STAT_NAMES_STRUCT(StatNames, ALL_ROUTER_STATS);

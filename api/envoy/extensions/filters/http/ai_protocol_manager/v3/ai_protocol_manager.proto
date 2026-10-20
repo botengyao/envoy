@@ -99,6 +99,21 @@ message RequestHandling {
   // Whether the parsed request is re-serialized once the AI filters finish. Defaults to ``ALWAYS``.
   // Requests that run no AI filters are forwarded as received either way.
   BodyReserialization reserialize_body = 3 [(validate.rules).enum = {defined_only: true}];
+
+  // Lend this filter's external buffer to the router as the request body log it replays retries
+  // from: the ``envoy.http.request_body_log`` filter state object, created unless the stream
+  // already has one. The router writes the body into it as it sends it, so a retry replays exactly
+  // what the first attempt received, even if a filter ahead of the router changed the body. In an
+  // upstream installation the filter also reads its own payload back from that log rather than
+  // storing a copy per attempt.
+  // [#not-implemented-hide:]
+  bool retry_body_log = 4;
+
+  // The longest body the lent log holds; a longer one fails the log, and the router gives up on
+  // retrying that request as it does when its in-memory retry buffer overflows. Zero for no limit.
+  // With the in-memory external buffer this bounds the heap the log can use.
+  // [#not-implemented-hide:]
+  uint64 retry_body_log_max_bytes = 5;
 }
 
 // Per-stream limits for request payload parsing.

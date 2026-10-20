@@ -128,6 +128,18 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "request_body_log_interface",
+    hdrs = ["request_body_log.h"],
+    deps = [
+        "//envoy/buffer:buffer_interface",
+        "//envoy/common:pure_lib",
+        "//envoy/stream_info:filter_state_interface",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status:statusor",
+    ],
+)
+
+envoy_cc_library(
     name = "filter_interface",
     hdrs = ["filter.h"],
     deps = [
