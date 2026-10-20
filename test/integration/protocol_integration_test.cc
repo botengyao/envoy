@@ -1719,16 +1719,10 @@ TEST_P(ProtocolIntegrationTest, RetryStreamingCancelDueToBufferOverflow) {
   cleanupUpstreamAndDownstream();
 }
 
-// A filter ahead of the router holds the request trailers and resumes later. The body the router
-// buffered for retries must reach each upstream attempt exactly once.
-TEST_P(ProtocolIntegrationTest, RetryWithHeldRequestTrailers) {
+void ProtocolIntegrationTest::testRetryWithHeldRequestTrailers(const std::string& filter_config) {
   config_helper_.addConfigModifier(setEnableDownstreamTrailersHttp1());
   config_helper_.addConfigModifier(setEnableUpstreamTrailersHttp1());
-  config_helper_.prependFilter(R"EOF(
-  name: hold-request-trailers-filter
-  typed_config:
-    "@type": type.googleapis.com/test.integration.filters.HoldRequestTrailersFilterConfig
-  )EOF");
+  config_helper_.prependFilter(filter_config);
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -1765,11 +1759,31 @@ TEST_P(ProtocolIntegrationTest, RetryWithHeldRequestTrailers) {
   waitForNextUpstreamRequest();
   EXPECT_EQ(body.size(), upstream_request_->bodyLength());
   ASSERT_NE(nullptr, upstream_request_->trailers());
-  upstream_request_->encodeHeaders(default_response_headers_, true);
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(512, true);
 
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(512U, response->body().size());
   EXPECT_EQ(1U, test_server_->counter("cluster.cluster_0.upstream_rq_retry")->value());
+}
+
+// The filter passes the body through and holds only the trailers.
+TEST_P(ProtocolIntegrationTest, RetryWithHeldRequestTrailers) {
+  testRetryWithHeldRequestTrailers(R"EOF(
+  name: hold-request-trailers-filter
+  typed_config:
+    "@type": type.googleapis.com/test.integration.filters.HoldRequestTrailersFilterConfig
+  )EOF");
+}
+
+// The filter holds the body, injects it once the trailers arrive, then releases the trailers.
+TEST_P(ProtocolIntegrationTest, RetryWithInjectedBodyAndHeldRequestTrailers) {
+  testRetryWithHeldRequestTrailers(R"EOF(
+  name: async-inject-body-at-end-stream-filter
+  typed_config:
+    "@type": type.googleapis.com/test.integration.filters.AsyncInjectBodyAtEndStreamFilterConfig
+  )EOF");
 }
 
 // Tests that the x-envoy-attempt-count header is properly set on the upstream request and the

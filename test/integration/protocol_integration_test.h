@@ -33,6 +33,9 @@ protected:
   // Creates a downstream connection presenting the client certificate selected by `options`.
   Network::ClientConnectionPtr
   makeDownstreamMtlsConnection(const Ssl::ClientSslTransportOptions& options);
+  // Sends a body and trailers through `filter_config`, placed ahead of the router, with retries
+  // enabled, and checks that each upstream attempt receives the body exactly once.
+  void testRetryWithHeldRequestTrailers(const std::string& filter_config);
 
 private:
   // Keeps the TLS client transport socket factory alive for the connection it created.
