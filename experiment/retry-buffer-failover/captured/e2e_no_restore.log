@@ -1,0 +1,20 @@
+PASS  no-restore-429      status 200  [200 b'{"candidates":[{"content":{"role":"model","parts":[{"text":"served by vertex"}]},"finishReason":"STO' in 0.02s]
+PASS  no-restore-429      served by vertex
+PASS  no-restore-429      attempt order  [['gemini', 'vertex']]
+PASS  no-restore-429      gemini got the router's bytes  [946 bytes]
+PASS  no-restore-429      gemini SNI, host, path  [sni=generativelanguage.googleapis.com path=/v1beta/models/gemini-2.5-flash:generateContent]
+PASS  no-restore-429      gemini own credential only  [key=True authz=False]
+PASS  no-restore-429      vertex got the router's bytes  [946 bytes]
+PASS  no-restore-429      vertex SNI, host, path  [sni=us-central1-aiplatform.googleapis.com path=/v1/projects/test-project/locations/us-central1/]
+PASS  no-restore-429      vertex own credential only  [key=False authz=True]
+PASS  no-restore-reverse  status 200  [200 b'{"candidates":[{"content":{"role":"model","parts":[{"text":"served by gemini"}]},"finishReason":"STO' in 0.02s]
+PASS  no-restore-reverse  served by gemini
+PASS  no-restore-reverse  attempt order  [['vertex', 'gemini']]
+PASS  no-restore-reverse  vertex got the router's bytes  [946 bytes]
+PASS  no-restore-reverse  vertex SNI, host, path  [sni=us-central1-aiplatform.googleapis.com path=/v1/projects/test-project/locations/us-central1/]
+PASS  no-restore-reverse  vertex own credential only  [key=False authz=True]
+PASS  no-restore-reverse  gemini got the router's bytes  [946 bytes]
+PASS  no-restore-reverse  gemini SNI, host, path  [sni=generativelanguage.googleapis.com path=/v1beta/models/gemini-2.5-flash:generateContent]
+PASS  no-restore-reverse  gemini own credential only  [key=True authz=False]
+
+18/18 checks passed
