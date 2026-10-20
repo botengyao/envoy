@@ -46,4 +46,7 @@ enum LLMProtocol {
   // Gemini ``generateContent`` / ``streamGenerateContent`` APIs, e.g.
   // ``/v1beta/models/{model}:generateContent`` on the Gemini API.
   GEMINI_GENERATE_CONTENT = 4;
+
+  // Gemini Interactions API, e.g. ``/v1beta/interactions`` on the Gemini API.
+  GEMINI_INTERACTIONS = 5;
 }

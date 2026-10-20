@@ -151,6 +151,43 @@ TEST(RequestInfoExtractorTest, GeminiOversizedPathModelFlagsAndKeepsStream) {
   EXPECT_TRUE(attrs.malformed);
 }
 
+TEST(RequestInfoExtractorTest, GeminiInteractions) {
+  const RequestAttributes attrs = extract(LLMProtocol::GeminiInteractions,
+                                          R"({"model":"gemini-3-flash-preview","stream":true,
+          "input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},
+                   {"type":"model_output","content":[{"type":"text","text":"yo"}]},
+                   {"type":"user_input","content":[{"type":"text","text":"again"}]}],
+          "generation_config":{"max_output_tokens":256},
+          "tools":[{"type":"function","name":"f"}]})",
+                                          "/v1beta/interactions");
+  EXPECT_EQ(attrs.llm_protocol, LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(attrs.model, "gemini-3-flash-preview");
+  EXPECT_EQ(attrs.stream, true);
+  EXPECT_EQ(attrs.max_output_tokens, 256u);
+  EXPECT_EQ(attrs.message_count, 3u);
+  EXPECT_EQ(attrs.tool_count, 1u);
+  EXPECT_FALSE(attrs.malformed);
+}
+
+TEST(RequestInfoExtractorTest, GeminiInteractionsContentInputIsOneTurn) {
+  for (const std::string input : {
+           R"("hi")",
+           R"({"type":"text","text":"hi"})",
+           R"([{"type":"text","text":"hi"},{"type":"image","uri":"gs://b/o.png"}])",
+       }) {
+    EXPECT_EQ(extract(LLMProtocol::GeminiInteractions, R"({"input":)" + input + "}").message_count,
+              1u)
+        << input;
+  }
+  nlohmann::json offloaded = parse("{}");
+  offloaded["input"] = JsonWithExtBuf::makeExternalRef(JsonWithExtBuf::ExternalRef{10, 20});
+  EXPECT_EQ(extractRequestAttributes(LLMProtocol::GeminiInteractions, offloaded, "/").message_count,
+            1u);
+  EXPECT_EQ(extract(LLMProtocol::GeminiInteractions, R"({"input":[]})").message_count, 0u);
+  EXPECT_FALSE(
+      extract(LLMProtocol::GeminiInteractions, R"({"input":null})").message_count.has_value());
+}
+
 TEST(RequestInfoExtractorTest, UnspecifiedReadsSharedAttributesOnly) {
   const RequestAttributes attrs = extract(LLMProtocol::Unspecified,
                                           R"({"model":"m","stream":false,"max_tokens":5,
@@ -167,7 +204,8 @@ TEST(RequestInfoExtractorTest, UnspecifiedReadsSharedAttributesOnly) {
 TEST(RequestInfoExtractorTest, AbsentAttributesStayAbsent) {
   for (const LLMProtocol protocol :
        {LLMProtocol::Unspecified, LLMProtocol::OpenAiChatCompletions, LLMProtocol::OpenAiResponses,
-        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent}) {
+        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent,
+        LLMProtocol::GeminiInteractions}) {
     const RequestAttributes attrs = extract(protocol, "{}", "/");
     EXPECT_EQ(attrs.llm_protocol, protocol);
     EXPECT_TRUE(attrs.model.empty()) << llmProtocolName(protocol);

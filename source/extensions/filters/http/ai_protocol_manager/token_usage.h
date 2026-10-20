@@ -22,6 +22,7 @@ enum class LLMProtocol {
   OpenAiResponses,
   AnthropicMessages,
   GeminiGenerateContent,
+  GeminiInteractions,
 };
 
 // The envoy.type.ai.v3.LLMProtocol enum-value name for a protocol

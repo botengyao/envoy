@@ -335,6 +335,75 @@ protected:
   }
 };
 
+// Gemini Interactions. A response and a stream's `interaction.status_update` carry `usage` at the
+// root, and `interaction.completed` under `interaction`. `total_output_tokens` excludes the thought
+// tokens reported beside it; the cached and tool-use counts are parts of the other totals.
+class GeminiInteractionsAdapter : public LLMProtocolAdapter {
+public:
+  LLMProtocol protocol() const override { return LLMProtocol::GeminiInteractions; }
+  const PayloadSchema* schema() const override { return nullptr; }
+
+  void canonicalizeUsage(TokenUsage& usage, bool& overflow) const override {
+    usage.output_tokens = addCounts(usage.output_tokens, usage.reasoning_tokens, overflow);
+  }
+
+  bool isTerminalEvent(const nlohmann::json& json) const override {
+    const auto type = readString(json, Keys::EventType);
+    return type.has_value() && type.value() == "interaction.completed";
+  }
+
+  absl::string_view usagePath() const override { return Keys::Usage; }
+
+  nlohmann::json renderUsage(const TokenUsage& usage) const override {
+    nlohmann::json out = nlohmann::json::object();
+    putCount(out, Keys::TotalInputTokens, usage.input_tokens);
+    putCount(out, Keys::TotalOutputTokens,
+             excludeBucket(usage.output_tokens, usage.reasoning_tokens));
+    putCount(out, Keys::TotalThoughtTokens, usage.reasoning_tokens);
+    putCount(out, Keys::TotalCachedTokens, usage.cached_input_tokens);
+    putCount(out, Keys::TotalToolUseTokens, usage.tool_use_input_tokens);
+    putCount(out, Keys::TotalTokens, totalForRender(usage));
+    return out;
+  }
+
+protected:
+  void extractUsageInto(const nlohmann::json& json, ExtractionResult& result) const override {
+    bool& malformed = result.malformed;
+    TokenUsage& usage = result.usage;
+    if (const auto type = readString(json, Keys::EventType);
+        type.has_value() && type.value() == "error") {
+      result.stream_error = true;
+      return;
+    }
+    const nlohmann::json* node = &json;
+    if (!json.contains(Keys::Usage)) {
+      if (const nlohmann::json* interaction =
+              readObject(json, Keys::Interaction, malformed, NullPolicy::AllowNullAsAbsent);
+          interaction != nullptr) {
+        node = interaction;
+      }
+    }
+
+    if (auto model = readString(*node, Keys::Model); model.has_value()) {
+      usage.model = std::move(model).value();
+    }
+
+    const nlohmann::json* usage_node =
+        readObject(*node, Keys::Usage, malformed, NullPolicy::AllowNullAsAbsent);
+    if (usage_node == nullptr) {
+      return;
+    }
+
+    // Native counts only; the thought tokens are summed into output at canonicalizeUsage().
+    usage.input_tokens = readCount(*usage_node, Keys::TotalInputTokens, malformed);
+    usage.output_tokens = readCount(*usage_node, Keys::TotalOutputTokens, malformed);
+    usage.total_tokens = readCount(*usage_node, Keys::TotalTokens, malformed);
+    usage.cached_input_tokens = readCount(*usage_node, Keys::TotalCachedTokens, malformed);
+    usage.tool_use_input_tokens = readCount(*usage_node, Keys::TotalToolUseTokens, malformed);
+    usage.reasoning_tokens = readCount(*usage_node, Keys::TotalThoughtTokens, malformed);
+  }
+};
+
 } // namespace
 
 const LLMProtocolAdapter& AdapterRegistry::get(LLMProtocol protocol) {
@@ -349,6 +418,8 @@ const LLMProtocolAdapter& AdapterRegistry::get(LLMProtocol protocol) {
     CONSTRUCT_ON_FIRST_USE(AnthropicMessagesAdapter);
   case LLMProtocol::GeminiGenerateContent:
     CONSTRUCT_ON_FIRST_USE(GeminiGenerateContentAdapter);
+  case LLMProtocol::GeminiInteractions:
+    CONSTRUCT_ON_FIRST_USE(GeminiInteractionsAdapter);
   case LLMProtocol::Unspecified:
     break;
   }
@@ -383,6 +454,8 @@ LLMProtocol AdapterRegistry::detect(const nlohmann::json& json) {
 
   // OpenAI Chat Completions and non-streaming Responses discriminate on
   // `object`; Responses streaming events discriminate on `type` ("response.*").
+  // Gemini Interactions names its object `interaction`, and each stream event
+  // its `event_type`.
   if (const auto object = readString(json, Keys::ObjectKey); object.has_value()) {
     if (absl::StartsWith(object.value(), "chat.completion")) {
       return LLMProtocol::OpenAiChatCompletions;
@@ -390,6 +463,14 @@ LLMProtocol AdapterRegistry::detect(const nlohmann::json& json) {
     if (object.value() == "response") {
       return LLMProtocol::OpenAiResponses;
     }
+    if (object.value() == "interaction") {
+      return LLMProtocol::GeminiInteractions;
+    }
+  }
+  if (const auto event_type = readString(json, Keys::EventType);
+      event_type.has_value() && (absl::StartsWith(event_type.value(), "interaction.") ||
+                                 absl::StartsWith(event_type.value(), "step."))) {
+    return LLMProtocol::GeminiInteractions;
   }
 
   if (const auto type = readString(json, Keys::Type); type.has_value()) {

@@ -58,6 +58,10 @@ bool skippableEventType(absl::string_view event_type) {
   if (absl::StartsWith(event_type, "response.")) {
     return !isOpenAiResponsesTerminalEventType(event_type);
   }
+  // Gemini Interactions' opening event and its steps: the interaction's usage arrives later.
+  if (absl::StartsWith(event_type, "step.") || event_type == "interaction.created") {
+    return true;
+  }
   return false;
 }
 

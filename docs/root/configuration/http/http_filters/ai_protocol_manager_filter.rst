@@ -12,9 +12,10 @@ directions of a stream:
 * On the **response (encode) path** it can extract normalized LLM **token
   usage** from provider responses — OpenAI (Chat Completions and Responses
   API), Anthropic (Messages API), and Gemini (``generateContent`` /
-  ``streamGenerateContent``) — and publish it as typed dynamic metadata for
-  consumption by typed-metadata readers, e.g. :ref:`ext_proc
-  <config_http_filters_ext_proc>` metadata forwarding and other filters.
+  ``streamGenerateContent`` and the Interactions API) — and publish it as
+  typed dynamic metadata for consumption by typed-metadata readers, e.g.
+  :ref:`ext_proc <config_http_filters_ext_proc>` metadata forwarding and other
+  filters.
 
 Request and response processing are enabled independently, by the presence of
 :ref:`request_handling
@@ -233,14 +234,20 @@ A request that declares none falls back to :ref:`default_llm_protocol
 and by default the API is detected from the request: its path, matched as a
 suffix against each provider's REST path (``/chat/completions``,
 ``/responses``, ``/v1/messages``, ``:generateContent``,
-``:streamGenerateContent``); then the ``anthropic-version`` header; then the
-payload's shape.
+``:streamGenerateContent``, ``/interactions``); then the
+``anthropic-version`` header; then the payload's shape.
 
 Chat Completions and Anthropic Messages share the ``messages[]`` request
 shape, so only keys exclusive to one of them tell the two apart. A payload
 carrying markers of both, or of neither -- including
 ``{"model": ..., "messages": [{"role": "user", "content": ...}]}``, which is
 valid under either -- names no API, and is forwarded unvalidated.
+
+OpenAI Responses and Gemini Interactions both name the model and ``input``. A payload is read as
+Interactions when it carries a key only Interactions has (``previous_interaction_id``, ``agent``,
+``agent_config``) or Gemini's ``system_instruction`` or ``generation_config`` beside ``input``;
+``{"model": ..., "input": ...}`` alone reads as Responses, so an Interactions route that is not
+matched by its path declares its API.
 
 The filter outputs statistics in the ``ai_protocol_manager.schema_validation.``
 namespace:
@@ -282,14 +289,14 @@ or the one the :ref:`schema validation
 when it runs first:
 
 .. csv-table::
-  :header: Attribute, OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Gemini
-  :widths: 1, 1, 1, 1, 1
+  :header: Attribute, OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Gemini, Gemini Interactions
+  :widths: 1, 1, 1, 1, 1, 1
 
-  ``model``, ``model``, ``model``, ``model``, model segment of the request path
-  ``stream``, ``stream``, ``stream``, ``stream``, "``:generateContent`` (false) or ``:streamGenerateContent`` (true) operation in the request path"
-  ``max_output_tokens``, "``max_completion_tokens``, else ``max_tokens``", ``max_output_tokens``, ``max_tokens``, "``generationConfig.maxOutputTokens`` (camelCase or snake_case)"
-  ``message_count``, ``messages``, "``input`` (a string counts as one message)", ``messages``, ``contents``
-  ``tool_count``, ``tools``, ``tools``, ``tools``, ``tools``
+  ``model``, ``model``, ``model``, ``model``, model segment of the request path, ``model``
+  ``stream``, ``stream``, ``stream``, ``stream``, "``:generateContent`` (false) or ``:streamGenerateContent`` (true) operation in the request path", ``stream``
+  ``max_output_tokens``, "``max_completion_tokens``, else ``max_tokens``", ``max_output_tokens``, ``max_tokens``, "``generationConfig.maxOutputTokens`` (camelCase or snake_case)", ``generation_config.max_output_tokens``
+  ``message_count``, ``messages``, "``input`` (a string counts as one message)", ``messages``, ``contents``, "``input`` (a list of steps counts each; a string or content counts as one)"
+  ``tool_count``, ``tools``, ``tools``, ``tools``, ``tools``, ``tools``
 
 Without an API, only ``model`` and ``stream`` are read. Every value is
 client-declared and optional. A value Envoy cannot use (wrong type, out of
@@ -615,7 +622,9 @@ counted by ``token_usage_total_mismatch``). The breakdown fields
 canonical values. The extractor
 normalizes each dialect's native shape onto this contract — for example
 Anthropic's disjoint cache buckets are summed into the canonical input, and
-Gemini's thoughts are summed into the canonical output.
+Gemini's thoughts are summed into the canonical output. Gemini Interactions reports usage on the
+interaction, at the root of a response and on a stream's ``interaction.completed`` event; its
+thoughts are summed into the canonical output too.
 
 .. note::
 

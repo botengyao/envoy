@@ -172,6 +172,63 @@ TEST_F(ResponseHandlerTest, SseGeminiAltSseLastSnapshotWins) {
   EXPECT_FALSE(handler.parsingComplete());
 }
 
+// The step events are dropped on their names; the step.delta below is not even JSON.
+TEST_F(ResponseHandlerTest, SseGeminiInteractionsCompletedEventCarriesTheUsage) {
+  const std::string stream =
+      "event: interaction.created\n"
+      "data: {\"event_type\":\"interaction.created\",\"interaction\":{\"id\":\"v1_1\","
+      "\"object\":\"interaction\",\"model\":\"gemini-3-flash-preview\","
+      "\"status\":\"in_progress\"}}\n\n"
+      "event: interaction.status_update\n"
+      "data: {\"event_type\":\"interaction.status_update\",\"interaction_id\":\"v1_1\","
+      "\"status\":\"in_progress\"}\n\n"
+      "event: step.start\n"
+      "data: {\"event_type\":\"step.start\",\"index\":0,\"step\":{\"type\":\"model_output\"}}\n\n"
+      "event: step.delta\n"
+      "data: not{json\n\n"
+      "event: step.stop\n"
+      "data: {\"event_type\":\"step.stop\",\"index\":0,\"usage\":{\"total_output_tokens\":2}}\n\n"
+      "event: interaction.completed\n"
+      "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"v1_1\","
+      "\"model\":\"gemini-3-flash-preview\",\"status\":\"completed\",\"usage\":{"
+      "\"total_input_tokens\":7,\"total_output_tokens\":20,\"total_thought_tokens\":22,"
+      "\"total_tokens\":49}}}\n\n"
+      "event: done\n"
+      "data: [DONE]\n\n";
+  for (const size_t frame_size : {5, 64, 8192}) {
+    SseResponseHandler handler(LLMProtocol::Unspecified, TestMaxEventSize, TestMaxParsedEvents,
+                               stats_);
+    feed(handler, stream, frame_size);
+    EXPECT_EQ(handler.usage().llm_protocol, LLMProtocol::GeminiInteractions);
+    EXPECT_EQ(handler.usage().input_tokens, 7) << "frame_size=" << frame_size;
+    EXPECT_EQ(handler.usage().output_tokens, 20) << "frame_size=" << frame_size;
+    EXPECT_EQ(handler.usage().reasoning_tokens, 22);
+    EXPECT_EQ(handler.usage().model, "gemini-3-flash-preview");
+    EXPECT_TRUE(handler.parsingComplete());
+    EXPECT_FALSE(handler.degraded());
+    TokenUsage finalized = handler.usage();
+    finalizeUsage(finalized);
+    EXPECT_EQ(finalized.output_tokens, 42);
+    EXPECT_EQ(finalized.total_tokens, 49);
+  }
+  EXPECT_EQ(stats_.response_parse_error_.value(), 0);
+}
+
+TEST_F(ResponseHandlerTest, SseGeminiInteractionsErrorEventDegrades) {
+  SseResponseHandler handler(LLMProtocol::Unspecified, TestMaxEventSize, TestMaxParsedEvents,
+                             stats_);
+  feed(handler,
+       "event: interaction.status_update\n"
+       "data: {\"event_type\":\"interaction.status_update\",\"interaction_id\":\"v1_1\","
+       "\"status\":\"in_progress\",\"usage\":{\"total_input_tokens\":7}}\n\n"
+       "event: error\n"
+       "data: {\"event_type\":\"error\",\"error\":{\"code\":\"internal\",\"message\":\"m\"}}\n\n",
+       4096);
+  EXPECT_EQ(handler.usage().input_tokens, 7);
+  EXPECT_FALSE(handler.parsingComplete());
+  EXPECT_TRUE(handler.degraded());
+}
+
 TEST_F(ResponseHandlerTest, SseCommentKeepAlivesAndUnknownEventsSkipped) {
   SseResponseHandler handler(LLMProtocol::AnthropicMessages, TestMaxEventSize, TestMaxParsedEvents,
                              stats_);

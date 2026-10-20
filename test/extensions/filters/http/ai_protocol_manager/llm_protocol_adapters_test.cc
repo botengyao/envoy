@@ -70,6 +70,7 @@ TEST(LLMProtocolNameTest, NamesMatchProtoEnumValueNames) {
   EXPECT_EQ(llmProtocolName(LLMProtocol::OpenAiResponses), "OPENAI_RESPONSES");
   EXPECT_EQ(llmProtocolName(LLMProtocol::AnthropicMessages), "ANTHROPIC_MESSAGES");
   EXPECT_EQ(llmProtocolName(LLMProtocol::GeminiGenerateContent), "GEMINI_GENERATE_CONTENT");
+  EXPECT_EQ(llmProtocolName(LLMProtocol::GeminiInteractions), "GEMINI_INTERACTIONS");
   EXPECT_EQ(llmProtocolName(LLMProtocol::Unspecified), "LLM_PROTOCOL_UNSPECIFIED");
 }
 
@@ -101,6 +102,19 @@ TEST(DetectFormatTest, Gemini) {
             LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(AdapterRegistry::detect(parse(R"({"usageMetadata":{}})")),
             LLMProtocol::GeminiGenerateContent);
+}
+
+TEST(DetectFormatTest, GeminiInteractions) {
+  EXPECT_EQ(AdapterRegistry::detect(parse(R"({"id":"v1_1","object":"interaction","steps":[]})")),
+            LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(
+      AdapterRegistry::detect(parse(R"({"event_type":"interaction.completed","interaction":{}})")),
+      LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(AdapterRegistry::detect(parse(R"({"event_type":"step.delta","index":0})")),
+            LLMProtocol::GeminiInteractions);
+  // An error event names no API of its own.
+  EXPECT_EQ(AdapterRegistry::detect(parse(R"({"event_type":"error","error":{}})")),
+            LLMProtocol::Unspecified);
 }
 
 TEST(DetectFormatTest, Unknown) {
@@ -360,6 +374,68 @@ TEST(ExtractGeminiTest, ToolUseWithoutPromptCountIsCounted) {
   EXPECT_EQ(usage.input_tokens, 5);
   EXPECT_EQ(usage.output_tokens, 10);
   EXPECT_EQ(usage.total_tokens, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Gemini Interactions extraction.
+
+TEST(ExtractGeminiInteractionsTest, Interaction) {
+  auto usage = extractUsage(LLMProtocol::GeminiInteractions, parse(R"(
+      {"id":"v1_1","object":"interaction","model":"gemini-3-flash-preview","status":"completed",
+       "steps":[{"type":"model_output","content":[{"type":"text","text":"Hi"}]}],
+       "usage":{"total_input_tokens":7,"total_output_tokens":20,"total_thought_tokens":22,
+                "total_cached_tokens":3,"total_tool_use_tokens":2,"total_tokens":49}})"));
+  EXPECT_EQ(usage.output_tokens, 20);
+  finalizeUsage(usage);
+  // The cached and tool-use counts are parts of the input; the thoughts are beside the output.
+  EXPECT_EQ(usage.input_tokens, 7);
+  EXPECT_EQ(usage.output_tokens, 42);
+  EXPECT_EQ(usage.total_tokens, 49);
+  EXPECT_EQ(usage.provider_total_tokens, 49);
+  EXPECT_EQ(usage.cached_input_tokens, 3);
+  EXPECT_EQ(usage.tool_use_input_tokens, 2);
+  EXPECT_EQ(usage.reasoning_tokens, 22);
+  EXPECT_EQ(usage.model, "gemini-3-flash-preview");
+  EXPECT_EQ(usage.llm_protocol, LLMProtocol::GeminiInteractions);
+}
+
+TEST(ExtractGeminiInteractionsTest, StreamCarriesUsageOnItsInteractionEvents) {
+  const LLMProtocolAdapter& adapter = AdapterRegistry::get(LLMProtocol::GeminiInteractions);
+  const nlohmann::json status_update = parse(R"(
+      {"event_type":"interaction.status_update","interaction_id":"v1_1","status":"in_progress",
+       "usage":{"total_input_tokens":7}})");
+  const nlohmann::json completed = parse(R"(
+      {"event_type":"interaction.completed",
+       "interaction":{"id":"v1_1","model":"gemini-3-flash-preview","status":"completed",
+                      "usage":{"total_input_tokens":7,"total_output_tokens":20,
+                               "total_tokens":27}}})");
+  TokenUsage accumulated;
+  accumulated.merge(adapter.extractUsage(status_update).usage);
+  EXPECT_EQ(accumulated.input_tokens, 7);
+  EXPECT_FALSE(adapter.isTerminalEvent(status_update));
+  accumulated.merge(adapter.extractUsage(completed).usage);
+  EXPECT_TRUE(adapter.isTerminalEvent(completed));
+  finalizeUsage(accumulated);
+  EXPECT_EQ(accumulated.input_tokens, 7);
+  EXPECT_EQ(accumulated.output_tokens, 20);
+  EXPECT_EQ(accumulated.total_tokens, 27);
+  EXPECT_EQ(accumulated.model, "gemini-3-flash-preview");
+}
+
+TEST(ExtractGeminiInteractionsTest, ErrorEventMarksTheStream) {
+  const ExtractionResult result = AdapterRegistry::get(LLMProtocol::GeminiInteractions)
+                                      .extractUsage(parse(R"({"event_type":"error",
+                                  "error":{"code":"missing_thought_signature","message":"m"}})"));
+  EXPECT_TRUE(result.stream_error);
+  EXPECT_FALSE(result.usage.hasAny());
+}
+
+TEST(ExtractGeminiInteractionsTest, InvalidCountIsMalformed) {
+  const ExtractionResult result =
+      AdapterRegistry::get(LLMProtocol::GeminiInteractions)
+          .extractUsage(parse(R"({"object":"interaction","usage":{"total_input_tokens":"7"}})"));
+  EXPECT_TRUE(result.malformed);
+  EXPECT_FALSE(result.usage.input_tokens.has_value());
 }
 
 TEST(ExtractAnthropicTest, CanonicalInclusiveAccounting) {
@@ -720,6 +796,7 @@ TEST(RenderUsageTest, UsagePathPerDialect) {
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::OpenAiResponses).usagePath(), "usage");
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::AnthropicMessages).usagePath(), "usage");
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::GeminiGenerateContent).usagePath(), "usageMetadata");
+  EXPECT_EQ(AdapterRegistry::get(LLMProtocol::GeminiInteractions).usagePath(), "usage");
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::Unspecified).usagePath(), "");
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::Unspecified).renderUsage(allBucketsUsage()),
             nlohmann::json::object());
@@ -747,6 +824,13 @@ TEST(RenderUsageTest, GeminiReportsToolUseAndThoughtsBesideTheirCounts) {
             parse(R"({"promptTokenCount": 95, "candidatesTokenCount": 25, "totalTokenCount": 140,
                       "cachedContentTokenCount": 30, "toolUsePromptTokenCount": 5,
                       "thoughtsTokenCount": 15})"));
+}
+
+TEST(RenderUsageTest, GeminiInteractionsReportsThoughtsBesideOutput) {
+  EXPECT_EQ(AdapterRegistry::get(LLMProtocol::GeminiInteractions).renderUsage(allBucketsUsage()),
+            parse(R"({"total_input_tokens": 100, "total_output_tokens": 25,
+                      "total_thought_tokens": 15, "total_cached_tokens": 30,
+                      "total_tool_use_tokens": 5, "total_tokens": 140})"));
 }
 
 TEST(RenderUsageTest, RendersOnlyTheCountsItHas) {
@@ -803,6 +887,9 @@ TEST(RenderUsageTest, NativeUsageRoundTripsThroughTheCanonicalContract) {
        R"({"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 20,
            "cachedContentTokenCount": 4, "toolUsePromptTokenCount": 2,
            "thoughtsTokenCount": 3})"},
+      {LLMProtocol::GeminiInteractions,
+       R"({"total_input_tokens": 7, "total_output_tokens": 20, "total_thought_tokens": 22,
+           "total_cached_tokens": 3, "total_tool_use_tokens": 2, "total_tokens": 49})"},
   };
   for (const auto& [protocol, native] : cases) {
     const LLMProtocolAdapter& adapter = AdapterRegistry::get(protocol);
@@ -825,6 +912,7 @@ TEST(AdapterRegistryTest, SchemaLookup) {
   EXPECT_NE(AdapterRegistry::get(LLMProtocol::GeminiGenerateContent).schema(), nullptr);
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::Unspecified).schema(), nullptr);
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::OpenAiResponses).schema(), nullptr);
+  EXPECT_EQ(AdapterRegistry::get(LLMProtocol::GeminiInteractions).schema(), nullptr);
 }
 
 // The schema is a construct-on-first-use singleton, so every lookup must hand back the same
@@ -837,7 +925,8 @@ TEST(AdapterRegistryTest, SchemaLookupIsStable) {
 TEST(AdapterRegistryTest, AdaptersReportTheirProtocol) {
   for (const LLMProtocol protocol :
        {LLMProtocol::Unspecified, LLMProtocol::OpenAiChatCompletions, LLMProtocol::OpenAiResponses,
-        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent}) {
+        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent,
+        LLMProtocol::GeminiInteractions}) {
     EXPECT_EQ(AdapterRegistry::get(protocol).protocol(), protocol);
   }
 }

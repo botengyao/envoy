@@ -32,6 +32,9 @@ TEST(DetectFromHeadersTest, MatchesProviderPathSuffix) {
             LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(fromPath("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"),
             LLMProtocol::GeminiGenerateContent);
+  EXPECT_EQ(fromPath("/v1beta/interactions"), LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(fromPath("/v1/interactions?alt=sse"), LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(fromPath("/v1beta/interactions/v1_abc"), LLMProtocol::Unspecified);
   EXPECT_EQ(fromPath("/v2/messages"), LLMProtocol::Unspecified);
   EXPECT_EQ(fromPath("/"), LLMProtocol::Unspecified);
 }
@@ -64,6 +67,22 @@ TEST(DetectFromPayloadTest, ExclusiveMarkers) {
        }) {
     EXPECT_EQ(fromPayload(body), LLMProtocol::OpenAiChatCompletions) << body;
   }
+}
+
+TEST(DetectFromPayloadTest, GeminiInteractionsMarkers) {
+  for (const std::string body : {
+           R"({"model":"m","input":"hi","previous_interaction_id":"v1_abc"})",
+           R"({"agent":"deep-research","input":"hi"})",
+           R"({"model":"m","input":"hi","generation_config":{"temperature":0}})",
+           R"({"model":"m","input":[{"type":"text","text":"hi"}],"system_instruction":"be terse"})",
+       }) {
+    EXPECT_EQ(fromPayload(body), LLMProtocol::GeminiInteractions) << body;
+  }
+  // `contents` is generateContent's, whichever keys the two APIs share beside it.
+  EXPECT_EQ(fromPayload(R"({"contents":[],"generation_config":{},"input":"x"})"),
+            LLMProtocol::GeminiGenerateContent);
+  // A bare `model` and `input` is either API; only the path tells them apart.
+  EXPECT_EQ(fromPayload(R"({"model":"m","input":"hi"})"), LLMProtocol::OpenAiResponses);
 }
 
 TEST(DetectFromPayloadTest, AmbiguousOrForeignDetectsNothing) {

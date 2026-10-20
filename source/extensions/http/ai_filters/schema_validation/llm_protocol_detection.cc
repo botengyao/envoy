@@ -31,6 +31,11 @@ constexpr absl::string_view AnthropicOnlyKeys[]{"system", "stop_sequences", "top
 constexpr absl::string_view OpenAiOnlyKeys[]{Keys::MaxCompletionTokens, "response_format",
                                              "frequency_penalty",       "presence_penalty",
                                              "stream_options",          "logit_bias"};
+// Keys only an Interactions body has, and keys it shares with generateContent, which has
+// `contents` where Interactions has `input`.
+constexpr absl::string_view InteractionsOnlyKeys[]{"previous_interaction_id", "agent",
+                                                   "agent_config"};
+constexpr absl::string_view GeminiSharedKeys[]{"system_instruction", Keys::GenerationConfigSnake};
 
 bool hasAnyKey(const nlohmann::json& json, absl::Span<const absl::string_view> keys) {
   return absl::c_any_of(keys, [&json](absl::string_view key) { return json.contains(key); });
@@ -67,6 +72,7 @@ LLMProtocol detectFromHeaders(const Http::RequestHeaderMap& headers) {
       {"/v1/messages", LLMProtocol::AnthropicMessages},
       {":generateContent", LLMProtocol::GeminiGenerateContent},
       {":streamGenerateContent", LLMProtocol::GeminiGenerateContent},
+      {"/interactions", LLMProtocol::GeminiInteractions},
   };
   const absl::string_view path = Http::PathUtil::removeQueryAndFragment(headers.getPathValue());
   for (const auto& [suffix, protocol] : PathSuffixes) {
@@ -81,6 +87,11 @@ LLMProtocol detectFromHeaders(const Http::RequestHeaderMap& headers) {
 LLMProtocol detectFromPayload(const nlohmann::json& json) {
   if (!json.is_object()) {
     return LLMProtocol::Unspecified;
+  }
+  if (!json.contains(Keys::Contents) &&
+      (hasAnyKey(json, InteractionsOnlyKeys) ||
+       (json.contains(Keys::Input) && hasAnyKey(json, GeminiSharedKeys)))) {
+    return LLMProtocol::GeminiInteractions;
   }
   if (hasAnyKey(json, GeminiOnlyKeys)) {
     return LLMProtocol::GeminiGenerateContent;

@@ -22,6 +22,8 @@ absl::string_view llmProtocolName(LLMProtocol protocol) {
     return "ANTHROPIC_MESSAGES";
   case LLMProtocol::GeminiGenerateContent:
     return "GEMINI_GENERATE_CONTENT";
+  case LLMProtocol::GeminiInteractions:
+    return "GEMINI_INTERACTIONS";
   case LLMProtocol::Unspecified:
     break;
   }

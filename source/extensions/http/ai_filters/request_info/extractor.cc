@@ -123,6 +123,32 @@ void readGeminiGenerateContent(const nlohmann::json& json, absl::string_view pat
   attrs.tool_count = readArrayLength(json, Keys::Tools, attrs.malformed);
 }
 
+// The content types an Interactions `input` list may hold; any other element is a step.
+bool isInteractionsContent(const nlohmann::json& element) {
+  const auto type = readString(element, Keys::Type);
+  return type == "text" || type == "image" || type == "audio" || type == "video" ||
+         type == "document";
+}
+
+void readGeminiInteractions(const nlohmann::json& json, RequestAttributes& attrs) {
+  readCommon(json, attrs);
+  if (const nlohmann::json* config = readObject(json, Keys::GenerationConfigSnake, attrs.malformed,
+                                                NullPolicy::AllowNullAsAbsent);
+      config != nullptr) {
+    attrs.max_output_tokens = readLimit(*config, Keys::MaxOutputTokens, attrs.malformed);
+  }
+  // A list of steps is the conversation. A string, a content item or a list of content items is
+  // one user turn.
+  if (const auto input = json.find(Keys::Input); input != json.end() && !input->is_null()) {
+    if (input->is_array() && (input->empty() || !isInteractionsContent(input->front()))) {
+      attrs.message_count = readArrayLength(json, Keys::Input, attrs.malformed);
+    } else {
+      attrs.message_count = 1;
+    }
+  }
+  attrs.tool_count = readArrayLength(json, Keys::Tools, attrs.malformed);
+}
+
 } // namespace
 
 RequestAttributes extractRequestAttributes(LLMProtocol protocol, const nlohmann::json& json,
@@ -141,6 +167,9 @@ RequestAttributes extractRequestAttributes(LLMProtocol protocol, const nlohmann:
     break;
   case LLMProtocol::GeminiGenerateContent:
     readGeminiGenerateContent(json, path, attrs);
+    break;
+  case LLMProtocol::GeminiInteractions:
+    readGeminiInteractions(json, attrs);
     break;
   case LLMProtocol::Unspecified:
     readCommon(json, attrs);

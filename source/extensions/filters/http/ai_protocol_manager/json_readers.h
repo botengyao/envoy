@@ -115,6 +115,13 @@ constexpr absl::string_view Messages = "messages";
 constexpr absl::string_view Input = "input";
 constexpr absl::string_view Contents = "contents";
 constexpr absl::string_view Tools = "tools";
+constexpr absl::string_view EventType = "event_type";
+constexpr absl::string_view Interaction = "interaction";
+constexpr absl::string_view TotalInputTokens = "total_input_tokens";
+constexpr absl::string_view TotalOutputTokens = "total_output_tokens";
+constexpr absl::string_view TotalThoughtTokens = "total_thought_tokens";
+constexpr absl::string_view TotalCachedTokens = "total_cached_tokens";
+constexpr absl::string_view TotalToolUseTokens = "total_tool_use_tokens";
 } // namespace Keys
 
 } // namespace AiProtocolManager

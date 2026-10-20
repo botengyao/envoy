@@ -25,6 +25,8 @@ inline LLMProtocol protocolFromProto(envoy::type::ai::v3::LLMProtocol protocol) 
     return LLMProtocol::AnthropicMessages;
   case envoy::type::ai::v3::GEMINI_GENERATE_CONTENT:
     return LLMProtocol::GeminiGenerateContent;
+  case envoy::type::ai::v3::GEMINI_INTERACTIONS:
+    return LLMProtocol::GeminiInteractions;
   }
   PANIC_DUE_TO_CORRUPT_ENUM;
 }
@@ -39,6 +41,8 @@ inline envoy::type::ai::v3::LLMProtocol protocolToProto(LLMProtocol protocol) {
     return envoy::type::ai::v3::ANTHROPIC_MESSAGES;
   case LLMProtocol::GeminiGenerateContent:
     return envoy::type::ai::v3::GEMINI_GENERATE_CONTENT;
+  case LLMProtocol::GeminiInteractions:
+    return envoy::type::ai::v3::GEMINI_INTERACTIONS;
   case LLMProtocol::Unspecified:
     break;
   }
