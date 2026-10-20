@@ -14,8 +14,8 @@ request carries. This design does four things:
 1. It extends the IR so Interactions converts into it and back without loss.
 2. It adds Gemini Interactions as an API Envoy knows.
 3. It runs schema validation first.
-4. It makes the flow work behind a dynamic forward proxy (DFP), where the API is detected per
-   request.
+4. It makes the flow work behind a dynamic forward proxy (DFP) with a single `*` route: the AI
+   Protocol Manager recognizes AI calls, and their API, from the request itself.
 
 The first release serves Gemini models, not agents, and lets the gateway change the model name.
 
@@ -146,7 +146,10 @@ To know whether a filter reads the IR, filters declare it, the way they declare 
 apply today (`AiFilter::bindingUse()`). Until then, the transcoder pair always converts, which is
 correct once the IR loses nothing.
 
-## The flow behind a DFP
+## Recognizing AI calls behind a DFP
+
+Behind a DFP, a single `*` route takes all traffic, and nothing on it says which requests are AI
+calls. So the AI Protocol Manager decides per request, from the request itself.
 
 ```mermaid
 sequenceDiagram
@@ -154,42 +157,90 @@ sequenceDiagram
     participant E as Envoy
     participant G as Gemini API
     C->>E: POST /v1beta/interactions
-    Note over E: The route says Interactions and pins the model.<br/>The DFP resolves the host from :authority.
-    Note over E: Cluster filters, in order:<br/>1. schema validation checks the Interactions request<br/>2. transcoder: Interactions to IR<br/>3. request info reads the IR<br/>4. transcoder: IR to Interactions, with the gateway's model
+    Note over E: One * route to the DFP cluster.<br/>The DFP resolves the host from :authority.
+    Note over E: The AI Protocol Manager recognizes Gemini Interactions:<br/>a POST with a JSON body, to a path ending in /interactions
+    Note over E: Cluster filters, in order:<br/>1. schema validation checks the Interactions request<br/>2. transcoder: Interactions to IR<br/>3. request info reads the IR<br/>4. transcoder: IR to Interactions
     E->>G: POST /v1beta/interactions
     G->>E: Interactions response
-    Note over E: 4. transcoder: Interactions to IR, usage recorded<br/>2. transcoder: IR to Interactions, with the client's model
+    Note over E: 4. transcoder: Interactions to IR, usage recorded<br/>2. transcoder: IR to Interactions
     E->>C: Interactions response
 ```
 
-Behind a DFP, one route can take any AI API, so the API is detected per request. Two things are
-missing on main today:
+### Which requests are AI calls
 
-- **The transcoder ignores the detected API.** Schema validation records what it detects in
-  `AiRequest::protocol()`. The transcoder reads the route's or the filter state's API instead,
-  which on a catch-all route is unset.
-- **The backend API has no default.** With no backend API declared, the backend-side transcoder
-  fails. Behind a DFP, the host serves the client's API, so the client's API should be the default.
+A request runs the AI filters when one of these holds, in this order:
+
+1. The route declares an API in its AI config, as today.
+2. A filter ahead names the API in `envoy.ai.llm_protocol.request`. Today this counts only on a
+   route that declares `request`.
+3. The AI Protocol Manager recognizes it. The request must be a `POST` with a JSON body, and its
+   path must be one a listed API uses.
+
+Each API is recognized by how its path ends, so gateway prefixes still match:
+
+| API | Path ends with |
+|---|---|
+| `GEMINI_INTERACTIONS` | `/interactions`: `/v1beta/interactions`, `/v1/interactions`, and Vertex AI's `.../locations/global/interactions` |
+| `GEMINI_GENERATE_CONTENT` | `:generateContent` or `:streamGenerateContent` |
+| `OPENAI_CHAT_COMPLETIONS` | `/chat/completions` |
+| `ANTHROPIC_MESSAGES` | `/v1/messages`, or Vertex AI's `.../publishers/anthropic/models/{model}:rawPredict` and `:streamRawPredict` |
+
+These come from schema validation's path detection and the transcoder's built-in bindings, such
+as Claude on Vertex AI's. The table moves into the AI Protocol Manager, which needs the API before
+it decides to hold the body.
+
+Everything else passes untouched, and is neither held nor parsed:
+
+- a get or a delete, which has no body;
+- a cancel, whose path ends in `/cancel`;
+- a file upload, which is not JSON;
+- a call of an API that is not listed.
+
+### What the recognized API decides
+
+- **The client's API.** The recognized API is the client's API for every AI filter.
+- **The backend's API.** It defaults to the client's, since behind a DFP the host serves the API
+  the client called. A filter ahead can still name another with `envoy.ai.llm_protocol.response`.
+  Today, a route that declares no backend API makes the backend-side transcoder fail.
+- **Access logs.** The AI Protocol Manager records the API in `envoy.ai.llm_protocol.request`.
+- **Responses.** Responses of recognized calls are converted and metered, as on a declared route.
+
+### Why the APIs are listed
+
+Listing an API sends all of its calls through the transcoders. Until an API converts to the IR and
+back without loss, that would change its traffic: today's IR drops Anthropic thinking and tool-use
+blocks from responses, for example. Chat Completions is safe to list, since it is the IR's shape.
+Gemini Interactions is safe once its conversion lands.
+
+### By the payload, later
+
+A path that names no listed API, such as a gateway's own `/llm`, could still be recognized by its
+payload. The AI Protocol Manager would hold a JSON `POST`, parse it, and look for the markers
+schema validation uses today. A payload that names no API is forwarded as received. This holds
+every JSON `POST`, so it is an option, off by default.
 
 ## Schema validation
 
 | Check | Where | Against |
 |---|---|---|
-| The client's request | The schema validation filter, first in the chain. Behind a DFP, it also names the API, from the path and then the payload. | The client's API |
+| The client's request | The schema validation filter, first in the chain | The client's API, as recognized |
 | The IR | Tests: every golden IR document | The IR schema: Chat Completions, plus `_envoy` |
 | The backend's request | The backend-side transcoder, before sending; it does this today | The backend's API |
 
-Schema validation runs first for two reasons. It checks what the client sent, which the
-conversion replaces. And behind a DFP, the transcoder needs the API it detects.
+Schema validation runs first because it checks what the client sent, which the conversion
+replaces. Naming the API moves out of it, into the AI Protocol Manager, so schema validation only
+validates.
 
 ## Examples
 
 ### 1. Same API, new model
 
 The client sends the Interactions request shown in [The IR](#the-ir) to
-`generativelanguage.googleapis.com`, and the route pins `gemini-3-flash-preview`:
+`generativelanguage.googleapis.com`. A filter ahead, such as ext_proc or a model router, sets
+`envoy.ai.model.resolved` to `gemini-3-flash-preview`:
 
-- Schema validation passes it.
+- The AI Protocol Manager recognizes Gemini Interactions from the method, the body and the path.
+- Schema validation passes the request.
 - The client-side transcoder converts it to the IR.
 - Request info reads `assistant-default` from the IR.
 - The backend-side transcoder rebuilds the Interactions request with
@@ -219,14 +270,17 @@ filters declare IR use. The request goes out as it came in, with the gateway's m
 
 ### 4. Get, delete and cancel
 
-These requests carry no AI config. A get returns a stored interaction, which can carry the usage
-of the request that created it, so a configured route would count that usage twice.
+The AI Protocol Manager does not recognize these: a get or a delete has no body, and a cancel's
+path ends in `/cancel`. They are forwarded without AI processing. A get returns a stored
+interaction, which can carry the usage of the request that created it, so that usage is not
+counted twice.
 
 ## Configuration
 
-`GEMINI_INTERACTIONS` does not exist yet, and both AI routes rely on the two DFP changes above.
-With `GEMINI_GENERATE_CONTENT` in its place and the CA path adjusted, this file passes
-`envoy --mode validate` on a build of `d5eb7030ad`.
+One route sends everything to the DFP cluster, and the AI Protocol Manager on the cluster decides
+what is an AI call. `endpoint_recognition` and `GEMINI_INTERACTIONS` are proposed. With the first
+removed, the second replaced by `GEMINI_GENERATE_CONTENT`, and the CA path adjusted, this file
+passes `envoy --mode validate` on a build of `d5eb7030ad`.
 
 ```yaml
 static_resources:
@@ -243,48 +297,14 @@ static_resources:
           route_config:
             name: egress
             virtual_hosts:
-            # Gemini: Interactions calls get the model the gateway picks.
-            - name: gemini
-              domains: [generativelanguage.googleapis.com]
-              routes:
-              - match:
-                  safe_regex: {regex: "/v1(beta)?/interactions"}
-                  headers: [{name: ":method", string_match: {exact: POST}}]
-                route: {cluster: dfp, timeout: 300s}
-                request_headers_to_remove: [accept-encoding]
-                typed_per_filter_config:
-                  envoy.filters.http.ai_protocol_manager:
-                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
-                    request: {llm_protocol: GEMINI_INTERACTIONS}
-                  envoy.filters.http.set_filter_state:
-                    "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
-                    on_request_headers:
-                    - object_key: envoy.ai.model.resolved
-                      format_string:
-                        text_format_source: {inline_string: gemini-3-flash-preview}
-              # Get, delete, cancel and anything else: plain forwarding, no AI config.
-              - match: {prefix: /}
-                route: {cluster: dfp, timeout: 300s}
-            # Any other AI provider: schema validation names the API from the path.
-            - name: any
+            - name: egress
               domains: ["*"]
               routes:
-              - match:
-                  safe_regex: {regex: ".*/(interactions|chat/completions|messages)"}
-                  headers: [{name: ":method", string_match: {exact: POST}}]
-                route: {cluster: dfp, timeout: 300s}
-                request_headers_to_remove: [accept-encoding]
-                typed_per_filter_config:
-                  envoy.filters.http.ai_protocol_manager:
-                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
-                    request: {}
+              # The only route. The AI Protocol Manager decides what is an AI call.
               - match: {prefix: /}
                 route: {cluster: dfp, timeout: 300s}
+                request_headers_to_remove: [accept-encoding]
           http_filters:
-          # Sets filter state only where a route configures it.
-          - name: envoy.filters.http.set_filter_state
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
           - name: envoy.filters.http.dynamic_forward_proxy
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -320,11 +340,14 @@ static_resources:
         - name: envoy.filters.http.ai_protocol_manager
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-            request_handling: {}
+            request_handling:
+              # New: recognize AI calls of these APIs by method, content type and path.
+              endpoint_recognition:
+                llm_protocols: [GEMINI_INTERACTIONS, OPENAI_CHAT_COMPLETIONS]
             response_handling:
               token_usage: {}
             filters:
-            # 1. Checks the request in the client's own API, and names the API.
+            # 1. Checks the request in the client's own API.
             - name: envoy.http.ai_filters.schema_validation
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
@@ -338,7 +361,7 @@ static_resources:
             - name: envoy.http.ai_filters.request_info
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
-            # 4. The IR to the backend's API, with the gateway's model; on the way back, to the IR.
+            # 4. The IR to the backend's API; on the way back, to the IR.
             - name: envoy.http.ai_filters.transcoder
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
@@ -350,37 +373,44 @@ static_resources:
 ```
 
 - Clients send plain HTTP with the provider's host, as through an egress sidecar. The DFP resolves
-  the host and Envoy originates TLS (`auto_sni`, `auto_san_validation`). Clients bring their own
+  the host, and Envoy originates TLS (`auto_sni`, `auto_san_validation`). Clients bring their own
   provider keys.
-- The Gemini route names its API and pins the model; the catch-all route leaves the API to
-  schema validation. Neither declares a backend API, which then defaults to the client's.
-- `accept-encoding` is removed because Envoy can neither read nor convert a compressed response.
+- `accept-encoding` is removed on the route, so for all traffic, because Envoy can neither read nor
+  convert a compressed response.
+- To have the gateway pick the model, a filter ahead sets `envoy.ai.model.resolved`: ext_proc or a
+  model router, for example. A virtual host for one provider's host can also set it with
+  `set_filter_state`.
 
 ## Changes
 
 | PR | Change |
 |---|---|
-| 1. `ai_protocol_manager: add the Gemini Interactions protocol` | `GEMINI_INTERACTIONS = 5`; the Interactions request schema; usage from unary and streamed responses (output plus thought tokens, read at `interaction.completed`); detection by the path suffix `/interactions`, with a fix for bodies read today as `generateContent`; request info's Interactions reader |
-| 2. `transcoder: follow the detected API behind a DFP` | The transcoder takes the client's API from `AiRequest::protocol()`, and the backend API defaults to the client's |
+| 1. `ai_protocol_manager: add the Gemini Interactions protocol` | `GEMINI_INTERACTIONS = 5`; the Interactions request schema; usage from unary and streamed responses (output plus thought tokens, read at `interaction.completed`); the path suffix `/interactions` in schema validation's detection, and a fix for bodies it reads today as `generateContent`; request info's Interactions reader |
+| 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when its route declares an API, when `envoy.ai.llm_protocol.request` names one, or when recognition does. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API is recorded in `envoy.ai.llm_protocol.request`. |
 | 3. `ai_protocol_manager: carry what the IR has no field for` | The `_envoy` member: engine rules that move unmapped members into `_envoy.<API>` and back; the AI Protocol Manager removes `_envoy` before sending; the IR schema accepts it |
 | 4. `ai_protocol_manager: transcode Gemini Interactions to and from the IR` | Request, response and stream, in both directions: text, instructions, generation settings and thoughts; everything else in `_envoy`; the gateway's model on the way out and the client's on the way back |
 | 5. `request_info: read the IR` | One reader for every API, between the transcoders, in place of today's per-API readers |
 
-PR 1 stands alone. PRs 3 and 4 are the IR work, and PR 5 depends on them. Later: skipping the
-conversion when nothing reads the IR; the Anthropic and Gemini conversions carrying thoughts and
-unmapped members the same way; tools; media.
+PR 1 stands alone, and PR 2 makes the single DFP route work. PRs 3 and 4 are the IR work, and
+PR 5 depends on them. Later: recognition by payload; skipping the conversion when nothing reads the
+IR; the Anthropic and Gemini conversions carrying thoughts and unmapped members the same way;
+tools; media.
 
 Tests come with each PR. They include round-trip goldens: every Interactions request, response
 and stream event goes into the IR and back unchanged, and every golden IR document passes the IR
-schema.
+schema. PR 2's integration test runs the single route: an Interactions call is converted and
+metered, while a get, a cancel and a file upload pass untouched.
 
 ## Limits of the first release
 
-- **Agents.** An `agent` request is carried through. On a route that sets a model, it is refused,
+- **Agents.** An `agent` request is carried through. When a model is set for it, it is refused,
   because it would then name both a model and an agent.
 - **Tools and media.** Same-API requests carry them, held in `_envoy`, but they are not converted
   to other APIs yet.
-- **Get, delete and cancel.** These calls are forwarded without AI processing or usage records.
+- **Recognition is by path.** A call on a gateway path that names no API is not an AI call until
+  recognition by payload exists.
+- **Get, delete and cancel.** These calls are not recognized, and are forwarded without AI
+  processing or usage records.
 
 ## Decisions
 
@@ -396,6 +426,10 @@ schema.
    transcoder pair always convert?
 3. **State-bound fields.** Should a cross-API request carrying `previous_interaction_id` or `agent`
    be refused? Doing so needs a refuse rule in the engine.
+4. **Which APIs recognition takes.** This design lists them in the config. Should every API whose
+   conversion loses nothing be recognized by default instead?
+5. **`accept-encoding`.** Should the AI Protocol Manager remove it only from the calls it takes,
+   instead of the route removing it from all traffic?
 
 ## References
 
