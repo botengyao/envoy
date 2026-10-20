@@ -1,6 +1,6 @@
 # Gemini Interactions in the AI Protocol Manager
 
-Design only, no code. Base: upstream/main `d7b74bd624` (2026-10-19).
+Design only, no code. Base: upstream/main `e320af5281` (2026-10-19).
 
 ## Summary
 
@@ -168,13 +168,21 @@ sequenceDiagram
 
 ### Which requests are AI calls
 
-A request runs the AI filters when one of these holds, in this order:
+A request runs the AI filters when one of these names its API. When several do, the first wins:
 
-1. The route declares an API in its AI config, as today.
-2. A filter ahead names the API in `envoy.ai.llm_protocol.request`. Today this counts only on a
-   route that declares `request`.
-3. The AI Protocol Manager recognizes it. The request must be a `POST` with a JSON body, and its
-   path must be one a listed API uses.
+1. **Filter state.** A filter ahead, such as ext_proc, `set_filter_state` or a model router, sets
+   `envoy.ai.llm_protocol.request`. Today this counts only on a route that declares `request`;
+   here it counts on any route. A filter ahead can therefore make a call an AI call, or correct
+   the API recognition would pick.
+2. **The route.** The route declares an API in its AI config, as today.
+3. **Recognition.** The AI Protocol Manager recognizes it. The request must be a `POST` with a JSON
+   body, and its path must be one a listed API uses.
+
+The other instructions in filter state apply to every AI call, however it was found:
+
+- `envoy.ai.llm_protocol.response` names the backend's API;
+- `envoy.ai.binding.request` and `envoy.ai.binding.response` name the bindings;
+- `envoy.ai.model.resolved` names the model to send.
 
 Each API is recognized by how its path ends, so gateway prefixes still match:
 
@@ -202,7 +210,8 @@ Everything else passes untouched, and is neither held nor parsed:
 - **The backend's API.** It defaults to the client's, since behind a DFP the host serves the API
   the client called. A filter ahead can still name another with `envoy.ai.llm_protocol.response`.
   Today, a route that declares no backend API makes the backend-side transcoder fail.
-- **Access logs.** The AI Protocol Manager records the API in `envoy.ai.llm_protocol.request`.
+- **Access logs.** The AI Protocol Manager records the API in `envoy.ai.llm_protocol.request`,
+  unless a filter ahead already set it.
 - **Responses.** Responses of recognized calls are converted and metered, as on a declared route.
 
 ### Why the APIs are listed
@@ -386,7 +395,7 @@ static_resources:
 | PR | Change |
 |---|---|
 | 1. `ai_protocol_manager: add the Gemini Interactions protocol` | `GEMINI_INTERACTIONS = 5`; the Interactions request schema; usage from unary and streamed responses (output plus thought tokens, read at `interaction.completed`); the path suffix `/interactions` in schema validation's detection, and a fix for bodies it reads today as `generateContent`; request info's Interactions reader |
-| 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when its route declares an API, when `envoy.ai.llm_protocol.request` names one, or when recognition does. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API is recorded in `envoy.ai.llm_protocol.request`. |
+| 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when `envoy.ai.llm_protocol.request` names its API, on any route; when its route declares one; or when recognition does. The first of these wins. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API is recorded in `envoy.ai.llm_protocol.request`. |
 | 3. `ai_protocol_manager: carry what the IR has no field for` | The `_envoy` member: engine rules that move unmapped members into `_envoy.<API>` and back; the AI Protocol Manager removes `_envoy` before sending; the IR schema accepts it |
 | 4. `ai_protocol_manager: transcode Gemini Interactions to and from the IR` | Request, response and stream, in both directions: text, instructions, generation settings and thoughts; everything else in `_envoy`; the gateway's model on the way out and the client's on the way back |
 | 5. `request_info: read the IR` | One reader for every API, between the transcoders, in place of today's per-API readers |
