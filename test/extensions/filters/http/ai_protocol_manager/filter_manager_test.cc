@@ -7,8 +7,10 @@
 #include "source/common/coroutine/dispatcher_executor.h"
 #include "source/common/coroutine/launch.h"
 #include "source/common/coroutine/status_macros.h"
+#include "source/common/router/string_accessor_impl.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_request.h"
 #include "source/extensions/filters/http/ai_protocol_manager/buffer_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
@@ -768,6 +770,57 @@ TEST_F(FilterManagerReserializationTest, DisabledDoesNotSendFilterEdits) {
   ASSERT_OK(run(std::make_unique<TestMutationFilter>("gpt-4-turbo"), /*always_serialize=*/false));
 
   EXPECT_EQ(bridge_.injected_.toString(), kReceived);
+}
+
+// Applies a binding, as a transcoder does, and leaves the body alone.
+class BindingFilter : public ReadOnlyFilter {
+public:
+  BindingUse bindingUse() const override { return {.response = true}; }
+};
+
+class FilterManagerResolvedModelTest : public FilterManagerReserializationTest {
+public:
+  FilterManagerResolvedModelTest() {
+    stream_info_.filterState()->setData(
+        FilterStateKeys::ModelResolved,
+        std::make_shared<Router::StringAccessorImpl>("gemini-3-flash-preview"));
+  }
+
+  nlohmann::json sent() { return nlohmann::json::parse(bridge_.injected_.toString()); }
+};
+
+TEST_F(FilterManagerResolvedModelTest, ReplacesTheModelTheBodyNames) {
+  ASSERT_OK(run(std::make_unique<ReadOnlyFilter>(), /*always_serialize=*/true));
+
+  EXPECT_EQ(sent()["model"], "gemini-3-flash-preview");
+  EXPECT_EQ(sent()["a"], 2.5);
+  EXPECT_EQ(headers_.getContentLengthValue(), absl::StrCat(bridge_.injected_.length()));
+}
+
+TEST_F(FilterManagerResolvedModelTest, NeedsTheBodyReserialized) {
+  ASSERT_OK(run(std::make_unique<ReadOnlyFilter>(), /*always_serialize=*/false));
+
+  EXPECT_EQ(bridge_.injected_.toString(), kReceived);
+}
+
+TEST_F(FilterManagerResolvedModelTest, LeavesTheModelToATranscoder) {
+  ASSERT_OK(run(std::make_unique<BindingFilter>(), /*always_serialize=*/true));
+
+  EXPECT_EQ(sent()["model"], "gpt-4");
+}
+
+TEST_F(FilterManagerResolvedModelTest, AddsNoModelToABodyWithout) {
+  JsonWithExtBuf doc;
+  doc.setJson(nlohmann::json{{"contents", nlohmann::json::array()}});
+  std::vector<AiFilterSharedPtr> filters;
+  FilterManager manager(std::move(filters));
+  absl::Status status = absl::UnknownError("request did not complete");
+  manager.startRequest(std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
+                       [&status](absl::Status s) { status = std::move(s); });
+  drain();
+  ASSERT_OK(status);
+
+  EXPECT_FALSE(sent().contains("model"));
 }
 
 TEST_F(FilterManagerTest, DoesNotSetContentLengthWhenNotPreviouslyPresent) {

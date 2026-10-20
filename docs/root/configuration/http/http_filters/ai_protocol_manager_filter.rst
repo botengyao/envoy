@@ -440,7 +440,13 @@ independent, and a key that is not set leaves today's behavior in place.
 ``envoy.ai.model.resolved``
   The model to send upstream in place of the one the client asked for. It reaches the body and
   the rendered path alike. The response still reports the model the client asked for; which
-  backend served it stays with the gateway.
+  backend served it stays with the gateway. A request that no transcoder handles, because the
+  backend takes the client's API, needs none to change its model: the AI Protocol Manager writes
+  the model into the ``model`` the body names when it re-serializes the body
+  (:ref:`reserialize_body
+  <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestHandling.reserialize_body>`
+  ``ALWAYS``). Such a response reports the model that served it, and an API that names its model
+  in the path, such as Gemini's ``generateContent``, needs the transcoder's binding.
 
 A route declares its bindings beside each ``llm_protocol``, in :ref:`request.binding
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.binding>` and

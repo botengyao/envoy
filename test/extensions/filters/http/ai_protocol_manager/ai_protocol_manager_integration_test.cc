@@ -1,14 +1,21 @@
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "envoy/data/ai/v3/token_usage.pb.h"
+#include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/extensions/filters/http/ext_proc/v3/ext_proc.pb.h"
 #include "envoy/service/ext_proc/v3/external_processor.pb.h"
+#include "envoy/type/ai/v3/llm_protocol.pb.h"
 
 #include "test/extensions/filters/http/ext_proc/test_processor.h"
 #include "test/integration/http_protocol_integration.h"
 #include "test/test_common/simulated_time_system.h"
 
+#include "absl/strings/str_split.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/notification.h"
+#include "nlohmann/json.hpp"
 
 namespace Envoy {
 namespace {
@@ -603,6 +610,108 @@ typed_config:
   // occupied namespace and skips instead of writing a second record.
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_found"), 1);
   EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_duplicate"), 1);
+}
+
+// A backend that takes the client's API needs no transcoder to change the model: the instance in
+// front of it writes the model a downstream filter resolved into the body it re-serializes.
+class AiProtocolManagerResolvedModelIntegrationTest
+    : public AiProtocolManagerResponseIntegrationTest {
+protected:
+  // Each event's name and payload, parsed when it is JSON. The response pipeline re-renders an
+  // event's JSON canonically, so the client gets the events' content, not their bytes.
+  static std::vector<std::pair<std::string, nlohmann::json>> sseEvents(absl::string_view stream) {
+    std::vector<std::pair<std::string, nlohmann::json>> events;
+    for (absl::string_view frame : absl::StrSplit(stream, "\n\n", absl::SkipEmpty())) {
+      auto& [name, data] = events.emplace_back();
+      for (absl::string_view line : absl::StrSplit(frame, '\n')) {
+        if (absl::ConsumePrefix(&line, "event: ")) {
+          name = std::string(line);
+        } else if (absl::ConsumePrefix(&line, "data: ")) {
+          data = nlohmann::json::accept(line) ? nlohmann::json::parse(line)
+                                              : nlohmann::json(std::string(line));
+        }
+      }
+    }
+    return events;
+  }
+
+  void initializeForInteractions() {
+    config_helper_.addConfigModifier([](ConfigHelper::HttpConnectionManager& hcm) {
+      envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
+          per_route;
+      per_route.mutable_request()->set_llm_protocol(envoy::type::ai::v3::GEMINI_INTERACTIONS);
+      per_route.mutable_response()->set_llm_protocol(envoy::type::ai::v3::GEMINI_INTERACTIONS);
+      auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+      std::ignore =
+          (*route->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
+              .PackFrom(per_route);
+    });
+    config_helper_.prependFilter(R"EOF(
+name: envoy.filters.http.ai_protocol_manager
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling:
+    reserialize_body: ALWAYS
+  response_handling:
+    token_usage: {}
+)EOF",
+                                 /*downstream=*/false);
+    config_helper_.prependFilter(R"EOF(
+name: envoy.filters.http.set_filter_state
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+  on_request_headers:
+  - object_key: envoy.ai.model.resolved
+    format_string:
+      text_format_source:
+        inline_string: gemini-3-flash-preview
+)EOF");
+    initialize();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(Protocols, AiProtocolManagerResolvedModelIntegrationTest,
+                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
+                         HttpProtocolIntegrationTest::protocolTestParamsToString);
+
+TEST_P(AiProtocolManagerResolvedModelIntegrationTest, UpstreamInstanceSendsTheResolvedModel) {
+  initializeForInteractions();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/v1beta/interactions"},
+                                     {":scheme", "http"},
+                                     {":authority", "sni.lyft.com"},
+                                     {"content-type", "application/json"}},
+      R"({"model":"gemini-flash-latest","input":"Hi","stream":true})");
+  waitForNextUpstreamRequest();
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_EQ(
+      nlohmann::json::parse(upstream_request_->body().toString()),
+      nlohmann::json::parse(R"({"model":"gemini-3-flash-preview","input":"Hi","stream":true})"));
+
+  const std::string events =
+      "event: interaction.created\n"
+      "data: {\"event_type\":\"interaction.created\",\"interaction\":{\"id\":\"v1_1\","
+      "\"model\":\"gemini-3-flash-preview\",\"status\":\"in_progress\"}}\n\n"
+      "event: step.delta\n"
+      "data: {\"event_type\":\"step.delta\",\"index\":0,\"delta\":{\"type\":\"text\","
+      "\"text\":\"Hello\"}}\n\n"
+      "event: interaction.completed\n"
+      "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"v1_1\","
+      "\"model\":\"gemini-3-flash-preview\",\"status\":\"completed\",\"usage\":{"
+      "\"total_input_tokens\":7,\"total_output_tokens\":20,\"total_thought_tokens\":22,"
+      "\"total_tokens\":49}}}\n\n"
+      "event: done\n"
+      "data: [DONE]\n\n";
+  upstream_request_->encodeHeaders(responseHeaders("text/event-stream"), false);
+  upstream_request_->encodeData(events, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ(sseEvents(events), sseEvents(response->body()));
+  EXPECT_EQ(sumCounters("ai_protocol_manager.token_usage_found"), 1);
 }
 
 // Hedged requests: two upstream attempts are in flight concurrently, each

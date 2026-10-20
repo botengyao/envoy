@@ -6,10 +6,14 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/coroutine/status_macros.h"
+#include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_pipeline.h"
+#include "source/extensions/filters/http/ai_protocol_manager/json_readers.h"
 #include "source/extensions/filters/http/ai_protocol_manager/replay_awaitable.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 #include "source/extensions/filters/http/ai_protocol_manager/task_group.h"
+
+#include "absl/algorithm/container.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -159,6 +163,7 @@ private:
     ASSERT(final_req_ != nullptr);
 
     if (always_serialize_) {
+      applyResolvedModel(final_req_->json());
       CO_RETURN_IF_ERROR(co_await serializeFinalRequest());
     } else {
       CO_RETURN_IF_ERROR(co_await forwardReceivedBody());
@@ -182,6 +187,25 @@ private:
                         co_await Serializer::serialize(final_req_->request_index(), buffer_manager_,
                                                        buffer_manager_));
     co_return absl::OkStatus();
+  }
+
+  // A request no AI filter transcodes keeps its API, so the resolved model goes into the `model` it
+  // names. A chain with a transcoder, the AI filter that applies bindings, leaves the model to its
+  // `FROM_IR` leg, which writes it in the body or in the path its binding renders.
+  void applyResolvedModel(nlohmann::json& json) {
+    if (stream_info_.filterState() == nullptr ||
+        absl::c_any_of(filters_, [](const AiFilterSharedPtr& filter) {
+          const BindingUse use = filter->bindingUse();
+          return use.request || use.response;
+        })) {
+      return;
+    }
+    const std::optional<absl::string_view> resolved =
+        stringFromFilterState(*stream_info_.filterState(), FilterStateKeys::ModelResolved);
+    const auto model = json.find(Keys::Model);
+    if (resolved.has_value() && model != json.end() && model->is_string()) {
+      *model = std::string(*resolved);
+    }
   }
 
   // The request's own index already locates its external references in the received body.

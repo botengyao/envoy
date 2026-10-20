@@ -141,8 +141,9 @@ The following lists the filter state object keys used by the Envoy extensions to
 
 ``envoy.ai.model.resolved``
   The model the transcoder sends upstream in place of the one the request names, in the body and
-  in the rendered path alike. Accepts a non-empty model name as a constructor, e.g.
-  "gemini-2.5-flash".
+  in the rendered path alike. Without a transcoder, the AI Protocol Manager writes it into the
+  body's ``model`` when it re-serializes the body. Accepts a non-empty model name as a
+  constructor, e.g. "gemini-2.5-flash".
 
 ``envoy.network.network_namespace``
   Contains the value of the downstream connection's Linux network namespace if it differs from the default.
