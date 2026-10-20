@@ -190,6 +190,7 @@ envoy_cc_library(
         "//source/common/common:macros",
         "//source/extensions/filters/http/ai_protocol_manager/schema:anthropic_messages_lib",
         "//source/extensions/filters/http/ai_protocol_manager/schema:gemini_generate_content_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/schema:gemini_interactions_lib",
         "//source/extensions/filters/http/ai_protocol_manager/schema:openai_chat_completions_lib",
         "@abseil-cpp//absl/strings",
     ],

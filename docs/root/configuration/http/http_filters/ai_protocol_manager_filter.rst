@@ -199,8 +199,8 @@ Schema validation
 The :ref:`schema validation filter
 <envoy_v3_api_msg_extensions.http.ai_filters.schema_validation.v3.SchemaValidation>`
 validates the payload against the payload schema of its wire API, for APIs with
-a defined schema (currently ``OPENAI_CHAT_COMPLETIONS``, ``ANTHROPIC_MESSAGES``
-and ``GEMINI_GENERATE_CONTENT``). Validation checks required fields, data
+a defined schema (currently ``OPENAI_CHAT_COMPLETIONS``, ``ANTHROPIC_MESSAGES``,
+``GEMINI_GENERATE_CONTENT`` and ``GEMINI_INTERACTIONS``). Validation checks required fields, data
 types, enum values, and offload rules -- metadata fields such as ``model`` and
 ``role`` must stay inline, while large message content may reside in the
 external buffer. A payload that fails is rejected with a 400, or forwarded

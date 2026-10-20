@@ -20,6 +20,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "gemini_interactions_lib",
+    srcs = ["gemini_interactions.cc"],
+    hdrs = ["gemini_interactions.h"],
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:schema_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "openai_chat_completions_lib",
     srcs = ["openai_chat_completions.cc"],
     hdrs = ["openai_chat_completions.h"],

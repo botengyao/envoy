@@ -905,14 +905,14 @@ TEST(RenderUsageTest, NativeUsageRoundTripsThroughTheCanonicalContract) {
 // Adapter registry.
 
 TEST(AdapterRegistryTest, SchemaLookup) {
-  // Chat Completions, Anthropic Messages, and Gemini generateContent carry defined payload
-  // schemas; APIs without one are not validated.
+  // Chat Completions, Anthropic Messages, Gemini generateContent, and Gemini Interactions carry
+  // defined payload schemas; APIs without one are not validated.
   EXPECT_NE(AdapterRegistry::get(LLMProtocol::OpenAiChatCompletions).schema(), nullptr);
   EXPECT_NE(AdapterRegistry::get(LLMProtocol::AnthropicMessages).schema(), nullptr);
   EXPECT_NE(AdapterRegistry::get(LLMProtocol::GeminiGenerateContent).schema(), nullptr);
+  EXPECT_NE(AdapterRegistry::get(LLMProtocol::GeminiInteractions).schema(), nullptr);
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::Unspecified).schema(), nullptr);
   EXPECT_EQ(AdapterRegistry::get(LLMProtocol::OpenAiResponses).schema(), nullptr);
-  EXPECT_EQ(AdapterRegistry::get(LLMProtocol::GeminiInteractions).schema(), nullptr);
 }
 
 // The schema is a construct-on-first-use singleton, so every lookup must hand back the same
@@ -936,7 +936,8 @@ TEST(AdapterRegistryTest, AllDeclaredOffloadableFieldsInStreamOrder) {
   // streamable field order.
   for (const LLMProtocol protocol :
        {LLMProtocol::OpenAiChatCompletions, LLMProtocol::OpenAiResponses,
-        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent}) {
+        LLMProtocol::AnthropicMessages, LLMProtocol::GeminiGenerateContent,
+        LLMProtocol::GeminiInteractions}) {
     const PayloadSchema* schema = AdapterRegistry::get(protocol).schema();
     if (schema == nullptr) {
       continue;

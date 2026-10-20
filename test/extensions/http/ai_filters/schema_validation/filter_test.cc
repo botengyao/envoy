@@ -178,6 +178,26 @@ TEST_F(SchemaValidationFilterTest, FailOpenForwardsAnInvalidPayload) {
   EXPECT_EQ(counterValue("valid"), 0);
 }
 
+TEST_F(SchemaValidationFilterTest, ValidatesGeminiInteractions) {
+  constexpr absl::string_view payload =
+      R"({"model":"gemini-3-flash-preview",)"
+      R"("input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}]})";
+  run(payload, LLMProtocol::Unspecified, "/v1beta/interactions");
+  expectForwarded();
+  EXPECT_EQ(nlohmann::json::parse(bridge_.injected_.toString()), nlohmann::json::parse(payload));
+  EXPECT_EQ(seen_protocol_, LLMProtocol::GeminiInteractions);
+  EXPECT_EQ(counterValue("llm_protocol_detected"), 1);
+  EXPECT_EQ(counterValue("valid"), 1);
+  EXPECT_EQ(counterValue("skipped"), 0);
+}
+
+// An Interactions request names a model or an agent, not both.
+TEST_F(SchemaValidationFilterTest, RejectsGeminiInteractionsNamingModelAndAgent) {
+  run(R"({"model":"gemini-3-flash-preview","agent":"deep-research-preview-04-2026","input":"hi"})",
+      LLMProtocol::GeminiInteractions, "/v1beta/interactions");
+  expectRejected();
+}
+
 TEST_F(SchemaValidationFilterTest, SkipsAnApiWithoutASchema) {
   run(R"({"model":"gpt-5","input":7})", LLMProtocol::OpenAiResponses, "/v1/responses");
   expectForwarded();

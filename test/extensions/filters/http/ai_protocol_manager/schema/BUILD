@@ -25,6 +25,19 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "gemini_interactions_test",
+    srcs = ["gemini_interactions_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/filters/http/ai_protocol_manager:json_with_ext_buf_lib",
+        "//source/extensions/filters/http/ai_protocol_manager/schema:gemini_interactions_lib",
+        "//test/test_common:status_utility_lib",
+        "@nlohmann_json//:json",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "openai_chat_completions_test",
     srcs = ["openai_chat_completions_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],

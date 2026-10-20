@@ -7,6 +7,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_adapter.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/anthropic_messages.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/gemini_generate_content.h"
+#include "source/extensions/filters/http/ai_protocol_manager/schema/gemini_interactions.h"
 #include "source/extensions/filters/http/ai_protocol_manager/schema/openai_chat_completions.h"
 
 #include "absl/strings/match.h"
@@ -341,7 +342,11 @@ protected:
 class GeminiInteractionsAdapter : public LLMProtocolAdapter {
 public:
   LLMProtocol protocol() const override { return LLMProtocol::GeminiInteractions; }
-  const PayloadSchema* schema() const override { return nullptr; }
+  const PayloadSchema* schema() const override {
+    static const PayloadSchema* interactions_schema =
+        new PayloadSchema(GeminiInteractions::createPayloadSchema());
+    return interactions_schema;
+  }
 
   void canonicalizeUsage(TokenUsage& usage, bool& overflow) const override {
     usage.output_tokens = addCounts(usage.output_tokens, usage.reasoning_tokens, overflow);
