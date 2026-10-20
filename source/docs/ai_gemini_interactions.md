@@ -14,8 +14,9 @@ request carries. This design does four things:
 1. It extends the IR so Interactions converts into it and back without loss.
 2. It adds Gemini Interactions as an API Envoy knows.
 3. It runs schema validation first.
-4. It makes the flow work behind a dynamic forward proxy (DFP) with a single `*` route: the AI
-   Protocol Manager recognizes AI calls, and their API, from the request itself.
+4. It splits the work between two AI Protocol Managers. One, before the router, reads the request
+   and picks the model. The other, in the cluster, converts the request for the backend. Behind a
+   dynamic forward proxy (DFP), the first also recognizes AI calls on a single `*` route.
 
 The first release serves Gemini models, not agents, and lets the gateway change the model name.
 
@@ -150,25 +151,55 @@ To know whether a filter reads the IR, filters declare it, the way they declare 
 apply today (`AiFilter::bindingUse()`). Until then, the transcoder pair always converts, which is
 correct once the IR loses nothing.
 
-## Recognizing AI calls behind a DFP
+## Two AI Protocol Managers
 
-Behind a DFP, a single `*` route takes all traffic, and nothing on it says which requests are AI
-calls. So the AI Protocol Manager decides per request, from the request itself.
+The work splits in two around the router. The model has to be picked before the router, which
+picks the backend from it. The conversion has to happen after, once per attempt, for the host that
+attempt goes to.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant E as Envoy
+    participant D as Before the router
+    participant U as In the cluster
     participant G as Gemini API
-    C->>E: POST /v1beta/interactions
-    Note over E: One * route to the DFP cluster.<br/>The DFP resolves the host from :authority.
-    Note over E: The AI Protocol Manager recognizes Gemini Interactions:<br/>a POST with a JSON body, to a path ending in /interactions
-    Note over E: Cluster filters, in order:<br/>1. schema validation checks the Interactions request<br/>2. transcoder: Interactions to IR<br/>3. request info reads the IR<br/>4. transcoder: IR to Interactions
-    E->>G: POST /v1beta/interactions
-    G->>E: Interactions response
-    Note over E: 4. transcoder: Interactions to IR, usage recorded<br/>2. transcoder: IR to Interactions
-    E->>C: Interactions response
+    C->>D: POST /v1beta/interactions, model "assistant-default"
+    Note over D: AI Protocol Manager 1:<br/>schema validation checks the request<br/>transcoder: to IR, for reading only<br/>request info reads the IR<br/>then a selector sets envoy.ai.model.resolved
+    D->>U: the request as received, plus filter state
+    Note over U: AI Protocol Manager 2, on every attempt:<br/>transcoder: Interactions to IR<br/>transcoder: IR to Interactions, model gemini-3-flash-preview
+    U->>G: POST /v1beta/interactions
+    G->>U: Interactions response
+    Note over U: transcoder pair converts it back, usage recorded
+    U->>C: Interactions response, model "assistant-default"
 ```
+
+| | AI Protocol Manager 1, before the router | AI Protocol Manager 2, in the cluster |
+|---|---|---|
+| Runs | once per request | once per attempt, after the host is picked |
+| AI filters | schema validation; the transcoder, request side, `TO_IR` only; request info. The model selector runs right after them. | the transcoder pair; IR filters such as guardrails go between them |
+| The request body | forwarded as received: `reserialize_body: DISABLE` | converted for the backend |
+| Filter state | writes the API, the client's model and the selector's choices | reads them |
+| The response | not touched | converted back, and its usage recorded |
+
+- **The second follows the first.** The first records the API it found in
+  `envoy.ai.llm_protocol.request`, and the second takes it from there (see [Which requests are AI
+  calls](#which-requests-are-ai-calls)). So the second needs no route config, except where its
+  backend differs from the client's API, such as a Vertex AI path.
+- **The selector.** Today it can be an external service behind ext_proc. It reads the request
+  info and answers in dynamic metadata, which `set_filter_state` copies into
+  `envoy.ai.model.resolved`. Later it can be an AI filter in the first AI Protocol Manager.
+- **Filter names.** When both read route config, give the second its own filter name, e.g.
+  `vertex.ai_protocol_manager`, so each has its own entry in `typed_per_filter_config`.
+- **Two costs, both follow-ups.** The request is parsed twice: the second does not reuse the first's
+  parse yet. And the first has no response role, but today it still parses and rewrites the
+  response of every request it parsed. It should leave a response alone when no AI filter handles
+  it.
+
+## Recognizing AI calls behind a DFP
+
+Behind a DFP, a single `*` route takes all traffic, and nothing on it says which requests are AI
+calls. So the first AI Protocol Manager decides per request, from the request itself, and the
+second follows it.
 
 ### Which requests are AI calls
 
@@ -215,8 +246,9 @@ neither held nor parsed:
 - **The backend's API.** It defaults to the client's, since behind a DFP the host serves the API
   the client called. A filter ahead can still name another with `envoy.ai.llm_protocol.response`.
   Today, a route that declares no backend API makes the backend-side transcoder fail.
-- **Access logs.** The AI Protocol Manager records the API in `envoy.ai.llm_protocol.request`,
-  unless a filter ahead already set it.
+- **The record.** The AI Protocol Manager records the API of every AI call in
+  `envoy.ai.llm_protocol.request`, unless a filter ahead already set it. The second AI Protocol
+  Manager follows that record, and access logs can show it.
 - **Responses.** Responses of recognized calls are converted and metered, as on a declared route.
 
 ### Why the APIs are listed
@@ -238,7 +270,7 @@ every JSON `POST`, so it is an option, off by default.
 
 | Check | Where | Against |
 |---|---|---|
-| The client's request | The schema validation filter, first in the chain | The client's API, as recognized |
+| The client's request | The schema validation filter, first in the first AI Protocol Manager | The client's API, as recognized |
 | The IR | Tests: every golden IR document | The IR schema: Chat Completions, plus `_envoy` |
 | The backend's request | The backend-side transcoder, before sending; it does this today | The backend's API |
 
@@ -252,18 +284,18 @@ header and then the payload, for a route that declares `request` without naming 
 ### 1. Same API, new model
 
 The client sends the Interactions request shown in [The IR](#the-ir) to
-`generativelanguage.googleapis.com`. A filter ahead, such as ext_proc or a model router, sets
-`envoy.ai.model.resolved` to `gemini-3-flash-preview`:
+`generativelanguage.googleapis.com`, through the DFP:
 
-- The AI Protocol Manager recognizes Gemini Interactions from the method, the body and the path.
-- Schema validation passes the request.
-- The client-side transcoder converts it to the IR.
-- Request info reads `assistant-default` from the IR.
-- The backend-side transcoder rebuilds the Interactions request with
-  `"model": "gemini-3-flash-preview"`.
+1. The first AI Protocol Manager recognizes Gemini Interactions from the method, the body and the
+   path. Schema validation passes the request, and request info reads `assistant-default` from the
+   IR. The body goes on as received.
+2. The selector picks `gemini-3-flash-preview`, and `envoy.ai.model.resolved` is set.
+3. The router sends the call to the DFP cluster, for the host the client named.
+4. The second AI Protocol Manager converts the request to the IR and back, with
+   `"model": "gemini-3-flash-preview"`.
 
-Google's response goes back the same way. The client sees `"model": "assistant-default"`, and
-usage is recorded for `gemini-3-flash-preview`.
+Google's response goes back through the second AI Protocol Manager. The client sees
+`"model": "assistant-default"`, and usage is recorded for `gemini-3-flash-preview`.
 
 ### 2. Streaming
 
@@ -293,11 +325,16 @@ counted twice.
 
 ## Configuration
 
-One route sends everything to the DFP cluster, and the AI Protocol Manager on the cluster decides
-what is an AI call. `endpoint_recognition` and `GEMINI_INTERACTIONS` are proposed. With the first
-removed, the second replaced by `GEMINI_GENERATE_CONTENT`, and the CA path adjusted, this file
-passes `envoy --mode validate` on a build of `d5eb7030ad`. The config protos it uses are the same on
-today's main.
+Both examples use proposed pieces: `endpoint_recognition`, `GEMINI_INTERACTIONS`, and the second AI
+Protocol Manager following filter state. With the proposed field removed, `GEMINI_GENERATE_CONTENT`
+in place of the new value, and the CA path adjusted, both pass `envoy --mode validate` on a build of
+`d5eb7030ad`. The config protos they use are the same on today's main.
+
+### A DFP for any provider
+
+One route sends everything to the DFP cluster. The first AI Protocol Manager, in the listener,
+recognizes AI calls and reads them; an external selector picks the model; the second, in the
+cluster, converts.
 
 ```yaml
 static_resources:
@@ -317,11 +354,53 @@ static_resources:
             - name: egress
               domains: ["*"]
               routes:
-              # The only route. The AI Protocol Manager decides what is an AI call.
+              # The only route. The AI Protocol Managers decide what is an AI call.
               - match: {prefix: /}
                 route: {cluster: dfp, timeout: 300s}
                 request_headers_to_remove: [accept-encoding]
           http_filters:
+          # 1. Reads the request and leaves its findings in filter state. The body goes on as
+          #    received.
+          - name: envoy.filters.http.ai_protocol_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+              request_handling:
+                reserialize_body: DISABLE
+                endpoint_recognition:
+                  llm_protocols: [GEMINI_INTERACTIONS, OPENAI_CHAT_COMPLETIONS]
+              filters:
+              - name: envoy.http.ai_filters.schema_validation
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
+              - name: envoy.http.ai_filters.transcoder
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                  request_handling: TO_IR
+              - name: envoy.http.ai_filters.request_info
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
+          # 2. Picks the model. Here an external service does it, from the request info.
+          - name: envoy.filters.http.ext_proc
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+              grpc_service:
+                envoy_grpc: {cluster_name: model_selector}
+              processing_mode:
+                request_header_mode: SEND
+                response_header_mode: SKIP
+              metadata_options:
+                forwarding_namespaces: {typed: [envoy.ai.request_info]}
+                receiving_namespaces: {untyped: [envoy.ai.selection]}
+          - name: envoy.filters.http.set_filter_state
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+              on_request_headers:
+              - object_key: envoy.ai.model.resolved
+                skip_if_empty: true
+                format_string:
+                  omit_empty_values: true
+                  text_format_source: {inline_string: "%DYNAMIC_METADATA(envoy.ai.selection:model)%"}
+          # 3. Routes, to the host the client named.
           - name: envoy.filters.http.dynamic_forward_proxy
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -352,33 +431,153 @@ static_resources:
         auto_config:
           http_protocol_options: {}
           http2_protocol_options: {}
-        # Runs once per attempt, after the host is resolved.
+        # 4. Converts for the backend, on every attempt, following the filter state.
         http_filters:
         - name: envoy.filters.http.ai_protocol_manager
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-            request_handling:
-              # New: recognize AI calls of these APIs by method, content type and path.
-              endpoint_recognition:
-                llm_protocols: [GEMINI_INTERACTIONS, OPENAI_CHAT_COMPLETIONS]
+            request_handling: {}
             response_handling:
               token_usage: {}
             filters:
-            # 1. Checks the request in the client's own API.
-            - name: envoy.http.ai_filters.schema_validation
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
-            # 2. The client's API to the IR; on the way back, the IR to the client's API.
             - name: envoy.http.ai_filters.transcoder
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
                 request_handling: TO_IR
                 response_handling: FROM_IR
-            # 3. Works on the IR.
-            - name: envoy.http.ai_filters.request_info
+            - name: envoy.http.ai_filters.transcoder
               typed_config:
-                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
-            # 4. The IR to the backend's API; on the way back, to the IR.
+                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                request_handling: FROM_IR
+                response_handling: TO_IR
+        - name: envoy.filters.http.upstream_codec
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
+
+  - name: model_selector
+    type: STATIC
+    load_assignment:
+      cluster_name: model_selector
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: {address: 127.0.0.1, port_value: 9000}
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+```
+
+- Clients send plain HTTP with the provider's host, as through an egress sidecar. The DFP resolves
+  the host, and Envoy originates TLS (`auto_sni`, `auto_san_validation`). Clients bring their own
+  provider keys.
+- The selector picks the model, not the provider: `auto_sni` follows the Host header, so a selector
+  that sent a call elsewhere would have to change that header too.
+- `accept-encoding` is removed on the route, so for all traffic, because Envoy can neither read nor
+  convert a compressed response.
+- Request info reads the IR once PR 5 lands. Until then, put it before the transcoder in the first
+  AI Protocol Manager. It reads each API natively today, and the transcoder does not relabel the
+  request's API after converting, so after it, request info would misread the IR.
+
+### Gemini on Vertex AI, one DNS cluster
+
+The same pattern, with one DNS cluster to Vertex AI instead of the DFP. Clients call Gemini API
+paths such as `/v1beta/interactions`, and Vertex AI serves the Interactions API at a project path.
+The listener's filters are the DFP example's, without the DFP filter; the route and the cluster
+change:
+
+```yaml
+          route_config:
+            name: vertex
+            virtual_hosts:
+            - name: gemini
+              domains: ["*"]
+              request_headers_to_remove: [authorization, accept-encoding]
+              routes:
+              # Interactions calls, sent to Gemini on Vertex AI.
+              - match:
+                  safe_regex: {regex: "/v1(beta)?/interactions"}
+                  headers: [{name: ":method", string_match: {exact: POST}}]
+                route: {cluster: vertex_ai, auto_host_rewrite: true, timeout: 300s}
+                typed_per_filter_config:
+                  # For the first AI Protocol Manager: the client speaks Interactions.
+                  envoy.filters.http.ai_protocol_manager:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    request: {llm_protocol: GEMINI_INTERACTIONS}
+                  # For the second, in the cluster: so does the backend, at Vertex AI's path.
+                  vertex.ai_protocol_manager:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    response:
+                      llm_protocol: GEMINI_INTERACTIONS
+                      binding: {uri_pattern: /v1beta1/projects/my-project/locations/global/interactions}
+              # Get, delete and cancel, moved to Vertex AI's path; no AI config.
+              - match:
+                  safe_regex: {regex: "/v1(beta)?/interactions/.+"}
+                route:
+                  cluster: vertex_ai
+                  auto_host_rewrite: true
+                  timeout: 300s
+                  regex_rewrite:
+                    pattern: {regex: "^/v1(beta)?/interactions/"}
+                    substitution: /v1beta1/projects/my-project/locations/global/interactions/
+
+  clusters:
+  - name: vertex_ai
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_PREFERRED
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: vertex_ai
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            hostname: aiplatform.googleapis.com
+            address:
+              socket_address: {address: aiplatform.googleapis.com, port_value: 443}
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: aiplatform.googleapis.com
+        common_tls_context:
+          alpn_protocols: [h2]
+          validation_context:
+            trusted_ca: {filename: /etc/ssl/certs/ca-certificates.crt}
+            match_typed_subject_alt_names:
+            - san_type: DNS
+              matcher: {exact: aiplatform.googleapis.com}
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+        http_filters:
+        # Vertex AI takes an OAuth access token; something outside Envoy refreshes it.
+        - name: envoy.filters.http.credential_injector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.credential_injector.v3.CredentialInjector
+            overwrite: true
+            credential:
+              name: envoy.http.injected_credentials.generic
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.http.injected_credentials.generic.v3.Generic
+                credential: {name: vertex-access-token}
+                header: authorization
+                header_value_prefix: "Bearer "
+        - name: vertex.ai_protocol_manager
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+            request_handling: {}
+            response_handling:
+              token_usage: {}
+            filters:
+            - name: envoy.http.ai_filters.transcoder
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                request_handling: TO_IR
+                response_handling: FROM_IR
             - name: envoy.http.ai_filters.transcoder
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
@@ -389,37 +588,42 @@ static_resources:
             "@type": type.googleapis.com/envoy.extensions.filters.http.upstream_codec.v3.UpstreamCodec
 ```
 
-- Clients send plain HTTP with the provider's host, as through an egress sidecar. The DFP resolves
-  the host, and Envoy originates TLS (`auto_sni`, `auto_san_validation`). Clients bring their own
-  provider keys.
-- `accept-encoding` is removed on the route, so for all traffic, because Envoy can neither read nor
-  convert a compressed response.
-- Request info sits between the transcoders, where it reads the IR (PR 5). Until then, put it
-  before the client-side transcoder. It reads each API natively today, and the transcoder does not
-  relabel the request's API after converting, so between them it would misread the IR.
-- To have the gateway pick the model, a filter ahead sets `envoy.ai.model.resolved`: ext_proc or a
-  model router, for example. A virtual host for one provider's host can also set it with
-  `set_filter_state`.
+- The route has an entry for each AI Protocol Manager, under its filter name. The first learns the
+  client's API. The second learns the backend's binding, which renders Vertex AI's path for the
+  converted request.
+- Get, delete and cancel carry no AI config. A path rewrite moves them to Vertex AI's path.
+- Vertex AI takes an OAuth access token rather than an API key. Here it comes from a secret that
+  something outside Envoy refreshes.
 
 ## Changes
 
 | PR | Change |
 |---|---|
 | 1. `ai_protocol_manager: add the Gemini Interactions protocol` | `GEMINI_INTERACTIONS = 5`; the Interactions request schema; usage from unary and streamed responses (output plus thought tokens, read at `interaction.completed`); the path suffix `/interactions` in schema validation's detection, and a fix for bodies it reads today as `generateContent`; request info's Interactions reader |
-| 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when `envoy.ai.llm_protocol.request` names its API, on any route; when its route declares one; or when recognition does. The first of these wins. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API is recorded in `envoy.ai.llm_protocol.request`. |
+| 2. `ai_protocol_manager: recognize AI calls without route config` | `RequestHandling.endpoint_recognition`, listing the APIs to recognize. A request is an AI call when `envoy.ai.llm_protocol.request` names its API, on any route; when its route declares one; or when recognition does. The first of these wins. The path table moves in from schema validation. The backend API defaults to the client's. Responses of recognized calls are converted and metered. The API of every AI call is recorded in `envoy.ai.llm_protocol.request`, which a second AI Protocol Manager follows. |
 | 3. `ai_protocol_manager: carry what the IR has no field for` | The `_envoy` member: engine rules that move unmapped members into `_envoy.<API>` and back. The AI Protocol Manager drops any `_envoy` a client or backend sends, removes `_envoy` before sending, and drops a stream chunk left with nothing else. The IR schema accepts it. |
 | 4. `ai_protocol_manager: transcode Gemini Interactions to and from the IR` | Request, response and stream, in both directions: text, instructions, generation settings and thoughts; everything else in `_envoy`; the gateway's model on the way out and the client's on the way back |
 | 5. `request_info: read the IR` | One reader for every API, between the transcoders, in place of today's per-API readers |
 
-PR 1 stands alone, and PR 2 makes the single DFP route work. PRs 3 and 4 are the IR work, and
-PR 5 depends on them. Later: recognition by payload; skipping the conversion when nothing reads the
-IR; the Anthropic and Gemini conversions carrying thoughts and unmapped members the same way;
-tools; media.
+PR 1 stands alone, and PR 2 makes the two-AI-Protocol-Manager pattern and the single DFP route
+work. PRs 3 and 4 are the IR work, and PR 5 depends on them. Later:
+
+- recognition by payload;
+- skipping the conversion when nothing reads the IR;
+- the second AI Protocol Manager reusing the first's parse;
+- the first leaving a response alone when no AI filter handles it;
+- an AI filter for picking the model, in place of ext_proc;
+- the Anthropic and Gemini conversions carrying thoughts and unmapped members the same way;
+- tools and media.
 
 Tests come with each PR. They include round-trip goldens: every Interactions request, response
 and stream event goes into the IR and back unchanged, and every golden IR document passes the IR
-schema. PR 2's integration test runs the single route: an Interactions call is converted and
-metered, while a get, a cancel and a file upload pass untouched.
+schema. PR 2's integration test runs both examples:
+
+- an Interactions call is recognized by the first AI Protocol Manager, and converted and metered by
+  the second;
+- the Vertex AI route renders the project path;
+- a get, a cancel and a file upload pass untouched.
 
 ## Limits of the first release
 
