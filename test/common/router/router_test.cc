@@ -3677,6 +3677,7 @@ TEST_F(RouterTest, DecodingBufferPassedBackToRouterRuntimeGuardDisabled) {
   TestScopedRuntime scoped_runtime;
   scoped_runtime.mergeValues(
       {{"envoy.reloadable_features.router_skip_replayed_request_body", "false"}});
+  recreateFilter();
   Buffer::OwnedImpl decoding_buffer;
   EXPECT_CALL(callbacks_, decodingBuffer()).WillRepeatedly(Return(&decoding_buffer));
   EXPECT_CALL(callbacks_, addDecodedData(_, true))

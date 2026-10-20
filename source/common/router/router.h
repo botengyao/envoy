@@ -310,6 +310,8 @@ public:
       : config_(config), stats_(stats),
         allow_multiplexed_upstream_half_close_(Runtime::runtimeFeatureEnabled(
             "envoy.reloadable_features.allow_multiplexed_upstream_half_close")),
+        skip_replayed_request_body_(Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.router_skip_replayed_request_body")),
         reject_early_connect_data_enabled_(config->reject_connect_request_early_data_) {}
 
   ~Filter() override;
@@ -706,6 +708,7 @@ private:
   bool include_timeout_retry_header_in_request_ : 1 = false;
   bool request_buffer_overflowed_ : 1 = false;
   const bool allow_multiplexed_upstream_half_close_ : 1 = false;
+  const bool skip_replayed_request_body_ : 1 = false;
   bool upstream_request_started_ : 1 = false;
   // True if cross-cluster retry is enabled: refreshClusterOnRetry is set in the effective retry
   // policy and there is no hedge policy (hedging is incompatible with cross-cluster retry).

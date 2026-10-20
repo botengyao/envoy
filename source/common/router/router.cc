@@ -1148,9 +1148,7 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   // makes the filter manager pass the router its own buffered body again. The router has already
   // handled its first decoding_buffer_length_ bytes.
   const uint64_t forwarded_length =
-      (decoding_buffer == &data && decoding_buffer_length_ > 0 &&
-       Runtime::runtimeFeatureEnabled(
-           "envoy.reloadable_features.router_skip_replayed_request_body"))
+      (skip_replayed_request_body_ && decoding_buffer == &data && decoding_buffer_length_ > 0)
           ? std::min(decoding_buffer_length_, data.length())
           : 0;
   if (forwarded_length > 0 && forwarded_length == data.length() && !end_stream) {
