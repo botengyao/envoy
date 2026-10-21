@@ -3,12 +3,14 @@
 
 Serves HTTPS with HTTP/1.1, records the SNI the client sent, and checks what each real backend
 would check: the path form, a single credential of the right kind, and a JSON body. Every request
-is appended to a JSONL log with a SHA-256 of the body, so a test can prove that the bytes an
-attempt received are the bytes the client sent.
+is appended to a JSONL log with a SHA-256 of the body and of its canonical JSON, so a test can
+prove what an attempt received even when a transcoder re-serialized it. A streaming method
+(":streamGenerateContent?alt=sse") is answered with server-sent events.
 
 The x-test-behavior request header scripts a response per backend, for example
 "gemini=429;vertex=200". Values: an HTTP status code, "reset" (close without a response),
-"reset-early" (close before reading the body), or "delay:<ms>" (then 200).
+"reset-early" (close before reading the body), or "delay:<ms>" (then 200). "429|200" scripts
+successive requests of one test to that backend; the last value repeats.
 """
 
 import argparse
@@ -21,26 +23,49 @@ import threading
 import time
 import weakref
 
+METHOD = r":(?P<method>generateContent|streamGenerateContent\?alt=sse)$"
 PATHS = {
-    "gemini": re.compile(r"^/v1beta/models/(?P<model>[A-Za-z0-9._-]+):generateContent$"),
+    "gemini": re.compile(r"^/v1beta/models/(?P<model>[A-Za-z0-9._-]+)" + METHOD),
     "vertex": re.compile(
         r"^/v1/projects/[^/]+/locations/[^/]+/publishers/google/models/"
-        r"(?P<model>[A-Za-z0-9._-]+):generateContent$"),
+        r"(?P<model>[A-Za-z0-9._-]+)" + METHOD),
 }
 
 _sni = weakref.WeakKeyDictionary()
 _log_lock = threading.Lock()
+_hits = {}
+
+
+def canonical(body):
+    """The body's JSON with sorted keys and no whitespace, or None when it is not JSON."""
+    try:
+        return json.dumps(json.loads(body), sort_keys=True, separators=(",", ":")).encode()
+    except ValueError:
+        return None
 
 
 def google_error(code, status, message):
     return {"error": {"code": code, "message": message, "status": status}}
 
 
-def behavior_for(name, header):
+def generation_config(body):
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return {}
+    config = doc.get("generationConfig") if isinstance(doc, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+def behavior_for(name, header, test):
     for part in (header or "").split(";"):
         key, _, value = part.strip().partition("=")
         if key == name:
-            return value.strip()
+            steps = value.strip().split("|")
+            with _log_lock:
+                hit = _hits.get((test, name), 0)
+                _hits[(test, name)] = hit + 1
+            return steps[min(hit, len(steps) - 1)]
     return "200"
 
 
@@ -62,19 +87,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return b"".join(chunks)
                 chunks.append(self.rfile.read(size))
                 self.rfile.readline()
-        return self.rfile.read(int(self.headers.get("content-length", "0")))
+        expected = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(expected)
+        if len(body) < expected:
+            raise ConnectionError(f"truncated: {len(body)} of {expected} bytes")
+        return body
 
     def reply(self, status, payload):
-        data = json.dumps(payload).encode()
+        if isinstance(payload, list):
+            data = b"".join(b"data: " + json.dumps(event).encode() + b"\r\n\r\n"
+                            for event in payload)
+            content_type = "text/event-stream"
+        else:
+            data = json.dumps(payload).encode()
+            content_type = "application/json"
         self.send_response(status)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def do_POST(self):
         name = self.server.backend_name
-        if behavior_for(name, self.headers.get("x-test-behavior")) == "reset-early":
+        behavior = behavior_for(name, self.headers.get("x-test-behavior"),
+                                self.headers.get("x-test-name"))
+        if behavior == "reset-early":
             # Reset before reading the body, while the proxy is still sending it.
             with _log_lock, open(self.server.log_path, "a") as f:
                 f.write(json.dumps({"ts": time.time(), "test": self.headers.get("x-test-name"),
@@ -82,7 +119,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             self.connection.shutdown(2)
             return
-        body = self.read_body()
+        try:
+            body = self.read_body()
+        except ConnectionError as error:
+            # The proxy reset the request before sending all of it: nothing to answer.
+            with _log_lock, open(self.server.log_path, "a") as f:
+                f.write(json.dumps({"ts": time.time(), "test": self.headers.get("x-test-name"),
+                                    "backend": name, "status": None, "truncated": str(error)}) +
+                        "\n")
+            self.close_connection = True
+            return
         record = {
             "ts": time.time(),
             "test": self.headers.get("x-test-name"),
@@ -99,8 +145,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "x-pdp-decision": self.headers.get("x-pdp-decision"),
             "body_len": len(body),
             "body_sha256": hashlib.sha256(body).hexdigest(),
+            "canonical_sha256": hashlib.sha256(canonical(body) or b"").hexdigest(),
+            "generation_config": sorted(generation_config(body)),
         }
-        behavior = behavior_for(name, self.headers.get("x-test-behavior"))
         status, payload = self.decide(name, body, behavior)
         record["status"] = status
         with _log_lock, open(self.server.log_path, "a") as f:
@@ -138,14 +185,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if status != 200:
             return status, google_error(status, "RESOURCE_EXHAUSTED" if status == 429 else
                                         "UNAVAILABLE", f"{name}: scripted {status}")
+        usage = {"promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10}
+        model = match.group("model")
+        if match.group("method").startswith("stream"):
+            return 200, [
+                {"candidates": [{"content": {"role": "model",
+                                             "parts": [{"text": f"served by {name}"}]}}],
+                 "modelVersion": model},
+                {"candidates": [{"content": {"role": "model", "parts": [{"text": "."}]},
+                                 "finishReason": "STOP"}],
+                 "usageMetadata": usage, "modelVersion": model},
+            ]
         return 200, {
             "candidates": [{
                 "content": {"role": "model", "parts": [{"text": f"served by {name}"}]},
                 "finishReason": "STOP",
             }],
-            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3,
-                              "totalTokenCount": 10},
-            "modelVersion": match.group("model"),
+            "usageMetadata": usage,
+            "modelVersion": model,
         }
 
 

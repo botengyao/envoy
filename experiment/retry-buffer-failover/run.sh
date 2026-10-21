@@ -52,5 +52,5 @@ if [[ "$RESTORE" == false ]]; then
 fi
 
 python3 e2e.py --restore "$RESTORE" | tee "$RUN/e2e.log"
-curl -s "http://127.0.0.1:19901/stats?filter=(retry_body|retry_or_shadow_abandoned|upstream_rq_retry|ai_protocol_manager)" \
+curl -s "http://127.0.0.1:19901/stats?filter=(retry_session|retry_or_shadow_abandoned|upstream_rq_retry|ai_protocol_manager)" \
   > "$RUN/stats.log"

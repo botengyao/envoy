@@ -1,79 +1,173 @@
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"2","StreamId":"15315564748915125647"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"5","StreamId":"5864906243851214324"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"5","StreamId":"5864906243851214324"] replaying 946 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"7","StreamId":"16818857249008064188"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"7","StreamId":"16818857249008064188"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"9","StreamId":"6478120755514207009"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"9","StreamId":"6478120755514207009"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"11","StreamId":"13517963171824980698"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"11","StreamId":"13517963171824980698"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"13","StreamId":"16732393293790555905"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"13","StreamId":"16732393293790555905"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"15","StreamId":"5847308233135955226"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"15","StreamId":"5847308233135955226"] replaying 16306 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"17","StreamId":"12116011838956678971"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"17","StreamId":"12116011838956678971"] replaying 67108786 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"19","StreamId":"9712146394317258181"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"19","StreamId":"9712146394317258181"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"21","StreamId":"12016329136272315532"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"21","StreamId":"12016329136272315532"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"23","StreamId":"187472482835063076"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"23","StreamId":"187472482835063076"] replaying 938 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"26","StreamId":"6490062304614247299"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"26","StreamId":"6490062304614247299"] replaying 4194218 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"28","StreamId":"12781365825286668564"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"28","StreamId":"12781365825286668564"] replaying 4194218 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"30","StreamId":"2651040022402154393"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"30","StreamId":"2651040022402154393"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"32","StreamId":"4037416083294798064"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"32","StreamId":"4037416083294798064"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"34","StreamId":"2876522032200595645"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"34","StreamId":"2876522032200595645"] replaying 16298 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"36","StreamId":"9690300698349866038"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"36","StreamId":"9690300698349866038"] replaying 3670048 request body bytes into the retry, following the log as the rest arrives
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"38","StreamId":"7693258158048696447"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"38","StreamId":"7693258158048696447"] replaying 4194218 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"40","StreamId":"186373088426313622"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"40","StreamId":"186373088426313622"] replaying 946 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"42","StreamId":"5796622171088869191"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"42","StreamId":"5796622171088869191"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"44","StreamId":"5020931339597564386"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"44","StreamId":"5020931339597564386"] replaying 4194226 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"46","StreamId":"16816145731420580334"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"46","StreamId":"16816145731420580334"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"48","StreamId":"15671328324699173912"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"48","StreamId":"15671328324699173912"] replaying 80 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"50","StreamId":"4888420285388544227"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"50","StreamId":"4888420285388544227"] replaying 16306 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"52","StreamId":"2854091098629466720"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"52","StreamId":"2854091098629466720"] replaying 67108786 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"54","StreamId":"984438904945134007"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"54","StreamId":"984438904945134007"] replaying 4194226 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"56","StreamId":"17062446670024291100"] writing the request body to a request body log for retries
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"56","StreamId":"17062446670024291100"] replaying 524210 request body bytes into the retry
-[debug][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:256] ai_protocol_manager: reading the payload back from the router's request body log instead of storing a copy
-[debug][router] [source/common/router/router.cc:1201] The request payload has at least 65536 bytes data which exceeds buffer limit 32768. Giving up on buffering.
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"62","StreamId":"4721945372507540759"] writing the request body to a request body log for retries
-[warning][filter] [source/extensions/filters/http/ai_protocol_manager/retry_body_log.cc:117] ai_protocol_manager: request body log failed: the body is longer than the log's limit
-[debug][router] [source/common/router/router.cc:2553] [Tags: "ConnectionId":"62","StreamId":"4721945372507540759"] the request body log failed after 1114112 bytes; giving up on retries
-[debug][router] [source/common/router/router.cc:2533] [Tags: "ConnectionId":"64","StreamId":"11727267169042131475"] writing the request body to a request body log for retries
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"64","StreamId":"11727267169042131475"] replaying 946 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:2573] [Tags: "ConnectionId":"64","StreamId":"11727267169042131475"] replaying 946 request body bytes into the retry
-[debug][router] [source/common/router/router.cc:1201] The request payload has at least 65536 bytes data which exceeds buffer limit 32768. Giving up on buffering.
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"5","StreamId":"14682309079949771240"] handing the request body over to the retry session after 0 bytes
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"17","StreamId":"17619693166753903090"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"37","StreamId":"17574055163707977229"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"57","StreamId":"12387687895303500870"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"77","StreamId":"12232766717530504860"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"97","StreamId":"10129534611065501504"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"117","StreamId":"7587965266979617095"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"137","StreamId":"14098990175946454989"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"157","StreamId":"2976777421009781367"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"178","StreamId":"8273020663692156744"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"200","StreamId":"4251063289986092083"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"219","StreamId":"10415968732861009052"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"239","StreamId":"6765072176150391120"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"259","StreamId":"16996647914032340063"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"299","StreamId":"17280030724864081336"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"319","StreamId":"12910644289375383716"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"339","StreamId":"10468515227301842444"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"359","StreamId":"11949590343044302645"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"379","StreamId":"12447362341202163753"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"399","StreamId":"13506198686995680008"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"419","StreamId":"11918991717845776174"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"440","StreamId":"2278205829536295710"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"462","StreamId":"3110795122050232148"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"541","StreamId":"5087130173683024622"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"561","StreamId":"8601983369128819835"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"581","StreamId":"17144155069432613856"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"601","StreamId":"3699567215817513998"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"621","StreamId":"10312159316976070027"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"641","StreamId":"7671387999511872548"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"681","StreamId":"4906218092982470617"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"701","StreamId":"15567483128820485356"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"721","StreamId":"1514637272473376304"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"741","StreamId":"12242693727051445733"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"761","StreamId":"12262604431532896481"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"772","StreamId":"11863200512902758059"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"774","StreamId":"12381482088533734125"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"776","StreamId":"11664811627686137283"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"779","StreamId":"16678359488155150085"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"782","StreamId":"15277976640794933429"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"785","StreamId":"18083210127668571051"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"787","StreamId":"13012988863998331541"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"798","StreamId":"7546092585615514489"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"818","StreamId":"8257473845758409473"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"829","StreamId":"13681811997281453999"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"831","StreamId":"13293159819256691864"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"834","StreamId":"6206315324762829543"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"844","StreamId":"4271375537041106102"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"868","StreamId":"16855867964264401833"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"908","StreamId":"11024859746012278822"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65458 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"948","StreamId":"4244827388750255871"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"988","StreamId":"2895778807249273456"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"988","StreamId":"2895778807249273456"] writing the request body to the retry session from byte 524288
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1028","StreamId":"4419677989293275537"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1028","StreamId":"4419677989293275537"] writing the request body to the retry session from byte 524288
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1048","StreamId":"3158719943368871635"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1048","StreamId":"3158719943368871635"] writing the request body to the retry session from byte 1572864
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1068","StreamId":"9393704259114177112"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1068","StreamId":"9393704259114177112"] writing the request body to the retry session from byte 524288
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1088","StreamId":"16911576751709260420"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1088","StreamId":"16911576751709260420"] writing the request body to the retry session from byte 1572864
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1108","StreamId":"18191479104920086244"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 65536 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1108","StreamId":"18191479104920086244"] writing the request body to the retry session from byte 524288
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1128","StreamId":"18368781507378652312"] handing the request body over to the retry session after 1048576 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.cc:41] ai_protocol_manager: spilling 1114112 bytes held in memory to the external buffer
+[debug][router] [source/common/router/router.cc:2530] [Tags: "ConnectionId":"1128","StreamId":"18368781507378652312"] writing the request body to the retry session from byte 1572864
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:417] ai_protocol_manager: parsing the request back from the retry session
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1139","StreamId":"8317788040568813338"] handing the request body over to the retry session after 0 bytes
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1141","StreamId":"6650238300561974136"] handing the request body over to the retry session after 0 bytes
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1142","StreamId":"15423398962367103003"] handing the request body over to the retry session after 0 bytes
+[debug][router] [source/common/router/router.cc:2486] [Tags: "ConnectionId":"1144","StreamId":"9288731759477641014"] handing the request body over to the retry session after 0 bytes
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session
+[debug][filter] [source/extensions/filters/http/ai_protocol_manager/filter.cc:412] ai_protocol_manager: reusing the parsed request from the retry session

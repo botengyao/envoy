@@ -1,19 +1,25 @@
-# Cross-cluster failover from the Gemini API to Vertex AI, with retries replayed from a request
-# body log the router writes into an AI protocol manager's external buffer.
+# Cross-cluster failover from the Gemini API to Vertex AI, with retries taken from an upstream retry
+# session (source/docs/ai_retry_session.md).
 #
-#   client -> ai_protocol_manager -> ext_proc (routing PDP, may replace the body)
-#          -> [lua body mutator, test only] -> router (priority_group + refresh_cluster_on_retry)
+#   client -> ai_protocol_manager -> ext_proc (routing PDP, may replace or rewrite the body)
+#          -> router (priority_group + refresh_cluster_on_retry)
 #          -> gemini (127.0.0.1:18443, SNI generativelanguage.googleapis.com)
 #          -> vertex (127.0.0.1:18444, SNI us-central1-aiplatform.googleapis.com)
 #
-# :19000  the log is lent by the upstream ai_protocol_manager of each provider cluster, which also
-#         reads its own payload back from it.
-# :19004  the log is lent by the downstream ai_protocol_manager; the clusters have no APM.
-# :19006  the log is lent by the downstream ai_protocol_manager and the provider clusters' upstream
-#         ai_protocol_managers read their payload back from it.
-# :19008  as :19006, with the log capped at 1 MiB.
-# :19002  control: no log, so the router keeps today's in-memory retry buffer, bounded by the
-#         32 KiB connection buffer limit.
+# Each provider cluster's upstream ai_protocol_manager transcodes the request through the IR into
+# its backend's API and binding, and the response back. Its filter name keys its own entry on the
+# shared route. Past request_body_buffer_limit the router keeps no copy of the body: it hands it
+# over to the retry session that attempt 1's upstream ai_protocol_manager writes, with the parsed
+# JSON, for later attempts to adopt. If attempt 1 fails while the body is still arriving, the
+# router writes the rest of it to the session itself.
+#
+# :19010  the router keeps no copy (request_body_buffer_limit: 0).
+# :19012  as :19010, with the router keeping bodies up to 1 MiB itself.
+# :19014  as :19010 without the PDP: nothing holds the headers ahead of the router, so it gets the
+#         body frame by frame and never has a decoding buffer.
+# :19016  as :19012 without the PDP: the router keeps exactly the first 1 MiB, then hands over.
+# :19002  control: provider clusters without a session, so the router keeps today's in-memory
+#         retry buffer, bounded by the 32 KiB connection buffer limit.
 admin:
   address: {socket_address: {address: 127.0.0.1, port_value: 19901}}
 
@@ -30,15 +36,15 @@ static_resources:
     generic_secret: {secret: {inline_string: "test-vertex-access-token"}}
 
   listeners:
-  - name: upstream_log
-    address: {socket_address: {address: 127.0.0.1, port_value: 19000}}
+  - name: upstream_session
+    address: {socket_address: {address: 127.0.0.1, port_value: 19010}}
     per_connection_buffer_limit_bytes: 32768
     filter_chains:
     - filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: upstream_log
+          stat_prefix: upstream_session
           access_log: &downstream_log
           - name: envoy.access_loggers.file
             typed_config:
@@ -55,8 +61,8 @@ static_resources:
                   cluster: "%UPSTREAM_CLUSTER%"
                   bytes_received: "%BYTES_RECEIVED%"
                   routing: "%DYNAMIC_METADATA(envoy.ai.routing)%"
-          route_config: &apm_routes
-            name: apm_clusters
+          route_config:
+            name: session_routes
             virtual_hosts:
             - name: ai
               domains: ["*"]
@@ -68,12 +74,34 @@ static_resources:
                   envoy.filters.http.ai_protocol_manager:
                     "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
                     request: {llm_protocol: GEMINI_GENERATE_CONTENT}
-                route:
+                  # The upstream ai_protocol_managers, looked up by filter name, one name per
+                  # provider (vertex and vertex_plain share one): the API the clients send, and
+                  # the API and binding that provider takes. An upstream binding pins project and
+                  # location, which a Gemini API path lacks.
+                  ai_protocol_manager.gemini:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    request: {llm_protocol: GEMINI_GENERATE_CONTENT}
+                    response:
+                      llm_protocol: GEMINI_GENERATE_CONTENT
+                      binding:
+                        uri_pattern: "/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}"
+                  ai_protocol_manager.vertex:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    request: {llm_protocol: GEMINI_GENERATE_CONTENT}
+                    response:
+                      llm_protocol: GEMINI_GENERATE_CONTENT
+                      binding:
+                        uri_pattern: "/v1/projects/test-project/locations/us-central1/publishers/google/models/\
+                          {model}:{generateContent|streamGenerateContent?alt=sse}"
+                # The router keeps no copy: it hands the body over to the retry session.
+                request_body_buffer_limit: 0
+                route: &session_route
                   inline_cluster_specifier_plugin:
                     extension:
                       name: envoy.router.cluster_specifier_plugin.priority_group
                       typed_config:
-                        "@type": type.googleapis.com/envoy.extensions.router.cluster_specifiers.priority_group.v3.PriorityGroupClusterSpecifier
+                        "@type": "type.googleapis.com/envoy.extensions.router.cluster_specifiers.priority_group.v3.\
+                          PriorityGroupClusterSpecifier"
                         priority_groups:
                         - name: gemini
                           clusters: [{cluster_name: gemini, weight: 100}]
@@ -108,6 +136,8 @@ static_resources:
                 timeout: 2s
               failure_mode_allow: false
               message_timeout: 0.5s
+              # Lets the PDP buffer and rewrite the body of a request it picks.
+              allow_mode_override: true
               processing_mode:
                 request_header_mode: SEND
                 response_header_mode: SKIP
@@ -123,20 +153,6 @@ static_resources:
               mutation_rules:
                 disallow_all: true
                 allow_expression: {regex: "^x-pdp-.*$"}
-          - &mutator
-            name: envoy.filters.http.lua
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-              default_source_code:
-                inline_string: |
-                  -- Test only: rewrites the body between the APM and the router.
-                  function envoy_on_request(handle)
-                    if handle:headers():get("x-test-mutate-body") == nil then
-                      return
-                    end
-                    local body = handle:body()
-                    body:setBytes(string.gsub(body:getBytes(0, body:length()), "hello", "HELLO"))
-                  end
           - &router
             name: envoy.filters.http.router
             typed_config:
@@ -157,17 +173,85 @@ static_resources:
                       flags: "%RESPONSE_FLAGS%"
                       transport_failure: "%UPSTREAM_TRANSPORT_FAILURE_REASON%"
 
-  - name: downstream_log
-    address: {socket_address: {address: 127.0.0.1, port_value: 19004}}
+  - name: upstream_session_graded
+    address: {socket_address: {address: 127.0.0.1, port_value: 19012}}
     per_connection_buffer_limit_bytes: 32768
     filter_chains:
     - filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: downstream_log
+          stat_prefix: upstream_session_graded
           access_log: *downstream_log
-          route_config: &plain_routes
+          route_config:
+            name: session_graded_routes
+            virtual_hosts:
+            - name: ai
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/v1beta/models/"}
+                request_headers_to_remove: [x-pdp-decision]
+                typed_per_filter_config: *apm_per_route
+                # Bodies up to 1 MiB stay on the router; a larger one is handed over at 1 MiB.
+                request_body_buffer_limit: 1048576
+                route: *session_route
+          http_filters: [*downstream_apm, *pdp, *router]
+
+  - name: upstream_session_direct
+    address: {socket_address: {address: 127.0.0.1, port_value: 19014}}
+    per_connection_buffer_limit_bytes: 32768
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: upstream_session_direct
+          access_log: *downstream_log
+          route_config:
+            name: session_direct_routes
+            virtual_hosts:
+            - name: ai
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/v1beta/models/"}
+                typed_per_filter_config: *apm_per_route
+                request_body_buffer_limit: 0
+                route: *session_route
+          http_filters: [*downstream_apm, *router]
+
+  - name: upstream_session_direct_graded
+    address: {socket_address: {address: 127.0.0.1, port_value: 19016}}
+    per_connection_buffer_limit_bytes: 32768
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: upstream_session_direct_graded
+          access_log: *downstream_log
+          route_config:
+            name: session_direct_graded_routes
+            virtual_hosts:
+            - name: ai
+              domains: ["*"]
+              routes:
+              - match: {prefix: "/v1beta/models/"}
+                typed_per_filter_config: *apm_per_route
+                request_body_buffer_limit: 1048576
+                route: *session_route
+          http_filters: [*downstream_apm, *router]
+
+  - name: control
+    address: {socket_address: {address: 127.0.0.1, port_value: 19002}}
+    per_connection_buffer_limit_bytes: 32768
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: control
+          access_log: *downstream_log
+          route_config:
             name: plain
             virtual_hosts:
             - name: ai
@@ -181,7 +265,8 @@ static_resources:
                     extension:
                       name: envoy.router.cluster_specifier_plugin.priority_group
                       typed_config:
-                        "@type": type.googleapis.com/envoy.extensions.router.cluster_specifiers.priority_group.v3.PriorityGroupClusterSpecifier
+                        "@type": "type.googleapis.com/envoy.extensions.router.cluster_specifiers.priority_group.v3.\
+                          PriorityGroupClusterSpecifier"
                         priority_groups:
                         - name: gemini
                           clusters: [{cluster_name: gemini_plain, weight: 100}]
@@ -191,85 +276,7 @@ static_resources:
                   auto_host_rewrite: true
                   timeout: 30s
                   retry_policy: *retry_policy
-          http_filters:
-          - name: envoy.filters.http.ai_protocol_manager
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-              request_handling:
-                retry_body_log: true
-              filters:
-              - name: envoy.http.ai_filters.request_info
-                typed_config:
-                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
-          - *pdp
-          - *mutator
-          - *router
-
-  - name: downstream_log_upstream_borrow
-    address: {socket_address: {address: 127.0.0.1, port_value: 19006}}
-    per_connection_buffer_limit_bytes: 32768
-    filter_chains:
-    - filters:
-      - name: envoy.filters.network.http_connection_manager
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: downstream_log_upstream_borrow
-          access_log: *downstream_log
-          route_config: *apm_routes
-          http_filters:
-          - &lending_apm
-            name: envoy.filters.http.ai_protocol_manager
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-              request_handling:
-                reserialize_body: DISABLE
-                retry_body_log: true
-                retry_body_log_max_bytes: 134217728
-              filters:
-              - name: envoy.http.ai_filters.request_info
-                typed_config:
-                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
-          - *pdp
-          - *mutator
-          - *router
-
-  - name: capped_log
-    address: {socket_address: {address: 127.0.0.1, port_value: 19008}}
-    per_connection_buffer_limit_bytes: 32768
-    filter_chains:
-    - filters:
-      - name: envoy.filters.network.http_connection_manager
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: capped_log
-          access_log: *downstream_log
-          route_config: *apm_routes
-          http_filters:
-          - name: envoy.filters.http.ai_protocol_manager
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-              request_handling:
-                reserialize_body: DISABLE
-                retry_body_log: true
-                retry_body_log_max_bytes: 1048576
-          - *pdp
-          - *router
-
-  - name: control
-    address: {socket_address: {address: 127.0.0.1, port_value: 19002}}
-    per_connection_buffer_limit_bytes: 32768
-    filter_chains:
-    - filters:
-      - name: envoy.filters.network.http_connection_manager
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: control
-          access_log: *downstream_log
-          route_config: *plain_routes
-          http_filters:
-          - *downstream_apm
-          - *pdp
-          - *router
+          http_filters: [*downstream_apm, *pdp, *router]
 
   clusters:
   - name: gemini
@@ -294,33 +301,35 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config: {http_protocol_options: {}}
-        http_filters:
-        - &upstream_apm
-          name: envoy.filters.http.ai_protocol_manager
-          typed_config:
+        http_filters: &gemini_session_chain
+        # First in the chain: it holds the headers until its legs have run, so the filters after
+        # it see the path it renders, and it takes every body byte the router forwards.
+        - name: ai_protocol_manager.gemini
+          typed_config: &session_apm
             "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
             request_handling:
-              reserialize_body: DISABLE
-              # Lends this filter's external buffer to the router as the retry log, and reads the
-              # payload back from it instead of storing a copy per attempt.
-              retry_body_log: true
-        - &gemini_lua
-          name: envoy.filters.http.lua
+              # The legs rebuild the body, so it is sent as they leave it.
+              reserialize_body: ALWAYS
+              # Keeps the body and its parsed document for later attempts to adopt.
+              retry_session: true
+            filters: &transcoder_pair
+            - name: envoy.http.ai_filters.transcoder
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                request_handling: TO_IR
+                response_handling: FROM_IR
+            - name: envoy.http.ai_filters.transcoder
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                request_handling: FROM_IR
+                response_handling: TO_IR
+        # Drops the other provider's credential, from the client or an earlier attempt.
+        - &gemini_strip
+          name: envoy.filters.http.header_mutation
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-            default_source_code:
-              inline_string: |
-                -- Idempotent: rebuilds the Gemini API path from the /models/{m}:{method} suffix
-                -- whatever form an earlier attempt left, and drops Vertex's credential.
-                function envoy_on_request(handle)
-                  local headers = handle:headers()
-                  local model, rest = string.match(headers:get(":path") or "",
-                                                   "/models/([^/:?]+)(:.*)$")
-                  if model ~= nil then
-                    headers:replace(":path", "/v1beta/models/" .. model .. rest)
-                  end
-                  headers:remove("authorization")
-                end
+            "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations: [{remove: authorization}]
         - &gemini_credential
           name: envoy.filters.http.credential_injector
           typed_config:
@@ -358,26 +367,14 @@ static_resources:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config: {http_protocol_options: {}}
         http_filters:
-        - *upstream_apm
-        - &vertex_lua
-          name: envoy.filters.http.lua
+        - name: ai_protocol_manager.vertex
+          typed_config: *session_apm
+        - &vertex_strip
+          name: envoy.filters.http.header_mutation
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-            default_source_code:
-              inline_string: |
-                -- Idempotent: rebuilds Vertex AI's publisher-model path from the
-                -- /models/{m}:{method} suffix, and drops the Gemini API key.
-                function envoy_on_request(handle)
-                  local headers = handle:headers()
-                  local model, rest = string.match(headers:get(":path") or "",
-                                                   "/models/([^/:?]+)(:.*)$")
-                  if model ~= nil then
-                    headers:replace(":path",
-                      "/v1/projects/test-project/locations/us-central1/publishers/google/models/"
-                      .. model .. rest)
-                  end
-                  headers:remove("x-goog-api-key")
-                end
+            "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations: [{remove: x-goog-api-key}]
         - &vertex_credential
           name: envoy.filters.http.credential_injector
           typed_config:
@@ -402,7 +399,9 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config: {http_protocol_options: {}}
-        http_filters: [*gemini_lua, *gemini_credential, *codec]
+        # No APM: with header restore on, every attempt starts from the client's path, which is
+        # this API's.
+        http_filters: [*gemini_strip, *gemini_credential, *codec]
 
   - name: vertex_plain
     type: STATIC
@@ -414,7 +413,35 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config: {http_protocol_options: {}}
-        http_filters: [*vertex_lua, *vertex_credential, *codec]
+        http_filters:
+        - name: ai_protocol_manager.vertex
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+            # No retry session: the router keeps the body.
+            request_handling: {reserialize_body: ALWAYS}
+            filters: *transcoder_pair
+        - *vertex_strip
+        - *vertex_credential
+        - *codec
+
+  # Nothing listens on 18449: attempts fail with ECONNREFUSED while the body is still arriving.
+  - name: gemini_refused
+    type: STATIC
+    connect_timeout: 1s
+    circuit_breakers: *breakers
+    load_assignment:
+      cluster_name: gemini_refused
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            hostname: generativelanguage.googleapis.com
+            address: {socket_address: {address: 127.0.0.1, port_value: 18449}}
+    transport_socket: *gemini_tls
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: {http_protocol_options: {}}
+        http_filters: *gemini_session_chain
 
   - name: pdp
     type: STATIC

@@ -1,33 +1,63 @@
-2026/10/20 01:20:22 pdp: listening on 127.0.0.1:18080
-2026/10/20 01:20:22 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:22 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:24 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:24 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:25 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:25 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[vertex gemini] rewrite=false
-2026/10/20 01:20:26 pdp: path=/v1beta/models/gemini-2.5-pro:generateContent model="gemini-2.5-pro" order=[vertex gemini] rewrite=false
-2026/10/20 01:20:26 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:27 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:27 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:27 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:28 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:28 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:28 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:29 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[vertex gemini] rewrite=false
-2026/10/20 01:20:29 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:31 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=true
-2026/10/20 01:20:31 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:32 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:32 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[vertex gemini] rewrite=false
-2026/10/20 01:20:33 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:33 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:34 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:34 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:34 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
-2026/10/20 01:20:35 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" order=[gemini vertex] rewrite=false
+2026/10/21 13:14:51 pdp: listening on 127.0.0.1:18080
+2026/10/21 13:14:51 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:51 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:52 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:52 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:53 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:54 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:55 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:56 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:14:56 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:14:57 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex]] rewrite=false
+2026/10/21 13:14:58 pdp: path=/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:58 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=true
+2026/10/21 13:14:59 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=true
+2026/10/21 13:14:59 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:14:59 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:00 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:00 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:01 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:02 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:03 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:04 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:04 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:05 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex]] rewrite=false
+2026/10/21 13:15:05 pdp: path=/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:06 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=true
+2026/10/21 13:15:06 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=true
+2026/10/21 13:15:07 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:15 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:15 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:16 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:16 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:16 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex]] rewrite=false
+2026/10/21 13:15:17 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:17 pdp: path=/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse model="gemini-2.5-flash" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:18 pdp: path=/v1beta/models/gemini-2.5-pro:generateContent model="gemini-2.5-pro" groups=[map[name:vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:18 pdp: path=/v1beta/models/gemini-2.5-flash-lite:generateContent model="gemini-2.5-flash-lite" groups=[map[clusters:[map[cluster_name:vertex weight:100]] name:policy-vertex] map[name:gemini]] rewrite=false
+2026/10/21 13:15:19 pdp: path=/v1beta/models/gemini-2.5-flash-lite:generateContent model="gemini-2.5-flash-lite" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:19 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini]] rewrite=false
+2026/10/21 13:15:19 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:20 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[clusters:[map[cluster_name:gemini_plain weight:100]] name:plain]] rewrite=false
+2026/10/21 13:15:20 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[clusters:[map[cluster_name:gemini_plain weight:100]] name:plain]] rewrite=false
+2026/10/21 13:15:20 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_plain weight:100]] name:plain] map[name:vertex]] rewrite=false
+2026/10/21 13:15:21 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:21 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:22 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:22 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:23 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:24 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:24 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:25 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:25 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:26 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:27 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:28 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[clusters:[map[cluster_name:gemini_refused weight:100]] name:refused] map[name:vertex]] rewrite=false
+2026/10/21 13:15:29 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:29 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:29 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
+2026/10/21 13:15:30 pdp: path=/v1beta/models/gemini-2.5-flash:generateContent model="gemini-2.5-flash" groups=[map[name:gemini] map[name:vertex]] rewrite=false
