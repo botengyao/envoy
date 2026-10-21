@@ -13,7 +13,7 @@
 #include "envoy/http/filter.h"
 #include "envoy/http/filter_factory.h"
 #include "envoy/http/hash_policy.h"
-#include "envoy/http/request_body_log.h"
+#include "envoy/http/retry_body_session.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/router/router_filter_interface.h"
 #include "envoy/router/shadow_writer.h"
@@ -40,7 +40,6 @@
 #include "source/common/upstream/upstream_factory_context_impl.h"
 
 #include "absl/container/inlined_vector.h"
-#include "absl/crc/crc32c.h"
 #include "absl/strings/match.h"
 
 namespace Envoy {
@@ -306,8 +305,7 @@ using UpstreamRequestPtr = std::unique_ptr<UpstreamRequest>;
 class Filter : Logger::Loggable<Logger::Id::router>,
                public Http::StreamDecoderFilter,
                public Upstream::LoadBalancerContextBase,
-               public RouterFilterInterface,
-               public Http::RequestBodyLog::WriterCallbacks {
+               public RouterFilterInterface {
 public:
   Filter(const FilterConfigSharedPtr& config, FilterStats& stats)
       : config_(config), stats_(stats),
@@ -530,12 +528,6 @@ public:
   void onPerTryTimeout(UpstreamRequest& upstream_request) override;
   void onPerTryIdleTimeout(UpstreamRequest& upstream_request) override;
   void onStreamMaxDurationReached(UpstreamRequest& upstream_request) override;
-  void onUpstreamRequestBodyFlowControl(UpstreamRequest& upstream_request, bool above) override;
-
-  // Http::RequestBodyLog::WriterCallbacks
-  void onLogAboveHighWatermark() override;
-  void onLogBelowLowWatermark() override;
-  void onLogFailed() override;
   void setupRouteTimeoutForWebsocketUpgrade() override;
   void disableRouteTimeoutForWebsocketUpgrade() override;
   Http::StreamDecoderFilterCallbacks* callbacks() override { return callbacks_; }
@@ -635,19 +627,13 @@ private:
                        GenericConnPoolPtr generic_conn_pool);
   void updateStatsOnNoRetry(RetryStatus retry_status);
   void updateStatsOnDoRetry(RetryState::DoRetryType do_retry_type);
-
-  // Becomes the writer of a request body log a filter created for this stream, when the request
-  // can be retried from it, instead of buffering the body in the decoding buffer.
-  void maybeUseBodyLog(bool end_stream);
-  // Gives up on retrying a request whose log failed, the same way as when the in-memory retry
-  // buffer overflows.
-  void handleBodyLogFailure();
-  void startBodyReplay(UpstreamRequest& upstream_request);
-  void finishBodyReplay();
-  void continueBodyReplay();
-  void onBodyReplayRead(uint64_t generation, absl::StatusOr<Buffer::InstancePtr> data);
-  void stopBodyReplay();
-  void failBodyReplay(absl::string_view details);
+  // Hands the body over to the retry session the live attempt's upstream filter writes, instead of
+  // giving up on retries at a buffer overflow. `forwarded` is what the attempt has been sent.
+  bool maybeHandOverRetrySession(uint64_t forwarded);
+  // After a hand-over, a retry needs the session to hold every byte received; otherwise gives up
+  // on retries, as at an overflow, and returns false.
+  bool retrySessionAllowsRetry();
+  void failRetrySession(absl::string_view details);
 
   void runRetryOptionsPredicates(UpstreamRequest& retriable_request);
   // Returns the effective retry policy to use for this request.
@@ -709,28 +695,9 @@ private:
   // double stream, and this avoids heap allocation in that case.
   absl::InlinedVector<Http::AsyncClient::OngoingRequest*, 2> shadow_streams_;
 
-  // The request body log this router writes; when set, retries replay from it and the decoding
-  // buffer stays empty.
-  std::shared_ptr<Http::RequestBodyLog> body_log_;
-  Http::RequestBodyLog::WriterPtr body_log_writer_;
-  Http::RequestBodyLog::ReadHandlePtr body_replay_read_;
-  // The newest replayed chunk, held until the next one is read or the replay is verified, so the
-  // bytes that complete the request never go out unverified.
-  Buffer::OwnedImpl body_replay_held_;
-  Event::SchedulableCallbackPtr body_replay_cb_;
-  // The attempt a replay feeds; null when no replay is in progress or pending.
-  UpstreamRequest* body_replay_target_{};
-  uint64_t body_replay_generation_{0};
-  uint64_t body_replay_offset_{0};
-  absl::crc32c_t body_replay_crc_{0};
-  uint32_t body_replay_chunks_this_pass_{0};
+  // Set once the body is handed over; retries then take it from the session.
+  std::shared_ptr<Http::RetryBodySession> retry_session_;
   uint64_t received_body_length_{0};
-  absl::crc32c_t received_body_crc_{0};
-  // Set once the whole body has been appended to the log; the replay then sends its last chunk.
-  bool body_logged_{false};
-  bool body_log_failed_{false};
-  // The replay stopped because its attempt pushed back, and resumes on the attempt's low watermark.
-  bool body_replay_blocked_{false};
   // The request headers before the first attempt's upstream filters ran, restored before every
   // cross-cluster retry so that one cluster's rewrites and credentials never reach another.
   Http::RequestHeaderMapPtr original_request_headers_;

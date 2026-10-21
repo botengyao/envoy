@@ -23,12 +23,12 @@ namespace Router {
   COUNTER(rq_direct_response)                                                                      \
   COUNTER(rq_overload_local_reply)                                                                 \
   COUNTER(rq_redirect)                                                                             \
+  COUNTER(retry_session_failed)                                                                    \
+  COUNTER(retry_session_handed_over)                                                               \
+  COUNTER(retry_session_incomplete)                                                                \
+  COUNTER(retry_session_not_adopted)                                                               \
   COUNTER(rq_reset_after_downstream_response_started)                                              \
   COUNTER(rq_total)                                                                                \
-  COUNTER(retry_body_log_failed)                                                                   \
-  COUNTER(retry_body_logged)                                                                       \
-  COUNTER(retry_body_replay_error)                                                                 \
-  COUNTER(retry_body_replay_mismatch)                                                              \
   STATNAME(retry)
 
 MAKE_STAT_NAMES_STRUCT(StatNames, ALL_ROUTER_STATS);

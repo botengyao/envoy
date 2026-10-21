@@ -164,6 +164,11 @@ void BufferManager::onData(Buffer::Instance& data) {
   maybeIssueWrite();
 }
 
+void BufferManager::adoptStore(ExternalBufferPtr store) {
+  ASSERT(buffer_ == nullptr && pending_.length() == 0 && !end_stream_seen_);
+  buffer_ = std::move(store);
+}
+
 void BufferManager::endStream() {
   end_stream_seen_ = true;
   ENVOY_LOG(trace, "ai_protocol_manager: stream complete");

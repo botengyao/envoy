@@ -81,18 +81,17 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
-    name = "retry_body_log_lib",
-    srcs = ["retry_body_log.cc"],
-    hdrs = ["retry_body_log.h"],
+    name = "retry_body_session_lib",
+    srcs = ["retry_body_session.cc"],
+    hdrs = ["retry_body_session.h"],
     deps = [
         ":external_buffer_interface",
-        "//envoy/event:dispatcher_interface",
-        "//envoy/http:request_body_log_interface",
+        ":token_usage_lib",
+        "//envoy/http:retry_body_session_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
-        "@abseil-cpp//absl/crc:crc32c",
-        "@abseil-cpp//absl/status",
+        "@nlohmann_json//:json",
     ],
 )
 
@@ -494,13 +493,13 @@ envoy_cc_library(
         ":llm_binding_lib",
         ":llm_protocol_conversion_lib",
         ":response_handler_lib",
-        ":retry_body_log_lib",
+        ":retry_body_session_lib",
         ":schema_lib",
         ":serializer_lib",
         ":stats_lib",
         "//envoy/common:exception_lib",
         "//envoy/http:codes_interface",
-        "//envoy/http:request_body_log_interface",
+        "//envoy/http:retry_body_session_interface",
         "//envoy/router:router_interface",
         "//envoy/server:factory_context_interface",
         "//envoy/stats:stats_interface",

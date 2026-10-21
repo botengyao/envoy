@@ -224,8 +224,7 @@ FilterConfig::FilterConfig(
       max_parsed_sse_events_(
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto.response_handling().token_usage().limits(),
                                           max_parsed_sse_events, DefaultMaxParsedSseEvents)),
-      retry_body_log_(proto.request_handling().retry_body_log()),
-      retry_body_log_max_bytes_(proto.request_handling().retry_body_log_max_bytes()),
+      retry_session_(proto.request_handling().retry_session()),
       ai_filter_factories_(std::move(ai_filter_factories)),
       buffer_factory_(std::move(buffer_factory)) {
   ASSERT(buffer_factory_ != nullptr);
@@ -259,6 +258,8 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
 }
 
 void AiProtocolManagerFilter::onDestroy() {
+  // The session keeps whatever this filter wrote; only the writer goes.
+  session_writer_.reset();
   if (decode_bridge_ != nullptr) {
     // Detach the bridge first so all registered BufferManagers on this path are detached and
     // their callbacks disarmed before cancelling coroutines in filter_manager_.
@@ -292,11 +293,6 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // since no body would ever arrive to drive the replay that releases them.)
   if (end_stream) {
     return Http::FilterHeadersStatus::Continue;
-  }
-
-  // Lent whether or not this filter inspects the request: the router writes the log either way.
-  if (config_->retryBodyLog()) {
-    lendRetryBodyLog();
   }
 
   // Copy what the route declared; see the note on route_has_request_ for why the
@@ -335,9 +331,15 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
-  JsonWithExtBufParser::Config parser_config;
-  parser_config.inline_string_threshold_bytes = inlineStringThresholdBytes();
-  request_parser_ = std::make_unique<JsonWithExtBufParser>(parser_config);
+  if (config_->retrySession() && isAiEndpoint() &&
+      decoder_callbacks_->upstreamCallbacks().has_value()) {
+    useRetrySession();
+  }
+  if (session_mode_ != SessionMode::Adopted) {
+    JsonWithExtBufParser::Config parser_config;
+    parser_config.inline_string_threshold_bytes = inlineStringThresholdBytes();
+    request_parser_ = std::make_unique<JsonWithExtBufParser>(parser_config);
+  }
   // Built here, not at setDecoderFilterCallbacks(), so a pass-through stream pays
   // for none of it: constructing it subscribes to upstream watermarks and claims
   // a schedulable callback.
@@ -346,20 +348,12 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   // A request small enough that the chain would have buffered it anyway is held in memory and
   // replayed from there, so it costs no storage IO at all. Past that the chain would have pushed
   // back, which is exactly the point at which offloading starts to pay for itself.
-  ExternalBufferFactory* decode_factory = &config_->bufferFactory();
-  // Upstream, the frames this filter receives are the ones the router appends to the log.
-  if (retry_body_log_ != nullptr && decoder_callbacks_->upstreamCallbacks().has_value()) {
-    std::optional<uint64_t> content_length;
-    if (uint64_t length; absl::SimpleAtoi(headers.getContentLengthValue(), &length)) {
-      content_length = length;
-    }
-    decode_buffer_factory_ = std::make_unique<BorrowingExternalBufferFactory>(
-        retry_body_log_, config_->bufferFactory(), content_length);
-    decode_factory = decode_buffer_factory_.get();
-  }
   decode_manager_ = std::make_shared<BufferManager>(
-      BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, *decode_factory,
+      BufferManager::Config{decoder_callbacks_->decoderBufferLimit()}, config_->bufferFactory(),
       *decode_bridge_);
+  if (session_mode_ != SessionMode::None) {
+    decode_manager_->adoptStore(retry_session_->view());
+  }
 
   // Pin the headers so routing and admission filters do not act on them before
   // the payload is offloaded. decodeData() still fires while iteration is stopped
@@ -369,20 +363,37 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
   return Http::FilterHeadersStatus::StopIteration;
 }
 
-void AiProtocolManagerFilter::lendRetryBodyLog() {
-  // The log lives in the downstream stream's filter state, which upstream filters share, so it
-  // outlasts the attempt whose filter created it. FilterChain keeps a stream recreated for an
-  // internal redirect from inheriting it.
+void AiProtocolManagerFilter::useRetrySession() {
   StreamInfo::FilterState& filter_state = *decoder_callbacks_->streamInfo().filterState();
-  retry_body_log_ = std::dynamic_pointer_cast<Http::RequestBodyLog>(
-      filter_state.getDataSharedMutableGeneric(Http::RequestBodyLog::key()));
-  if (retry_body_log_ == nullptr) {
-    retry_body_log_ = std::make_shared<ExternalBufferRequestBodyLog>(
-        decoder_callbacks_->dispatcher(), config_->bufferFactoryShared(),
-        decoder_callbacks_->decoderBufferLimit(), config_->retryBodyLogMaxBytes());
-    filter_state.setData(Http::RequestBodyLog::key(), retry_body_log_,
-                         StreamInfo::FilterState::LifeSpan::FilterChain);
+  const uint32_t attempt = decoder_callbacks_->streamInfo().attemptCount().value_or(1);
+  auto session = std::dynamic_pointer_cast<RetryBodySessionImpl>(
+      filter_state.getDataSharedMutableGeneric(Http::RetryBodySession::key()));
+  if (session != nullptr && session->handedOver()) {
+    // The router no longer has the body, so this attempt takes it from the session or not at all.
+    const nlohmann::json* document = session->document(parseTag());
+    if (!session->ended() || session->failed() || document == nullptr) {
+      config_->stats().request_session_not_adoptable_.inc();
+      ENVOY_LOG(debug, "ai_protocol_manager: cannot adopt the retry session");
+      return;
+    }
+    ENVOY_LOG(debug, "ai_protocol_manager: reusing the parsed request from the retry session");
+    session->adopt(attempt);
+    request_json_.setJson(*document);
+    retry_session_ = std::move(session);
+    session_mode_ = SessionMode::Adopted;
+    config_->stats().request_session_adopted_.inc();
+    return;
   }
+  // The router still has the body and sends all of it to this attempt, so the session starts over.
+  session = std::make_shared<RetryBodySessionImpl>(
+      config_->bufferFactory().createBuffer(decoder_callbacks_->dispatcher()),
+      decoder_callbacks_->decoderBufferLimit(), attempt);
+  session_writer_ = session->attachWriter(*this, 0);
+  filter_state.setData(Http::RetryBodySession::key(), session,
+                       StreamInfo::FilterState::LifeSpan::FilterChain);
+  retry_session_ = std::move(session);
+  session_mode_ = SessionMode::Writer;
+  config_->stats().request_session_written_.inc();
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
@@ -439,7 +450,26 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
     config_->stats().request_parsed_.inc();
+    // Copied before any AI filter edits it in place; only worth it once later attempts need it.
+    if (session_mode_ == SessionMode::Writer && retry_session_->handedOver()) {
+      retry_session_->setDocument(parseTag(), request_json_.json());
+    }
   }
+  return true;
+}
+
+bool AiProtocolManagerFilter::rejectFailedSession() {
+  if (!retry_session_->failed()) {
+    return false;
+  }
+  // Failed here, while the frame is in hand, rather than from the end write inside
+  // finalizeDecode().
+  payload_rejected_ = true;
+  session_writer_.reset();
+  config_->stats().request_external_buffer_error_.inc();
+  decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError, "AI protocol buffer error",
+                                     nullptr, std::nullopt,
+                                     "ai_protocol_manager_external_buffer_error");
   return true;
 }
 
@@ -462,6 +492,23 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 
+  if (session_mode_ == SessionMode::Adopted) {
+    // The router sends an adopting attempt only the end of the stream.
+    if (data.length() > 0) {
+      payload_rejected_ = true;
+      decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError,
+                                         "request body sent to an attempt that adopted the retry "
+                                         "session",
+                                         nullptr, std::nullopt,
+                                         "ai_protocol_manager_session_unexpected_body");
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+    if (end_stream) {
+      finalizeDecode(/*has_trailers=*/false);
+    }
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
   if (request_parser_ != nullptr) {
     // The framing promised a body but no byte of one arrived -- a chunked request
     // whose only chunk is the terminator, or an empty terminal DATA frame. There
@@ -475,7 +522,17 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
     }
   }
 
-  decode_manager_->onData(data);
+  if (session_writer_ != nullptr) {
+    session_writer_->append(data);
+    if (end_stream) {
+      session_writer_->end();
+    }
+    if (rejectFailedSession()) {
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+  } else {
+    decode_manager_->onData(data);
+  }
   if (end_stream) {
     finalizeDecode(/*has_trailers=*/false);
   }
@@ -500,6 +557,12 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
   if (request_parser_ != nullptr) {
     Buffer::OwnedImpl empty;
     if (!feedParser(empty, /*end_stream=*/true)) {
+      return Http::FilterTrailersStatus::StopIteration;
+    }
+  }
+  if (session_writer_ != nullptr) {
+    session_writer_->end();
+    if (rejectFailedSession()) {
       return Http::FilterTrailersStatus::StopIteration;
     }
   }

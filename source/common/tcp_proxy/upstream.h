@@ -354,7 +354,6 @@ public:
   void onPerTryTimeout(UpstreamRequest&) override {}
   void onPerTryIdleTimeout(UpstreamRequest&) override {}
   void onStreamMaxDurationReached(UpstreamRequest&) override {}
-  void onUpstreamRequestBodyFlowControl(UpstreamRequest&, bool) override {}
   void setupRouteTimeoutForWebsocketUpgrade() override {}
   void disableRouteTimeoutForWebsocketUpgrade() override {}
   Http::StreamDecoderFilterCallbacks* callbacks() override { return &decoder_filter_callbacks_; }

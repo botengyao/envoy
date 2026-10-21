@@ -172,8 +172,6 @@ public:
   bool encodeComplete() const { return router_sent_end_stream_; }
   // Exposes streamInfo for the upstream stream.
   StreamInfo::StreamInfo& streamInfo() { return stream_info_; }
-  // Whether this request is pushing back on the request body the router sends it.
-  bool bodyFlowControlled() const { return downstream_data_disabled_ > 0; }
   bool hadUpstream() const { return had_upstream_; }
   // Disable per-try timeouts for websocket upgrades after successful handshake
   void disablePerTryTimeoutForWebsocketUpgrade();

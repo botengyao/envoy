@@ -123,17 +123,15 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
-    name = "retry_body_log_test",
-    srcs = ["retry_body_log_test.cc"],
+    name = "retry_body_session_test",
+    srcs = ["retry_body_session_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
     rbe_pool = "linux_x64_small",
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
-        "//source/extensions/filters/http/ai_protocol_manager:retry_body_log_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:retry_body_session_lib",
         "//test/mocks/event:event_mocks",
-        "//test/test_common:status_utility_lib",
-        "@abseil-cpp//absl/crc:crc32c",
     ],
 )
 
@@ -177,9 +175,11 @@ envoy_extension_cc_test(
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_state_lib",
         "//source/extensions/filters/http/ai_protocol_manager:external_buffer_impl_lib",
         "//source/extensions/filters/http/ai_protocol_manager:filter_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:retry_body_session_lib",
         "//source/extensions/filters/http/ai_protocol_manager:serializer_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/stats:stats_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
         "//test/test_common:logging_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",

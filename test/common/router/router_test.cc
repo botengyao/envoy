@@ -10,6 +10,7 @@
 #include "envoy/extensions/upstreams/http/http/v3/http_connection_pool.pb.h"
 #include "envoy/extensions/upstreams/http/tcp/v3/tcp_connection_pool.pb.h"
 #include "envoy/extensions/upstreams/tcp/generic/v3/generic_connection_pool.pb.h"
+#include "envoy/http/retry_body_session.h"
 #include "envoy/type/v3/percent.pb.h"
 
 #include "source/common/buffer/buffer_impl.h"
@@ -3863,6 +3864,313 @@ TEST_F(RouterTest, BufferLimitLogicMaxUint32Boundary) {
   // Should be successful with the large buffer limit
   EXPECT_EQ(1000U, decoding_buffer.length());
   EXPECT_TRUE(verifyHostUpstreamStats(1, 0));
+}
+
+// What an upstream filter that keeps the body would publish.
+class FakeRetryBodySession : public Http::RetryBodySession {
+public:
+  uint32_t attempt() const override { return attempt_; }
+  uint64_t length() const override { return length_; }
+  bool failed() const override { return failed_; }
+  void handOver() override { handed_over_ = true; }
+  bool hasWriter() const override { return false; }
+  WriterPtr attachWriter(WriterCallbacks&, uint64_t) override { return nullptr; }
+
+  uint32_t attempt_{1};
+  uint64_t length_{0};
+  bool failed_{false};
+  bool handed_over_{false};
+};
+
+class RouterRetryBodySessionTest : public RouterTest {
+public:
+  explicit RouterRetryBodySessionTest(uint64_t buffer_limit = 0) : buffer_limit_(buffer_limit) {}
+
+  void SetUp() override {
+    EXPECT_CALL(callbacks_.route_->route_entry_, requestBodyBufferLimit())
+        .WillRepeatedly(Return(buffer_limit_));
+    // Buffers and drains as the filter manager does: a decoding buffer exists only once something
+    // has been buffered.
+    ON_CALL(callbacks_, addDecodedData(_, true))
+        .WillByDefault(Invoke([this](Buffer::Instance& data, bool) {
+          if (callbacks_.buffer_ == nullptr) {
+            callbacks_.buffer_ = std::make_unique<Buffer::OwnedImpl>();
+          }
+          callbacks_.buffer_->move(data);
+        }));
+    ON_CALL(callbacks_, modifyDecodingBuffer(_))
+        .WillByDefault(Invoke([this](std::function<void(Buffer::Instance&)> callback) {
+          ASSERT_NE(callbacks_.buffer_, nullptr);
+          callback(*callbacks_.buffer_);
+        }));
+    callbacks_.streamInfo().filterState()->setData(Http::RetryBodySession::key(), session_,
+                                                   StreamInfo::FilterState::LifeSpan::FilterChain);
+    expectNewStreamWithImmediateEncoder(encoder1_, &response_decoder_, Http::Protocol::Http10);
+    Http::TestRequestHeaderMapImpl headers{{"x-envoy-retry-on", "5xx"},
+                                           {"x-envoy-internal", "true"}};
+    HttpTestUtility::addDefaultHeaders(headers);
+    headers_ = headers;
+    router_->decodeHeaders(headers_, false);
+    EXPECT_CALL(*router_->retry_state_, enabled()).WillRepeatedly(Return(true));
+    ON_CALL(*router_->retry_state_, wouldRetryFromHeaders(_, _, _))
+        .WillByDefault(Return(RetryState::RetryDecision::NoRetry));
+  }
+
+  // Expects the retry to get headers that do not end the stream, adopts the session as the new
+  // attempt's filter would, and expects the end of the body only.
+  void expectAdoptedRetry(NiceMock<Http::MockRequestEncoder>& encoder) {
+    expectNewStreamWithImmediateEncoder(encoder, &response_decoder_, Http::Protocol::Http10);
+    EXPECT_CALL(encoder, encodeHeaders(_, false)).WillOnce(Invoke([this](auto&, bool) {
+      session_->attempt_ = 2;
+      return absl::OkStatus();
+    }));
+    EXPECT_CALL(encoder, encodeData(BufferString(""), true));
+  }
+
+  void respondOk() {
+    Http::ResponseHeaderMapPtr response_headers(
+        new Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+    EXPECT_CALL(callbacks_, encodeHeaders_(_, true));
+    response_decoder_->decodeHeaders(std::move(response_headers), true);
+  }
+
+  uint64_t counter(absl::string_view name) {
+    return stats_store_.counter(absl::StrCat("test.", name)).value();
+  }
+  uint64_t abandoned() {
+    return cm_.thread_local_cluster_.cluster_.info_->stats_store_
+        .counter("retry_or_shadow_abandoned")
+        .value();
+  }
+
+  const uint64_t buffer_limit_;
+  const std::shared_ptr<FakeRetryBodySession> session_{std::make_shared<FakeRetryBodySession>()};
+  Http::TestRequestHeaderMapImpl headers_;
+  NiceMock<Http::MockRequestEncoder> encoder1_;
+  Http::ResponseDecoder* response_decoder_{};
+};
+
+// With no room to buffer, the router hands the body over to the live attempt's session and keeps
+// no copy, not even a decoding buffer; a retry after a reset gets the end of the body only, from an
+// attempt that adopted the session.
+TEST_F(RouterRetryBodySessionTest, HandsOverAndRetriesAfterAReset) {
+  expectResponseTimerCreate();
+  EXPECT_CALL(callbacks_, addDecodedData(_, _)).Times(0);
+  EXPECT_CALL(encoder1_, encodeData(BufferString("body"), true));
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, true);
+  EXPECT_TRUE(session_->handed_over_);
+  EXPECT_EQ(1U, counter("retry_session_handed_over"));
+
+  session_->length_ = 4;
+  router_->retry_state_->expectResetRetry();
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectAdoptedRetry(encoder2);
+  router_->retry_state_->callback_();
+  respondOk();
+  EXPECT_EQ(0U, counter("retry_session_not_adopted"));
+}
+
+// The same through a retriable response, the failover the design is for.
+TEST_F(RouterRetryBodySessionTest, RetriesAfterARetriableResponse) {
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, true);
+  session_->length_ = 4;
+
+  EXPECT_CALL(*router_->retry_state_, wouldRetryFromHeaders(_, _, _))
+      .WillOnce(Return(RetryState::RetryDecision::RetryWithBackoff))
+      .WillRepeatedly(Return(RetryState::RetryDecision::NoRetry));
+  router_->retry_state_->expectHeadersRetry();
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "503"}}));
+  response_decoder_->decodeHeaders(std::move(response_headers), true);
+
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectAdoptedRetry(encoder2);
+  router_->retry_state_->callback_();
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _))
+      .WillOnce(Return(RetryStatus::No));
+  respondOk();
+}
+
+// A request with trailers gets them on the retry in place of the empty end of the body.
+TEST_F(RouterRetryBodySessionTest, RetrySendsTheTrailers) {
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  expectResponseTimerCreate();
+  Http::TestRequestTrailerMapImpl trailers{{"some", "trailer"}};
+  router_->decodeTrailers(trailers);
+  session_->length_ = 4;
+  router_->retry_state_->expectResetRetry();
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectNewStreamWithImmediateEncoder(encoder2, &response_decoder_, Http::Protocol::Http10);
+  EXPECT_CALL(encoder2, encodeHeaders(_, false)).WillOnce(Invoke([this](auto&, bool) {
+    session_->attempt_ = 2;
+    return absl::OkStatus();
+  }));
+  EXPECT_CALL(encoder2, encodeData(_, _)).Times(0);
+  EXPECT_CALL(encoder2, encodeTrailers(HeaderMapEqualRef(&trailers)));
+  router_->retry_state_->callback_();
+  respondOk();
+}
+
+// A retry needs the whole body in the session: an attempt that fails while the body is still
+// arriving is not retried, as after a buffer overflow.
+TEST_F(RouterRetryBodySessionTest, NoRetryWhileTheBodyIsArriving) {
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  session_->length_ = 4;
+  EXPECT_CALL(*router_->retry_state_, shouldRetryReset(_, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _));
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_EQ(1U, counter("retry_session_incomplete"));
+  EXPECT_EQ(1U, abandoned());
+}
+
+// The same for a retriable response: it reaches the client instead.
+TEST_F(RouterRetryBodySessionTest, NoRetryOnAResponseWhileTheBodyIsArriving) {
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  session_->length_ = 4;
+  EXPECT_CALL(*router_->retry_state_, wouldRetryFromHeaders(_, _, _))
+      .WillOnce(Return(RetryState::RetryDecision::RetryWithBackoff));
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true))
+      .WillOnce(Invoke([](Http::ResponseHeaderMap& headers, bool) {
+        EXPECT_EQ(headers.getStatusValue(), "429");
+      }));
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "429"}}));
+  response_decoder_->decodeHeaders(std::move(response_headers), true);
+  EXPECT_EQ(1U, counter("retry_session_incomplete"));
+}
+
+// The body ended, but the session's store failed.
+TEST_F(RouterRetryBodySessionTest, NoRetryFromAFailedSession) {
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, true);
+  session_->length_ = 4;
+  session_->failed_ = true;
+  EXPECT_CALL(*router_->retry_state_, shouldRetryReset(_, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _));
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_EQ(1U, counter("retry_session_incomplete"));
+}
+
+// The session holds fewer bytes than the router forwarded.
+TEST_F(RouterRetryBodySessionTest, NoRetryFromAShortSession) {
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl first("ab");
+  router_->decodeData(first, false);
+  Buffer::OwnedImpl second("cd");
+  router_->decodeData(second, true);
+  session_->length_ = 3;
+  EXPECT_CALL(*router_->retry_state_, shouldRetryReset(_, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _));
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  EXPECT_EQ(1U, counter("retry_session_incomplete"));
+}
+
+// A retry whose attempt did not adopt the session would go out without a body, so the router
+// fails it instead.
+TEST_F(RouterRetryBodySessionTest, FailsARetryThatDidNotAdopt) {
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, true);
+  session_->length_ = 4;
+  router_->retry_state_->expectResetRetry();
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectNewStreamWithImmediateEncoder(encoder2, &response_decoder_, Http::Protocol::Http10);
+  EXPECT_CALL(encoder2, encodeData(_, _)).Times(0);
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::ServiceUnavailable, _, _, _, "retry_session_not_adopted"));
+  router_->retry_state_->callback_();
+  EXPECT_EQ(1U, counter("retry_session_not_adopted"));
+}
+
+// A session holding bytes the attempt was never sent is not handed the body; the router gives up
+// on retries as it does at an overflow today.
+TEST_F(RouterRetryBodySessionTest, NoHandOverToASessionWithExtraBytes) {
+  session_->length_ = 7;
+  EXPECT_CALL(encoder1_, encodeData(BufferString("body"), false));
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  EXPECT_FALSE(session_->handed_over_);
+  EXPECT_EQ(0U, counter("retry_session_handed_over"));
+  EXPECT_EQ(1U, abandoned());
+  router_->onDestroy();
+}
+
+TEST_F(RouterRetryBodySessionTest, NoHandOverToAFailedSession) {
+  session_->failed_ = true;
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  EXPECT_FALSE(session_->handed_over_);
+  EXPECT_EQ(1U, abandoned());
+  router_->onDestroy();
+}
+
+// A session written by another attempt holds another attempt's bytes.
+TEST_F(RouterRetryBodySessionTest, NoHandOverToAnotherAttemptsSession) {
+  session_->attempt_ = 2;
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, false);
+  EXPECT_FALSE(session_->handed_over_);
+  EXPECT_EQ(1U, abandoned());
+  router_->onDestroy();
+}
+
+class RouterRetryBodySessionGradedTest : public RouterRetryBodySessionTest {
+public:
+  RouterRetryBodySessionGradedTest() : RouterRetryBodySessionTest(4) {}
+};
+
+// Under a limit, the router keeps a copy as today; at the frame that would cross it, it hands the
+// body over to a session holding everything forwarded so far, and drops its copy.
+TEST_F(RouterRetryBodySessionGradedTest, HandsOverWhereTheBufferWouldOverflow) {
+  EXPECT_CALL(encoder1_, encodeData(BufferString("ab"), false));
+  Buffer::OwnedImpl first("ab");
+  router_->decodeData(first, false);
+  ASSERT_NE(callbacks_.buffer_, nullptr);
+  EXPECT_EQ(callbacks_.buffer_->length(), 2);
+  EXPECT_FALSE(session_->handed_over_);
+
+  session_->length_ = 2;
+  EXPECT_CALL(encoder1_, encodeData(BufferString("cdef"), true));
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl second("cdef");
+  router_->decodeData(second, true);
+  EXPECT_TRUE(session_->handed_over_);
+  EXPECT_EQ(callbacks_.buffer_->length(), 0);
+
+  session_->length_ = 6;
+  router_->retry_state_->expectResetRetry();
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectAdoptedRetry(encoder2);
+  router_->retry_state_->callback_();
+  respondOk();
+}
+
+// A filter ahead of the session's writer held bytes back: the router keeps the retry decision to
+// itself and gives up, as today.
+TEST_F(RouterRetryBodySessionGradedTest, NoHandOverToASessionMissingBytes) {
+  Buffer::OwnedImpl first("ab");
+  router_->decodeData(first, false);
+  session_->length_ = 1;
+  Buffer::OwnedImpl second("cdef");
+  router_->decodeData(second, false);
+  EXPECT_FALSE(session_->handed_over_);
+  EXPECT_EQ(1U, abandoned());
+  router_->onDestroy();
 }
 
 // Two requests are sent (slow request + hedged retry) and then global timeout

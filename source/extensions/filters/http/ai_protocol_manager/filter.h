@@ -20,7 +20,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/llm_binding.h"
 #include "source/extensions/filters/http/ai_protocol_manager/llm_protocol_conversion.h"
 #include "source/extensions/filters/http/ai_protocol_manager/response_handler.h"
-#include "source/extensions/filters/http/ai_protocol_manager/retry_body_log.h"
+#include "source/extensions/filters/http/ai_protocol_manager/retry_body_session.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stats.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
@@ -63,8 +63,7 @@ public:
   uint32_t maxSseEventSize() const { return max_sse_event_size_; }
   uint32_t maxJsonBodySize() const { return max_json_body_size_; }
   uint32_t maxParsedSseEvents() const { return max_parsed_sse_events_; }
-  bool retryBodyLog() const { return retry_body_log_; }
-  uint64_t retryBodyLogMaxBytes() const { return retry_body_log_max_bytes_; }
+  bool retrySession() const { return retry_session_; }
   AiProtocolManagerStats& stats() const { return stats_; }
   ExternalBufferFactory& bufferFactory() const { return *buffer_factory_; }
   const ExternalBufferFactorySharedPtr& bufferFactoryShared() const { return buffer_factory_; }
@@ -85,8 +84,7 @@ private:
   const uint32_t max_sse_event_size_ = 0;
   const uint32_t max_json_body_size_ = 0;
   const uint32_t max_parsed_sse_events_ = 0;
-  const bool retry_body_log_ = false;
-  const uint64_t retry_body_log_max_bytes_ = 0;
+  const bool retry_session_ = false;
   const AiFilterFactories ai_filter_factories_;
   const ExternalBufferFactorySharedPtr buffer_factory_;
 };
@@ -191,6 +189,7 @@ private:
 // mutates the response; extraction works on bounded side state, synchronously
 // on the encode callbacks, and no handler failure can affect the stream.
 class AiProtocolManagerFilter : public Http::PassThroughFilter,
+                                public Http::RetryBodySession::WriterCallbacks,
                                 public Logger::Loggable<Logger::Id::filter> {
 public:
   explicit AiProtocolManagerFilter(FilterConfigSharedPtr config) : config_(std::move(config)) {}
@@ -210,7 +209,25 @@ public:
   Http::FilterDataStatus encodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus encodeTrailers(Http::ResponseTrailerMap& trailers) override;
 
+  // Http::RetryBodySession::WriterCallbacks, for the retry session this filter writes.
+  void onSessionAboveHighWatermark() override {
+    decoder_callbacks_->onDecoderFilterAboveWriteBufferHighWatermark();
+  }
+  void onSessionBelowLowWatermark() override {
+    decoder_callbacks_->onDecoderFilterBelowWriteBufferLowWatermark();
+  }
+  // The filter checks the session after each frame it hands it.
+  void onSessionFailed() override {}
+
 private:
+  // How this filter uses the stream's retry session.
+  enum class SessionMode {
+    None,
+    // Takes the body the router forwards into a new session.
+    Writer,
+    // Takes its body and parsed document from a session another attempt wrote.
+    Adopted,
+  };
   // Feeds one body frame to the parser in place. Returns false only if the
   // payload was rejected, in which case the caller must not offload or replay
   // it; a best-effort parse that fails abandons parsing and returns true.
@@ -218,6 +235,9 @@ private:
 
   // Terminates the stream with a 400 for a payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
+
+  // Terminates the stream with a 500 if the retry session this filter writes has failed.
+  bool rejectFailedSession();
 
   // Whether the route handed its request payload to the filter, which is also
   // what makes a parse failure fatal.
@@ -232,8 +252,12 @@ private:
   // Returns whether a record was published for this stream.
   bool finalizeResponseHandling();
 
-  // Finds the stream's request body log, or creates one in this filter's external buffer.
-  void lendRetryBodyLog();
+  // Writes a new retry session or adopts the stream's, and sets session_mode_. Called in an
+  // upstream installation once the stream is known to be parsed.
+  void useRetrySession();
+  RetryBodySessionImpl::ParseTag parseTag() const {
+    return {request_protocol_, inlineStringThresholdBytes()};
+  }
 
   // Finalizes the decode path when the full request body (and optional trailers) has been received.
   // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
@@ -247,11 +271,6 @@ private:
   // Declared before decode_manager_, encode_manager_, and filter_manager_ so they outlive the
   // managers and coroutines that reference them.
   FilterChainBridgePtr decode_bridge_;
-  // The stream's request body log, when this filter lends one.
-  std::shared_ptr<Http::RequestBodyLog> retry_body_log_;
-  // The factory decode_manager_ stores the payload with when an upstream installation reads it back
-  // from the router's request body log.
-  std::unique_ptr<ExternalBufferFactory> decode_buffer_factory_;
 
   // Non-null exactly when decodeHeaders() decided to inspect this stream, so it
   // doubles as the engaged flag. Outlives request_parser_, which is released as
@@ -274,6 +293,11 @@ private:
   // Cleared once parsing is done with, whether it completed, was abandoned, or
   // failed the request.
   std::unique_ptr<JsonWithExtBufParser> request_parser_;
+
+  SessionMode session_mode_{SessionMode::None};
+  std::shared_ptr<RetryBodySessionImpl> retry_session_;
+  // Held while this filter writes the session.
+  Http::RetryBodySession::WriterPtr session_writer_;
 
   // Once set, later frames on the dying stream are dropped, not offloaded.
   bool payload_rejected_{false};

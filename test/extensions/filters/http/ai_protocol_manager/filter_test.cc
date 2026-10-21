@@ -12,11 +12,13 @@
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter_state.h"
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/retry_body_session.h"
 #include "source/extensions/filters/http/ai_protocol_manager/serializer.h"
 
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/stats/mocks.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/utility.h"
 
@@ -2448,6 +2450,243 @@ TEST_F(AiProtocolManagerFilterTest,
   EXPECT_EQ(
       encoded_injected_.toString(),
       R"({"model":"gpt-4","usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12},"tagged":true})");
+}
+
+// The upstream side of an upstream installation, which is all that makes the filter one.
+class FakeUpstreamCallbacks : public Http::UpstreamStreamFilterCallbacks {
+public:
+  StreamInfo::StreamInfo& upstreamStreamInfo() override { return stream_info_; }
+  OptRef<Router::GenericUpstream> upstream() override { return {}; }
+  void dumpState(std::ostream&, int) const override {}
+  bool pausedForConnect() const override { return false; }
+  void setPausedForConnect(bool) override {}
+  bool pausedForWebsocketUpgrade() const override { return false; }
+  void setPausedForWebsocketUpgrade(bool) override {}
+  bool pausedForGenericUpgrade() const override { return false; }
+  void setPausedForGenericUpgrade(bool) override {}
+  void disableRouteTimeoutForWebsocketUpgrade() override {}
+  void disablePerTryTimeoutForWebsocketUpgrade() override {}
+  const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
+    return options_;
+  }
+  void addUpstreamCallbacks(Http::UpstreamCallbacks&) override {}
+  void setUpstreamToDownstream(Router::UpstreamToDownstream&) override {}
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  Http::ConnectionPool::Instance::StreamOptions options_;
+};
+
+// A store whose writes fail as they are made.
+class SyncFailingBuffer : public ExternalBuffer {
+public:
+  void write(Buffer::InstancePtr, bool, WriteCallback cb) override {
+    cb(ExternalBufferStatus::Error);
+  }
+  void read(uint64_t, uint64_t, ReadCallback cb) override {
+    cb(ExternalBufferStatus::Error, nullptr);
+  }
+  uint64_t length() const override { return 0; }
+};
+
+class SyncFailingBufferFactory : public ExternalBufferFactory {
+public:
+  using ExternalBufferFactory::createBuffer;
+  ExternalBufferPtr createBuffer(Event::Dispatcher&) override {
+    return std::make_unique<SyncFailingBuffer>();
+  }
+};
+
+// An upstream installation with retry_session: each "attempt" is a new filter on the same stream.
+class AiProtocolManagerFilterSessionTest : public AiProtocolManagerFilterTest {
+public:
+  static constexpr absl::string_view Body =
+      R"({"model":"m","messages":[{"role":"user","content":"hi"}]})";
+
+  AiProtocolManagerFilterSessionTest() {
+    ON_CALL(callbacks_, upstreamCallbacks())
+        .WillByDefault(testing::Return(OptRef<Http::UpstreamStreamFilterCallbacks>{upstream_}));
+    setRouteConfig();
+    startAttempt(1);
+  }
+
+  // Replaces the filter as the router does for a new attempt.
+  void startAttempt(uint32_t attempt) {
+    filter_->onDestroy();
+    envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto;
+    proto.mutable_request_handling()->set_retry_session(true);
+    // Forwarded as received, so the replay shows which bytes the attempt took.
+    proto.mutable_request_handling()->set_reserialize_body(
+        envoy::extensions::filters::http::ai_protocol_manager::v3::RequestHandling::DISABLE);
+    filter_ = std::make_unique<AiProtocolManagerFilter>(std::make_shared<const FilterConfig>(
+        proto, *stats_store_.rootScope(), AiFilterFactories{}, factory_));
+    filter_->setDecoderFilterCallbacks(callbacks_);
+    filter_->setEncoderFilterCallbacks(encoder_callbacks_);
+    callbacks_.stream_info_.attempt_count_ = attempt;
+    injected_.drain(injected_.length());
+    injected_end_stream_ = false;
+  }
+
+  // The session's bytes are readable once its end is written, so replay starts on the next pass.
+  void runReplay() {
+    drain();
+    while (replay_cb_ != nullptr && replay_cb_->enabled()) {
+      replay_cb_->invokeCallback();
+      drain();
+    }
+  }
+
+  // How this fixture's chat route parses a request.
+  static RetryBodySessionImpl::ParseTag parseTag() {
+    return {LLMProtocol::OpenAiChatCompletions,
+            JsonWithExtBufParser::kDefaultInlineStringThresholdBytes};
+  }
+
+  std::shared_ptr<RetryBodySessionImpl> session() {
+    return std::dynamic_pointer_cast<RetryBodySessionImpl>(
+        callbacks_.stream_info_.filterState()->getDataSharedMutableGeneric(
+            Http::RetryBodySession::key()));
+  }
+
+  // Attempt 1 takes the whole body into a session the router has handed over.
+  void writeHandedOverSession() {
+    ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+    session()->handOver();
+    Buffer::OwnedImpl body(Body);
+    filter_->decodeData(body, true);
+    runReplay();
+  }
+
+  FakeUpstreamCallbacks upstream_;
+};
+
+TEST_F(AiProtocolManagerFilterSessionTest, WriterKeepsTheBodyInASession) {
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  ASSERT_NE(session(), nullptr);
+  EXPECT_EQ(session()->attempt(), 1);
+  EXPECT_EQ(counterValue("request_session_written"), 1);
+
+  Buffer::OwnedImpl first(Body.substr(0, 10));
+  EXPECT_EQ(filter_->decodeData(first, false), Http::FilterDataStatus::StopIterationNoBuffer);
+  Buffer::OwnedImpl rest(Body.substr(10));
+  EXPECT_EQ(filter_->decodeData(rest, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  EXPECT_EQ(session()->length(), Body.size());
+  // Never handed over, so nothing keeps the parsed document for another attempt.
+  EXPECT_TRUE(session()->ended());
+  EXPECT_EQ(session()->document(parseTag()), nullptr);
+
+  runReplay();
+  EXPECT_EQ(injected_.toString(), Body);
+  EXPECT_TRUE(injected_end_stream_);
+}
+
+// The parsed document is kept only when the router handed the body over.
+TEST_F(AiProtocolManagerFilterSessionTest, KeepsTheDocumentOnceHandedOver) {
+  writeHandedOverSession();
+  EXPECT_NE(session()->document(parseTag()), nullptr);
+  EXPECT_EQ(counterValue("request_parsed"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterSessionTest, TrailersEndTheSession) {
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  session()->handOver();
+  Buffer::OwnedImpl body(Body);
+  filter_->decodeData(body, false);
+  EXPECT_FALSE(session()->ended());
+  Http::TestRequestTrailerMapImpl trailers;
+  EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::StopIteration);
+  EXPECT_TRUE(session()->ended());
+  EXPECT_NE(session()->document(parseTag()), nullptr);
+}
+
+// A retry sent from the router's own copy starts the session over.
+TEST_F(AiProtocolManagerFilterSessionTest, ReplacesASessionNotHandedOver) {
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  const auto first = session();
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_NE(session(), first);
+  EXPECT_EQ(session()->attempt(), 2);
+  EXPECT_EQ(counterValue("request_session_written"), 2);
+}
+
+// A later attempt takes its body and document from the session: no parse, and the router's empty
+// end of stream starts it.
+TEST_F(AiProtocolManagerFilterSessionTest, AdoptsACompleteSession) {
+  writeHandedOverSession();
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_EQ(session()->attempt(), 2);
+  EXPECT_EQ(counterValue("request_session_adopted"), 1);
+
+  Buffer::OwnedImpl end_of_body;
+  EXPECT_EQ(filter_->decodeData(end_of_body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  runReplay();
+  EXPECT_EQ(injected_.toString(), Body);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(counterValue("request_parsed"), 1);
+}
+
+TEST_F(AiProtocolManagerFilterSessionTest, AdoptedAttemptHoldsTheTrailers) {
+  writeHandedOverSession();
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Http::TestRequestTrailerMapImpl trailers;
+  EXPECT_EQ(filter_->decodeTrailers(trailers), Http::FilterTrailersStatus::StopIteration);
+  const int released = continue_calls_;
+  runReplay();
+  EXPECT_EQ(injected_.toString(), Body);
+  EXPECT_EQ(continue_calls_, released + 1);
+}
+
+// An adopting attempt is sent only the end of the stream; a body means the router lost track.
+TEST_F(AiProtocolManagerFilterSessionTest, AdoptedAttemptRejectsABody) {
+  writeHandedOverSession();
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl body("x");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  EXPECT_EQ(local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_session_unexpected_body");
+}
+
+// A handed-over session without the whole body cannot be adopted; the attempt does not stamp it,
+// so the router fails the retry.
+TEST_F(AiProtocolManagerFilterSessionTest, DoesNotAdoptAnIncompleteSession) {
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  session()->handOver();
+  Buffer::OwnedImpl body(Body.substr(0, 10));
+  filter_->decodeData(body, false);
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_EQ(session()->attempt(), 1);
+  EXPECT_EQ(counterValue("request_session_not_adoptable"), 1);
+}
+
+// A store that fails stops the request at the frame that found it, with one reply.
+TEST_F(AiProtocolManagerFilterSessionTest, FailedStoreRejectsOnce) {
+  factory_ = std::make_shared<SyncFailingBufferFactory>();
+  startAttempt(1);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl body(Body);
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_external_buffer_error");
+  EXPECT_EQ(counterValue("request_external_buffer_error"), 1);
+  drain();
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(inject_calls_, 0);
+}
+
+// A store falling behind pushes back on the router, as the buffer manager's own queue does.
+TEST_F(AiProtocolManagerFilterSessionTest, ForwardsTheSessionsBackPressure) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(4));
+  startAttempt(1);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  EXPECT_CALL(callbacks_, onDecoderFilterAboveWriteBufferHighWatermark());
+  Buffer::OwnedImpl body(Body);
+  filter_->decodeData(body, false);
+  EXPECT_CALL(callbacks_, onDecoderFilterBelowWriteBufferLowWatermark());
+  drain();
 }
 
 } // namespace

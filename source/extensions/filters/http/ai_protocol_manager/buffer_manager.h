@@ -239,6 +239,10 @@ public:
   // holds the filter chain (returns StopIteration*) while the body is buffered.
   void onData(Buffer::Instance& data);
 
+  // Uses `store`, which someone else fills, as the payload instead of onData(): length() is its
+  // length, and replay() reads from it. Called before anything else touches the payload.
+  void adoptStore(ExternalBufferPtr store);
+
   // Signals that the full body has been offloaded, flushing any batched backlog to
   // the buffer so all of it becomes durable, and is ready to replay.
   void endStream();

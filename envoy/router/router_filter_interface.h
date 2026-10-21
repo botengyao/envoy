@@ -104,14 +104,6 @@ public:
    */
   virtual void onStreamMaxDurationReached(UpstreamRequest& upstream_request) PURE;
 
-  /**
-   * This will be called when an upstream request starts or stops pushing back on the request body
-   * the router sends it.
-   * @param upstream_request the request whose buffers crossed a watermark.
-   * @param above true on the high watermark, false on the matching low watermark.
-   */
-  virtual void onUpstreamRequestBodyFlowControl(UpstreamRequest& upstream_request, bool above) PURE;
-
   /*
    * This will be called to set up the route timeout early for websocket upgrades.
    * This ensures the timeout is active during the upgrade negotiation phase.

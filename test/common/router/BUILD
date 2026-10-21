@@ -408,6 +408,7 @@ envoy_cc_test(
     shard_count = 5,
     deps = [
         ":router_test_base_lib",
+        "//envoy/http:retry_body_session_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/http:context_lib",
         "//source/common/network:application_protocol_lib",

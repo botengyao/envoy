@@ -268,6 +268,36 @@ TEST_F(BufferManagerTest, OffloadsAndReplaysBody) {
   EXPECT_EQ(bridge_->injected_.toString(), "{\"messages\":[\"hi\"]}");
 }
 
+// A store someone else filled: it takes only the empty write ending the payload.
+class FilledExternalBuffer : public ExternalBuffer {
+public:
+  explicit FilledExternalBuffer(std::string bytes) : bytes_(std::move(bytes)) {}
+  void write(Buffer::InstancePtr data, bool end_stream, WriteCallback cb) override {
+    cb(data->length() == 0 && end_stream ? ExternalBufferStatus::Ok : ExternalBufferStatus::Error);
+  }
+  void read(uint64_t offset, uint64_t length, ReadCallback cb) override {
+    cb(ExternalBufferStatus::Ok,
+       std::make_unique<Buffer::OwnedImpl>(absl::string_view(bytes_).substr(offset, length)));
+  }
+  uint64_t length() const override { return bytes_.size(); }
+
+private:
+  const std::string bytes_;
+};
+
+// An adopted store is the payload: its length counts, and replay reads it back.
+TEST_F(BufferManagerTest, ReplaysAnAdoptedStore) {
+  manager_->adoptStore(std::make_unique<FilledExternalBuffer>("{\"contents\":[]}"));
+  EXPECT_EQ(manager_->length(), 15);
+  EXPECT_FALSE(manager_->empty());
+  manager_->endStream();
+  replayAll();
+  replay_cb_->invokeCallback();
+  drain();
+  EXPECT_TRUE(replay_done_);
+  EXPECT_EQ(bridge_->injected_.toString(), "{\"contents\":[]}");
+}
+
 // A body that arrives in a single frame is still round-tripped.
 TEST_F(BufferManagerTest, SingleFrameBody) {
   Buffer::OwnedImpl body("{}");

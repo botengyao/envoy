@@ -35,8 +35,6 @@ public:
   MOCK_METHOD(void, onPerTryTimeout, (UpstreamRequest & upstream_request));
   MOCK_METHOD(void, onPerTryIdleTimeout, (UpstreamRequest & upstream_request));
   MOCK_METHOD(void, onStreamMaxDurationReached, (UpstreamRequest & upstream_request));
-  MOCK_METHOD(void, onUpstreamRequestBodyFlowControl,
-              (UpstreamRequest & upstream_request, bool above));
   MOCK_METHOD(void, setupRouteTimeoutForWebsocketUpgrade, ());
   MOCK_METHOD(void, disableRouteTimeoutForWebsocketUpgrade, ());
 
