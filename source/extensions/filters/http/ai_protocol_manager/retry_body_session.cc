@@ -14,8 +14,8 @@ public:
   explicit WriterImpl(std::shared_ptr<RetryBodySessionImpl> session)
       : session_(std::move(session)) {}
   ~WriterImpl() override { session_->detach(*this); }
-  void append(Buffer::Instance& data) override { session_->append(data); }
-  void end() override { session_->end(); }
+  void append(Buffer::Instance& data) override { session_->append(*this, data); }
+  void end() override { session_->end(*this); }
 
 private:
   const std::shared_ptr<RetryBodySessionImpl> session_;
@@ -56,7 +56,7 @@ RetryBodySessionImpl::RetryBodySessionImpl(ExternalBufferPtr store, uint64_t hig
 
 Http::RetryBodySession::WriterPtr RetryBodySessionImpl::attachWriter(WriterCallbacks& callbacks,
                                                                      uint64_t offset) {
-  if (writer_ != nullptr || ended_ || failed_ || offset != taken_) {
+  if (ended_ || failed_ || offset != taken_) {
     return nullptr;
   }
   auto writer = std::make_unique<WriterImpl>(shared_from_this());
@@ -88,19 +88,22 @@ ExternalBufferPtr RetryBodySessionImpl::view() {
   return std::make_unique<View>(shared_from_this());
 }
 
-void RetryBodySessionImpl::append(Buffer::Instance& data) {
-  ASSERT(!ended_);
-  if (failed_) {
+void RetryBodySessionImpl::append(WriterImpl& writer, Buffer::Instance& data) {
+  if (failed_ || &writer != writer_) {
     data.drain(data.length());
     return;
   }
+  ASSERT(!ended_);
   taken_ += data.length();
   pending_.move(data);
   maybeWrite();
   updateWatermark();
 }
 
-void RetryBodySessionImpl::end() {
+void RetryBodySessionImpl::end(WriterImpl& writer) {
+  if (&writer != writer_) {
+    return;
+  }
   ASSERT(!ended_);
   ended_ = true;
   maybeWrite();

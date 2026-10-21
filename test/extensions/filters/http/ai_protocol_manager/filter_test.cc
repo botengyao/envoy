@@ -2556,7 +2556,34 @@ public:
     runReplay();
   }
 
+  // Attempt 1 takes the first `prefix` bytes of `body` and is gone; attempt 2 claims the session,
+  // the router writes the rest of the body to it, and sends attempt 2 the end of the stream.
+  void claimAndFinishFromTheRouter(absl::string_view body, size_t prefix) {
+    ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+    session()->handOver();
+    Buffer::OwnedImpl first(body.substr(0, prefix));
+    filter_->decodeData(first, false);
+    startAttempt(2);
+    ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+    EXPECT_EQ(session()->attempt(), 2);
+
+    Http::RetryBodySession::WriterPtr writer = session()->attachWriter(router_, prefix);
+    ASSERT_NE(writer, nullptr);
+    Buffer::OwnedImpl rest(body.substr(prefix));
+    writer->append(rest);
+    writer->end();
+    Buffer::OwnedImpl end_of_body;
+    filter_->decodeData(end_of_body, true);
+  }
+
+  struct RouterWriterCallbacks : public Http::RetryBodySession::WriterCallbacks {
+    void onSessionAboveHighWatermark() override {}
+    void onSessionBelowLowWatermark() override {}
+    void onSessionFailed() override {}
+  };
+
   FakeUpstreamCallbacks upstream_;
+  RouterWriterCallbacks router_;
 };
 
 TEST_F(AiProtocolManagerFilterSessionTest, WriterKeepsTheBodyInASession) {
@@ -2649,13 +2676,77 @@ TEST_F(AiProtocolManagerFilterSessionTest, AdoptedAttemptRejectsABody) {
   EXPECT_EQ(local_reply_details_, "ai_protocol_manager_session_unexpected_body");
 }
 
-// A handed-over session without the whole body cannot be adopted; the attempt does not stamp it,
-// so the router fails the retry.
-TEST_F(AiProtocolManagerFilterSessionTest, DoesNotAdoptAnIncompleteSession) {
+// An attempt that failed while the body was arriving left no document: the next one claims the
+// session at its headers and, once the router has written the rest, parses it back from the store.
+// It keeps what it parsed for the attempts after it.
+TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackASessionTheRouterFinished) {
+  claimAndFinishFromTheRouter(Body, 10);
+  runReplay();
+  EXPECT_EQ(injected_.toString(), Body);
+  EXPECT_TRUE(injected_end_stream_);
+  EXPECT_EQ(counterValue("request_session_adopted"), 1);
+  EXPECT_EQ(counterValue("request_session_reparsed"), 1);
+  EXPECT_NE(session()->document(parseTag()), nullptr);
+}
+
+// A body larger than one read is parsed back over several passes.
+TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackALargeSessionAcrossPasses) {
+  const std::string body = absl::StrCat(R"({"model":"m","messages":[{"role":"user","content":")",
+                                        std::string(300 * 1024, 'x'), R"("}]})");
+  claimAndFinishFromTheRouter(body, 10);
+  drain();
+  EXPECT_EQ(inject_calls_, 0);
+  runReplay();
+  EXPECT_EQ(injected_.toString(), body);
+  EXPECT_EQ(counterValue("request_session_reparsed"), 1);
+}
+
+// A document parsed another way is no use to this attempt, which parses the session back.
+TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackForAnotherParse) {
+  writeHandedOverSession();
+  session()->setDocument({LLMProtocol::GeminiGenerateContent, 1024}, nlohmann::json::object());
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl end_of_body;
+  filter_->decodeData(end_of_body, true);
+  runReplay();
+  EXPECT_EQ(injected_.toString(), Body);
+  EXPECT_EQ(counterValue("request_session_reparsed"), 1);
+  EXPECT_NE(session()->document(parseTag()), nullptr);
+}
+
+// A document larger than a body the stream would buffer is not kept; later attempts parse back.
+TEST_F(AiProtocolManagerFilterSessionTest, KeepsNoDocumentLargerThanTheBufferLimit) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(16));
+  startAttempt(1);
+  writeHandedOverSession();
+  EXPECT_EQ(session()->document(parseTag()), nullptr);
+}
+
+// The router sends the end only once the session has the whole body; an attempt that gets it
+// sooner fails rather than parse part of one.
+TEST_F(AiProtocolManagerFilterSessionTest, RejectsTheEndOfASessionStillBeingWritten) {
   ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   session()->handOver();
-  Buffer::OwnedImpl body(Body.substr(0, 10));
+  Buffer::OwnedImpl first(Body.substr(0, 10));
+  filter_->decodeData(first, false);
+  startAttempt(2);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl end_of_body;
+  filter_->decodeData(end_of_body, true);
+  EXPECT_EQ(local_reply_code_, Http::Code::InternalServerError);
+  EXPECT_EQ(local_reply_details_, "ai_protocol_manager_external_buffer_error");
+}
+
+// A failed session is not claimed; the attempt does not stamp it, so the router fails the retry.
+TEST_F(AiProtocolManagerFilterSessionTest, DoesNotClaimAFailedSession) {
+  factory_ = std::make_shared<SyncFailingBufferFactory>();
+  startAttempt(1);
+  ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  session()->handOver();
+  Buffer::OwnedImpl body(Body);
   filter_->decodeData(body, false);
+  ASSERT_TRUE(session()->failed());
   startAttempt(2);
   ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   EXPECT_EQ(session()->attempt(), 1);

@@ -80,6 +80,9 @@ public:
   // Total raw byte length of strings that were replaced by ExternalRefs rather than kept inline.
   std::uint64_t externalRefBytes() const { return external_ref_bytes_; }
 
+  // DOM nodes attached so far.
+  std::uint32_t nodeCount() const { return node_count_; }
+
   // Json::Wuffs::WuffsJsonCursor::Handler
   bool openStringCapture(absl::string_view key, int depth, size_t token_start) override;
   bool onStringChunk(absl::string_view key, int depth, absl::string_view chunk) override;

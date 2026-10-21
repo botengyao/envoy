@@ -305,7 +305,8 @@ using UpstreamRequestPtr = std::unique_ptr<UpstreamRequest>;
 class Filter : Logger::Loggable<Logger::Id::router>,
                public Http::StreamDecoderFilter,
                public Upstream::LoadBalancerContextBase,
-               public RouterFilterInterface {
+               public RouterFilterInterface,
+               public Http::RetryBodySession::WriterCallbacks {
 public:
   Filter(const FilterConfigSharedPtr& config, FilterStats& stats)
       : config_(config), stats_(stats),
@@ -627,13 +628,27 @@ private:
                        GenericConnPoolPtr generic_conn_pool);
   void updateStatsOnNoRetry(RetryStatus retry_status);
   void updateStatsOnDoRetry(RetryState::DoRetryType do_retry_type);
-  // Hands the body over to the retry session the live attempt's upstream filter writes, instead of
-  // giving up on retries at a buffer overflow. `forwarded` is what the attempt has been sent.
+  // Hands the body over to the retry session the last attempt's upstream filter writes, instead of
+  // giving up on retries at a buffer overflow. `forwarded` is what that attempt has been sent.
   bool maybeHandOverRetrySession(uint64_t forwarded);
   // After a hand-over, a retry needs the session to hold every byte received; otherwise gives up
   // on retries, as at an overflow, and returns false.
   bool retrySessionAllowsRetry();
-  void failRetrySession(absl::string_view details);
+  // Whether the router writes the next body bytes to the session itself: the attempt the body was
+  // handed over to is gone, and a retry takes the body from the session.
+  bool routerWritesRetrySession() const;
+  // Returns false if it ended the stream.
+  bool writeRetrySession(Buffer::Instance& data, bool end_stream);
+  void failRetrySession(Stats::Counter& counter, absl::string_view details);
+
+  // Http::RetryBodySession::WriterCallbacks
+  void onSessionAboveHighWatermark() override {
+    callbacks_->onDecoderFilterAboveWriteBufferHighWatermark();
+  }
+  void onSessionBelowLowWatermark() override {
+    callbacks_->onDecoderFilterBelowWriteBufferLowWatermark();
+  }
+  void onSessionFailed() override;
 
   void runRetryOptionsPredicates(UpstreamRequest& retriable_request);
   // Returns the effective retry policy to use for this request.
@@ -697,6 +712,8 @@ private:
 
   // Set once the body is handed over; retries then take it from the session.
   std::shared_ptr<Http::RetryBodySession> retry_session_;
+  // Held once the router writes the session itself.
+  Http::RetryBodySession::WriterPtr retry_session_writer_;
   uint64_t received_body_length_{0};
   // The request headers before the first attempt's upstream filters ran, restored before every
   // cross-cluster retry so that one cluster's rewrites and credentials never reach another.
@@ -706,6 +723,8 @@ private:
   uint64_t request_body_buffer_limit_{std::numeric_limits<uint64_t>::max()};
   uint32_t attempt_count_{0};
   uint32_t pending_retries_{0};
+  // The attempt the body was handed over to.
+  uint32_t retry_session_attempt_{0};
   Http::Code timeout_response_code_ = Http::Code::GatewayTimeout;
   FilterUtility::HedgingParams hedging_params_;
   Http::StreamFilterSidestreamWatermarkCallbacks watermark_callbacks_;
@@ -729,6 +748,7 @@ private:
   // chunk.
   bool reject_early_connect_data_enabled_ : 1 = false;
   bool saw_local_reply_ : 1 = false;
+  bool writing_retry_session_ : 1 = false;
 };
 
 class ProdFilter : public Filter {

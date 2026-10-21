@@ -226,7 +226,8 @@ private:
     None,
     // Takes the body the router forwards into a new session.
     Writer,
-    // Takes its body and parsed document from a session another attempt wrote.
+    // Takes its body from a session another attempt wrote, and its document from the session's
+    // snapshot or, without one, by parsing the session back.
     Adopted,
   };
   // Feeds one body frame to the parser in place. Returns false only if the
@@ -239,6 +240,7 @@ private:
 
   // Terminates the stream with a 500 if the retry session this filter writes has failed.
   bool rejectFailedSession();
+  void rejectExternalBufferError();
 
   // Whether the route handed its request payload to the filter, which is also
   // what makes a parse failure fatal.
@@ -259,6 +261,11 @@ private:
   RetryBodySessionImpl::ParseTag parseTag() const {
     return {request_protocol_, inlineStringThresholdBytes()};
   }
+  // Takes the adopted session's document once the session has the whole body.
+  void adoptSessionDocument(bool has_trailers);
+  void readSessionChunk();
+
+  void createRequestParser();
 
   // Finalizes the decode path when the full request body (and optional trailers) has been received.
   // Sets endStream on decode_manager_ and executes the AI filter chain or replays the body.
@@ -299,6 +306,14 @@ private:
   std::shared_ptr<RetryBodySessionImpl> retry_session_;
   // Held while this filter writes the session.
   Http::RetryBodySession::WriterPtr session_writer_;
+  // Set while this filter parses an adopted session back from its store.
+  ExternalBufferPtr session_reader_;
+  Event::SchedulableCallbackPtr session_read_callback_;
+  uint64_t session_read_offset_{0};
+  uint32_t session_reads_{0};
+  bool session_has_trailers_{false};
+  // Bytes fed to the parser so far.
+  uint64_t parsed_bytes_{0};
 
   // Once set, later frames on the dying stream are dropped, not offloaded.
   bool payload_rejected_{false};

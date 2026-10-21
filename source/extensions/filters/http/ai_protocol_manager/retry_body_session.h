@@ -45,7 +45,6 @@ public:
   uint64_t length() const override { return taken_; }
   bool failed() const override { return failed_; }
   void handOver() override { handed_over_ = true; }
-  bool hasWriter() const override { return writer_ != nullptr; }
   WriterPtr attachWriter(WriterCallbacks& callbacks, uint64_t offset) override;
 
   bool handedOver() const { return handed_over_; }
@@ -72,8 +71,8 @@ private:
   };
   using PendingReadSharedPtr = std::shared_ptr<PendingRead>;
 
-  void append(Buffer::Instance& data);
-  void end();
+  void append(WriterImpl& writer, Buffer::Instance& data);
+  void end(WriterImpl& writer);
   void detach(WriterImpl& writer);
   void maybeWrite();
   void onWriteComplete(ExternalBufferStatus status);

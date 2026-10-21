@@ -86,14 +86,10 @@ public:
   virtual void handOver() PURE;
 
   /**
-   * @return whether a writer is attached.
-   */
-  virtual bool hasWriter() const PURE;
-
-  /**
    * Makes the caller the session's only writer from `offset`, which must be length(). A writer
-   * attached above the high watermark is told so at once.
-   * @return null if the session has a writer, has ended or failed, or `offset` is not its length.
+   * attached before it, whose attempt is gone, takes no more bytes and gets no more callbacks. A
+   * writer attached above the high watermark is told so at once.
+   * @return null if the session has ended or failed, or `offset` is not its length.
    */
   virtual WriterPtr attachWriter(WriterCallbacks& callbacks, uint64_t offset) PURE;
 };

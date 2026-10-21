@@ -183,23 +183,25 @@ TEST_F(RetryBodySessionTest, StoreFailureFailsReadsAndTellsTheWriter) {
   EXPECT_EQ(session->attachWriter(callbacks_, session->length()), nullptr);
 }
 
-// One writer at a time; the next attaches where the last stopped, and is told at once when the
-// session is still pushing back.
-TEST_F(RetryBodySessionTest, WriterHandsOffAtTheSessionsLength) {
+// One writer at a time: the next attaches where the last stopped and replaces it, and is told at
+// once when the session is still pushing back.
+TEST_F(RetryBodySessionTest, ANewWriterReplacesTheLast) {
   auto session = makeSession(nullptr, /*high_watermark=*/4);
-  TestWriter next;
-  EXPECT_TRUE(session->hasWriter());
-  EXPECT_EQ(session->attachWriter(next, 0), nullptr);
   append("hello");
-  writer_.reset();
-  EXPECT_FALSE(session->hasWriter());
-
+  EXPECT_EQ(callbacks_.above_, 1);
+  TestWriter next;
   EXPECT_EQ(session->attachWriter(next, 4), nullptr);
   auto writer = session->attachWriter(next, 5);
   ASSERT_NE(writer, nullptr);
   EXPECT_EQ(next.above_, 1);
+
+  // The replaced writer takes no more bytes and hears nothing more.
+  append("lost");
+  EXPECT_EQ(session->length(), 5);
   drain();
   EXPECT_EQ(next.below_, 1);
+  EXPECT_EQ(callbacks_.below_, 0);
+  writer_.reset();
 
   Buffer::OwnedImpl rest(" world");
   writer->append(rest);

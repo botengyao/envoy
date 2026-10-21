@@ -42,6 +42,12 @@ constexpr uint32_t DefaultMaxJsonBodySize = 4 * 1024 * 1024;
 // bounding the parse work a lifetime event flood can extract; see the proto.
 constexpr uint32_t DefaultMaxParsedSseEvents = 65536;
 
+// A rough heap cost of one DOM node: the value, its container slot and its key.
+constexpr uint64_t SnapshotBytesPerNode = 64;
+// An adopted session is parsed back in chunks of this size, a few per event-loop pass.
+constexpr uint64_t SessionReadChunkSize = 64 * 1024;
+constexpr uint32_t SessionReadChunksPerPass = 8;
+
 // HTTP Content-Type is case-insensitive and may carry parameters
 // (`application/json; charset=utf-8`).
 bool contentTypeMatches(absl::string_view content_type, absl::string_view expected) {
@@ -260,6 +266,8 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
 void AiProtocolManagerFilter::onDestroy() {
   // The session keeps whatever this filter wrote; only the writer goes.
   session_writer_.reset();
+  session_read_callback_.reset();
+  session_reader_.reset();
   if (decode_bridge_ != nullptr) {
     // Detach the bridge first so all registered BufferManagers on this path are detached and
     // their callbacks disarmed before cancelling coroutines in filter_manager_.
@@ -336,9 +344,7 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     useRetrySession();
   }
   if (session_mode_ != SessionMode::Adopted) {
-    JsonWithExtBufParser::Config parser_config;
-    parser_config.inline_string_threshold_bytes = inlineStringThresholdBytes();
-    request_parser_ = std::make_unique<JsonWithExtBufParser>(parser_config);
+    createRequestParser();
   }
   // Built here, not at setDecoderFilterCallbacks(), so a pass-through stream pays
   // for none of it: constructing it subscribes to upstream watermarks and claims
@@ -370,15 +376,13 @@ void AiProtocolManagerFilter::useRetrySession() {
       filter_state.getDataSharedMutableGeneric(Http::RetryBodySession::key()));
   if (session != nullptr && session->handedOver()) {
     // The router no longer has the body, so this attempt takes it from the session or not at all.
-    const nlohmann::json* document = session->document(parseTag());
-    if (!session->ended() || session->failed() || document == nullptr) {
+    // The router may still be writing it; the document is taken at the end of the stream.
+    if (session->failed()) {
       config_->stats().request_session_not_adoptable_.inc();
-      ENVOY_LOG(debug, "ai_protocol_manager: cannot adopt the retry session");
+      ENVOY_LOG(debug, "ai_protocol_manager: cannot adopt the failed retry session");
       return;
     }
-    ENVOY_LOG(debug, "ai_protocol_manager: reusing the parsed request from the retry session");
     session->adopt(attempt);
-    request_json_.setJson(*document);
     retry_session_ = std::move(session);
     session_mode_ = SessionMode::Adopted;
     config_->stats().request_session_adopted_.inc();
@@ -397,6 +401,62 @@ void AiProtocolManagerFilter::useRetrySession() {
   retry_session_ = std::move(session);
   session_mode_ = SessionMode::Writer;
   config_->stats().request_session_written_.inc();
+}
+
+void AiProtocolManagerFilter::adoptSessionDocument(bool has_trailers) {
+  if (!retry_session_->ended() || retry_session_->failed()) {
+    rejectExternalBufferError();
+    return;
+  }
+  if (const nlohmann::json* document = retry_session_->document(parseTag()); document != nullptr) {
+    ENVOY_LOG(debug, "ai_protocol_manager: reusing the parsed request from the retry session");
+    request_json_.setJson(*document);
+    finalizeDecode(has_trailers);
+    return;
+  }
+  ENVOY_LOG(debug, "ai_protocol_manager: parsing the request back from the retry session");
+  config_->stats().request_session_reparsed_.inc();
+  createRequestParser();
+  session_reader_ = retry_session_->view();
+  session_has_trailers_ = has_trailers;
+  session_read_callback_ =
+      decoder_callbacks_->dispatcher().createSchedulableCallback([this]() { readSessionChunk(); });
+  readSessionChunk();
+}
+
+void AiProtocolManagerFilter::readSessionChunk() {
+  const uint64_t length =
+      std::min(SessionReadChunkSize, session_reader_->length() - session_read_offset_);
+  session_reader_->read(session_read_offset_, length,
+                        [this](ExternalBufferStatus status, Buffer::InstancePtr data) {
+                          if (status != ExternalBufferStatus::Ok) {
+                            rejectExternalBufferError();
+                            return;
+                          }
+                          session_read_offset_ += data->length();
+                          const bool end_stream = session_read_offset_ == session_reader_->length();
+                          if (!feedParser(*data, end_stream)) {
+                            return;
+                          }
+                          if (end_stream) {
+                            finalizeDecode(session_has_trailers_);
+                            return;
+                          }
+                          // Always through the dispatcher, and on a later pass every few chunks: a
+                          // store that completes reads on-stack would otherwise parse the whole
+                          // body in one go.
+                          if (++session_reads_ % SessionReadChunksPerPass == 0) {
+                            session_read_callback_->scheduleCallbackNextIteration();
+                          } else {
+                            session_read_callback_->scheduleCallbackCurrentIteration();
+                          }
+                        });
+}
+
+void AiProtocolManagerFilter::createRequestParser() {
+  JsonWithExtBufParser::Config parser_config;
+  parser_config.inline_string_threshold_bytes = inlineStringThresholdBytes();
+  request_parser_ = std::make_unique<JsonWithExtBufParser>(parser_config);
 }
 
 uint32_t AiProtocolManagerFilter::inlineStringThresholdBytes() const {
@@ -421,6 +481,7 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
   // byte boundary, so there is no need to join them into one block. Copying here
   // would reintroduce the per-stream footprint the external buffer avoids.
   absl::Status status = absl::OkStatus();
+  parsed_bytes_ += data.length();
   const Buffer::RawSliceVector slices = data.getRawSlices();
   for (size_t i = 0; i < slices.size() && status.ok(); ++i) {
     // Only the final slice of a terminal frame closes the document.
@@ -450,11 +511,16 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
   }
 
   if (end_stream) {
+    const uint64_t document_bytes = request_parser_->nodeCount() * SnapshotBytesPerNode +
+                                    parsed_bytes_ - request_parser_->externalRefBytes();
     request_json_ = request_parser_->takeDocument();
     request_parser_.reset();
     config_->stats().request_parsed_.inc();
-    // Copied before any AI filter edits it in place; only worth it once later attempts need it.
-    if (session_mode_ == SessionMode::Writer && retry_session_->handedOver()) {
+    // Copied before any AI filter edits it in place, once later attempts need it. A document larger
+    // than a body the stream would buffer is parsed again by each of them instead.
+    const uint64_t buffer_limit = decoder_callbacks_->decoderBufferLimit();
+    if (session_mode_ != SessionMode::None && retry_session_->handedOver() &&
+        (buffer_limit == 0 || document_bytes <= buffer_limit)) {
       retry_session_->setDocument(parseTag(), request_json_.json());
     }
   }
@@ -467,13 +533,17 @@ bool AiProtocolManagerFilter::rejectFailedSession() {
   }
   // Failed here, while the frame is in hand, rather than from the end write inside
   // finalizeDecode().
+  rejectExternalBufferError();
+  return true;
+}
+
+void AiProtocolManagerFilter::rejectExternalBufferError() {
   payload_rejected_ = true;
   session_writer_.reset();
   config_->stats().request_external_buffer_error_.inc();
   decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError, "AI protocol buffer error",
                                      nullptr, std::nullopt,
                                      "ai_protocol_manager_external_buffer_error");
-  return true;
 }
 
 void AiProtocolManagerFilter::rejectInvalidPayload(const absl::Status& status) {
@@ -507,7 +577,7 @@ Http::FilterDataStatus AiProtocolManagerFilter::decodeData(Buffer::Instance& dat
       return Http::FilterDataStatus::StopIterationNoBuffer;
     }
     if (end_stream) {
-      finalizeDecode(/*has_trailers=*/false);
+      adoptSessionDocument(/*has_trailers=*/false);
     }
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
@@ -548,6 +618,10 @@ Http::FilterTrailersStatus AiProtocolManagerFilter::decodeTrailers(Http::Request
     return Http::FilterTrailersStatus::Continue;
   }
   if (payload_rejected_) {
+    return Http::FilterTrailersStatus::StopIteration;
+  }
+  if (session_mode_ == SessionMode::Adopted) {
+    adoptSessionDocument(/*has_trailers=*/true);
     return Http::FilterTrailersStatus::StopIteration;
   }
   // A trailer-only request (no body) has nothing to replay; let the trailers flow.

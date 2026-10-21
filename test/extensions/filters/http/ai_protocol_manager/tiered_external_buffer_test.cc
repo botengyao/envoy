@@ -88,7 +88,7 @@ public:
     buffer_ = std::make_unique<TieredExternalBuffer>(dispatcher_, factory_, limit);
   }
 
-  // Writes `bytes` and returns where its acknowledgement stands after draining the dispatcher.
+  // Writes `bytes` and returns where its acknowledgment stands after draining the dispatcher.
   std::string writeAndDrain(absl::string_view bytes, bool end_stream = false) {
     std::string status = "<pending>";
     buffer_->write(std::make_unique<Buffer::OwnedImpl>(bytes), end_stream,
@@ -206,7 +206,7 @@ TEST_F(TieredExternalBufferTest, AFailedSpillFailsEverything) {
   EXPECT_EQ(readNow(0, 1), "error");
 }
 
-// Destroying the buffer cancels a pending acknowledgement.
+// Destroying the buffer cancels a pending acknowledgment.
 TEST_F(TieredExternalBufferTest, DestructionCancelsPendingCallbacks) {
   makeBuffer(10);
   bool called = false;

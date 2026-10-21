@@ -1218,6 +1218,15 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
     // potentially shadow. Additionally, we can't do a copy here because there's a check down
     // this stack for whether `data` is the same buffer as already buffered data.
     callbacks_->addDecodedData(data, true);
+  } else if (routerWritesRetrySession()) {
+    if (!writeRetrySession(data, end_stream)) {
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    }
+    if (end_stream && !upstream_requests_.empty()) {
+      // The live attempt adopted the session at its headers and waits for the end of the body.
+      Buffer::OwnedImpl end_of_body;
+      upstream_requests_.front()->acceptDataFromRouter(end_of_body, true);
+    }
   } else {
     if (!upstream_requests_.empty()) {
       upstream_requests_.front()->acceptDataFromRouter(data, end_stream);
@@ -1255,6 +1264,12 @@ Http::FilterTrailersStatus Filter::decodeTrailers(Http::RequestTrailerMap& trail
   // a backoff timer.
   ASSERT(upstream_requests_.size() <= 1);
   downstream_trailers_ = &trailers;
+  if (routerWritesRetrySession()) {
+    Buffer::OwnedImpl no_data;
+    if (!writeRetrySession(no_data, true)) {
+      return Http::FilterTrailersStatus::StopIteration;
+    }
+  }
   if (!upstream_requests_.empty()) {
     upstream_requests_.front()->acceptTrailersFromRouter(trailers);
   }
@@ -1408,6 +1423,7 @@ void Filter::onRequestComplete() {
 }
 
 void Filter::onDestroy() {
+  retry_session_writer_.reset();
   // Cancel any in-flight host selection
   if (host_selection_cancelable_) {
     host_selection_cancelable_->cancel();
@@ -2447,7 +2463,7 @@ bool Filter::convertRequestHeadersForInternalRedirect(
 }
 
 bool Filter::maybeHandOverRetrySession(uint64_t forwarded) {
-  if (upstream_requests_.empty() || route_entry_->internalRedirectPolicy().enabled() ||
+  if (route_entry_->internalRedirectPolicy().enabled() ||
       hedging_params_.hedge_on_per_try_timeout_ ||
       Http::HeaderUtility::isConnect(*downstream_headers_) ||
       Http::Utility::isUpgrade(*downstream_headers_)) {
@@ -2456,13 +2472,15 @@ bool Filter::maybeHandOverRetrySession(uint64_t forwarded) {
   auto session = std::dynamic_pointer_cast<Http::RetryBodySession>(
       callbacks_->streamInfo().filterState()->getDataSharedMutableGeneric(
           Http::RetryBodySession::key()));
-  // The session must hold exactly what the live attempt was sent, from its first byte.
+  // The session must hold exactly what the last attempt was sent, from its first byte. That attempt
+  // may already be gone, with a retry waiting for its backoff.
   if (session == nullptr || session->failed() || session->attempt() != attempt_count_ ||
       session->length() != forwarded) {
     return false;
   }
   session->handOver();
   retry_session_ = std::move(session);
+  retry_session_attempt_ = attempt_count_;
   received_body_length_ = forwarded;
   ENVOY_STREAM_LOG(debug, "handing the request body over to the retry session after {} bytes",
                    *callbacks_, forwarded);
@@ -2471,22 +2489,69 @@ bool Filter::maybeHandOverRetrySession(uint64_t forwarded) {
 }
 
 bool Filter::retrySessionAllowsRetry() {
-  if (retry_session_ == nullptr || (downstream_end_stream_ && !retry_session_->failed() &&
-                                    retry_session_->length() == received_body_length_)) {
+  // A body still arriving is fine: the router writes the rest itself.
+  if (retry_session_ == nullptr ||
+      (!retry_session_->failed() && retry_session_->length() == received_body_length_)) {
     return true;
   }
   ENVOY_STREAM_LOG(debug,
-                   "the retry session cannot serve a retry (body ended: {}, failed: {}, {} of {} "
-                   "bytes); giving up on retries",
-                   *callbacks_, static_cast<bool>(downstream_end_stream_), retry_session_->failed(),
-                   retry_session_->length(), received_body_length_);
+                   "the retry session cannot serve a retry (failed: {}, {} of {} bytes); giving up "
+                   "on retries",
+                   *callbacks_, retry_session_->failed(), retry_session_->length(),
+                   received_body_length_);
   stats_.retry_session_incomplete_.inc();
   cluster_->trafficStats()->retry_or_shadow_abandoned_.inc();
   retry_state_.reset();
   return false;
 }
 
-void Filter::failRetrySession(absl::string_view details) {
+bool Filter::routerWritesRetrySession() const {
+  if (retry_session_ == nullptr) {
+    return false;
+  }
+  if (retry_session_writer_ != nullptr) {
+    return true;
+  }
+  if (upstream_requests_.empty()) {
+    return retry_state_ != nullptr;
+  }
+  return attempt_count_ != retry_session_attempt_;
+}
+
+bool Filter::writeRetrySession(Buffer::Instance& data, bool end_stream) {
+  if (retry_session_writer_ == nullptr) {
+    const uint64_t offset = received_body_length_ - data.length();
+    retry_session_writer_ = retry_session_->attachWriter(*this, offset);
+    if (retry_session_writer_ == nullptr) {
+      failRetrySession(stats_.retry_session_failed_, "retry_session_failed");
+      return false;
+    }
+    ENVOY_STREAM_LOG(debug, "writing the request body to the retry session from byte {}",
+                     *callbacks_, offset);
+  }
+  writing_retry_session_ = true;
+  retry_session_writer_->append(data);
+  if (end_stream) {
+    retry_session_writer_->end();
+  }
+  writing_retry_session_ = false;
+  if (retry_session_->failed()) {
+    failRetrySession(stats_.retry_session_failed_, "retry_session_failed");
+    return false;
+  }
+  return true;
+}
+
+void Filter::onSessionFailed() {
+  // A failure inside append() or end() is handled once they return.
+  if (!writing_retry_session_) {
+    failRetrySession(stats_.retry_session_failed_, "retry_session_failed");
+  }
+}
+
+void Filter::failRetrySession(Stats::Counter& counter, absl::string_view details) {
+  counter.inc();
+  retry_session_writer_.reset();
   resetAll();
   cleanup();
   callbacks_->streamInfo().setResponseCodeDetails(details);
@@ -2636,15 +2701,24 @@ void Filter::continueDoRetry(bool can_send_early_data, bool can_use_http3,
     // The attempt's upstream filter adopts the session while it takes the headers; one that did
     // not would send the request without its body.
     if (retry_session_->attempt() != attempt_count_) {
-      stats_.retry_session_not_adopted_.inc();
-      failRetrySession("retry_session_not_adopted");
+      failRetrySession(stats_.retry_session_not_adopted_, "retry_session_not_adopted");
       return;
     }
-    if (downstream_trailers_) {
-      upstream_request_tmp->acceptTrailersFromRouter(*downstream_trailers_);
-    } else {
-      Buffer::OwnedImpl end_of_body;
-      upstream_request_tmp->acceptDataFromRouter(end_of_body, true);
+    // A body still arriving is ended by decodeData() or decodeTrailers() instead.
+    if (downstream_end_stream_) {
+      if (timeout_.global_timeout_.count() > 0 && !response_timeout_) {
+        // The body ended while no attempt was live, so onRequestComplete() armed nothing.
+        response_timeout_ =
+            callbacks_->dispatcher().createTimer([this]() -> void { onResponseTimeout(); });
+        response_timeout_->enableTimer(
+            std::max(timeout_.global_timeout_ - elapsed_time, std::chrono::milliseconds::zero()));
+      }
+      if (downstream_trailers_) {
+        upstream_request_tmp->acceptTrailersFromRouter(*downstream_trailers_);
+      } else {
+        Buffer::OwnedImpl end_of_body;
+        upstream_request_tmp->acceptDataFromRouter(end_of_body, true);
+      }
     }
   } else if (!upstream_requests_.empty() &&
              (upstream_requests_.front().get() == upstream_request_tmp)) {
