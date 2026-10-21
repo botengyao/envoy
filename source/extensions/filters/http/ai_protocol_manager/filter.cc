@@ -385,9 +385,12 @@ void AiProtocolManagerFilter::useRetrySession() {
     return;
   }
   // The router still has the body and sends all of it to this attempt, so the session starts over.
+  // A body that fits the stream's buffer limit stays in memory, as on the path without a session.
+  const uint64_t buffer_limit = decoder_callbacks_->decoderBufferLimit();
   session = std::make_shared<RetryBodySessionImpl>(
-      config_->bufferFactory().createBuffer(decoder_callbacks_->dispatcher()),
-      decoder_callbacks_->decoderBufferLimit(), attempt);
+      std::make_unique<TieredExternalBuffer>(decoder_callbacks_->dispatcher(),
+                                             config_->bufferFactoryShared(), buffer_limit),
+      buffer_limit, attempt);
   session_writer_ = session->attachWriter(*this, 0);
   filter_state.setData(Http::RetryBodySession::key(), session,
                        StreamInfo::FilterState::LifeSpan::FilterChain);

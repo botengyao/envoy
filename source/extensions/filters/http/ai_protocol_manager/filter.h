@@ -22,6 +22,7 @@
 #include "source/extensions/filters/http/ai_protocol_manager/response_handler.h"
 #include "source/extensions/filters/http/ai_protocol_manager/retry_body_session.h"
 #include "source/extensions/filters/http/ai_protocol_manager/stats.h"
+#include "source/extensions/filters/http/ai_protocol_manager/tiered_external_buffer.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "absl/status/status.h"

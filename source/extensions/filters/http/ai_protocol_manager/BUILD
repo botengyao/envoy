@@ -81,6 +81,19 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "tiered_external_buffer_lib",
+    srcs = ["tiered_external_buffer.cc"],
+    hdrs = ["tiered_external_buffer.h"],
+    deps = [
+        ":external_buffer_interface",
+        "//envoy/event:dispatcher_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:assert_lib",
+        "//source/common/common:logger_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "retry_body_session_lib",
     srcs = ["retry_body_session.cc"],
     hdrs = ["retry_body_session.h"],
@@ -497,6 +510,7 @@ envoy_cc_library(
         ":schema_lib",
         ":serializer_lib",
         ":stats_lib",
+        ":tiered_external_buffer_lib",
         "//envoy/common:exception_lib",
         "//envoy/http:codes_interface",
         "//envoy/http:retry_body_session_interface",

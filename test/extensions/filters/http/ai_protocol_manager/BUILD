@@ -123,6 +123,18 @@ envoy_extension_cc_test(
 )
 
 envoy_extension_cc_test(
+    name = "tiered_external_buffer_test",
+    srcs = ["tiered_external_buffer_test.cc"],
+    extension_names = ["envoy.filters.http.ai_protocol_manager"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/extensions/filters/http/ai_protocol_manager:tiered_external_buffer_lib",
+        "//test/mocks/event:event_mocks",
+    ],
+)
+
+envoy_extension_cc_test(
     name = "retry_body_session_test",
     srcs = ["retry_body_session_test.cc"],
     extension_names = ["envoy.filters.http.ai_protocol_manager"],
