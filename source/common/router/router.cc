@@ -2550,10 +2550,18 @@ void Filter::onSessionFailed() {
 }
 
 void Filter::failRetrySession(Stats::Counter& counter, absl::string_view details) {
-  counter.inc();
   retry_session_writer_.reset();
+  // A response on its way no longer depends on the session.
+  if (downstream_response_started_) {
+    return;
+  }
   resetAll();
   cleanup();
+  // Nor does the reply the stream already has.
+  if (saw_local_reply_) {
+    return;
+  }
+  counter.inc();
   callbacks_->streamInfo().setResponseCodeDetails(details);
   callbacks_->sendLocalReply(Http::Code::ServiceUnavailable, "request body unavailable for a retry",
                              modify_headers_, std::nullopt, details);
@@ -2661,6 +2669,11 @@ void Filter::doRetry(bool can_send_early_data, bool can_use_http3, TimeoutRetry 
 void Filter::continueDoRetry(bool can_send_early_data, bool can_use_http3,
                              TimeoutRetry is_timeout_retry, GenericConnPoolPtr generic_conn_pool) {
   ASSERT(generic_conn_pool != nullptr);
+  // A store write still in flight when the last attempt went may have failed the session since.
+  if (retry_session_ != nullptr && retry_session_->failed()) {
+    failRetrySession(stats_.retry_session_failed_, "retry_session_failed");
+    return;
+  }
   UpstreamRequestPtr upstream_request = std::make_unique<UpstreamRequest>(
       *this, std::move(generic_conn_pool), can_send_early_data, can_use_http3,
       allow_multiplexed_upstream_half_close_ /*enable_half_close*/);

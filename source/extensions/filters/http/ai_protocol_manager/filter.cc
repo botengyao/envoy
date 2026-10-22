@@ -266,7 +266,10 @@ absl::StatusOr<FilterConfigSharedPtr> FilterConfig::create(
 void AiProtocolManagerFilter::onDestroy() {
   // The session keeps whatever this filter wrote; only the writer goes.
   session_writer_.reset();
-  session_read_callback_.reset();
+  // Cancelled, not destroyed: this may run inside it.
+  if (session_read_callback_ != nullptr) {
+    session_read_callback_->cancel();
+  }
   session_reader_.reset();
   if (decode_bridge_ != nullptr) {
     // Detach the bridge first so all registered BufferManagers on this path are detached and
@@ -518,9 +521,8 @@ bool AiProtocolManagerFilter::feedParser(const Buffer::Instance& data, bool end_
     config_->stats().request_parsed_.inc();
     // Copied before any AI filter edits it in place, once later attempts need it. A document larger
     // than a body the stream would buffer is parsed again by each of them instead.
-    const uint64_t buffer_limit = decoder_callbacks_->decoderBufferLimit();
     if (session_mode_ != SessionMode::None && retry_session_->handedOver() &&
-        (buffer_limit == 0 || document_bytes <= buffer_limit)) {
+        document_bytes <= decoder_callbacks_->decoderBufferLimit()) {
       retry_session_->setDocument(parseTag(), request_json_.json());
     }
   }

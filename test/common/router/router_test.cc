@@ -4144,6 +4144,71 @@ TEST_F(RouterRetryBodySessionTest, FailsWhenTheSessionFailsAfterTheRouterWrote) 
   EXPECT_EQ(1U, counter("retry_session_failed"));
 }
 
+// A session whose store failed while no one was writing it serves no retry.
+TEST_F(RouterRetryBodySessionTest, FailsARetryFromASessionThatFailedDuringTheBackoff) {
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl body("body");
+  router_->decodeData(body, true);
+  session_->length_ = 4;
+  router_->retry_state_->expectResetRetry();
+  encoder1_.stream_.resetStream(Http::StreamResetReason::RemoteReset);
+
+  session_->failed_ = true;
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _, _)).Times(0);
+  EXPECT_CALL(callbacks_,
+              sendLocalReply(Http::Code::ServiceUnavailable, _, _, _, "retry_session_failed"));
+  router_->retry_state_->callback_();
+  EXPECT_EQ(1U, counter("retry_session_failed"));
+}
+
+// Once the retry answers, a session failure no longer ends the stream.
+TEST_F(RouterRetryBodySessionTest, IgnoresASessionFailureOnceTheRetryAnswers) {
+  sendAndReset("body");
+  Buffer::OwnedImpl more("more");
+  router_->decodeData(more, false);
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectAdoptingRetry(encoder2);
+  router_->retry_state_->callback_();
+  EXPECT_CALL(encoder2, encodeData(BufferString(""), true));
+  expectResponseTimerCreate();
+  Buffer::OwnedImpl rest("!");
+  router_->decodeData(rest, true);
+
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _))
+      .WillOnce(Return(RetryStatus::No));
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false));
+  Http::ResponseHeaderMapPtr response_headers(
+      new Http::TestResponseHeaderMapImpl({{":status", "200"}}));
+  response_decoder_->decodeHeaders(std::move(response_headers), false);
+
+  session_->failed_ = true;
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  session_->callbacks_->onSessionFailed();
+  EXPECT_EQ(0U, counter("retry_session_failed"));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+  Buffer::OwnedImpl response_body("ok");
+  response_decoder_->decodeData(response_body, true);
+}
+
+// Nor once the stream has a local reply, as when the adopter's reads fail before the router hears
+// of the failure; the router sends no second reply.
+TEST_F(RouterRetryBodySessionTest, IgnoresASessionFailureAfterALocalReply) {
+  sendAndReset("body");
+  Buffer::OwnedImpl more("more");
+  router_->decodeData(more, false);
+  NiceMock<Http::MockRequestEncoder> encoder2;
+  expectAdoptingRetry(encoder2);
+  router_->retry_state_->callback_();
+
+  Http::StreamFilterBase::LocalReplyData reply{Http::Code::InternalServerError, std::nullopt,
+                                               "ai_protocol_manager_external_buffer_error", false};
+  router_->onLocalReply(reply);
+  session_->failed_ = true;
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  session_->callbacks_->onSessionFailed();
+  EXPECT_EQ(0U, counter("retry_session_failed"));
+}
+
 // A session the router cannot write from where the body stands cannot serve the retry.
 TEST_F(RouterRetryBodySessionTest, FailsWhenTheRouterCannotWriteTheSession) {
   sendAndReset("body");

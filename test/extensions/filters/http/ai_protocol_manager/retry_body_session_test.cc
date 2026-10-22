@@ -110,6 +110,9 @@ TEST_F(RetryBodySessionTest, DocumentOnlyForTheSameParse) {
   EXPECT_TRUE(session->document(GeminiTag)->contains("contents"));
   EXPECT_EQ(session->document({LLMProtocol::GeminiGenerateContent, 2048}), nullptr);
   EXPECT_EQ(session->document({LLMProtocol::OpenAiChatCompletions, 1024}), nullptr);
+  // The first document stays.
+  session->setDocument({LLMProtocol::OpenAiChatCompletions, 1024}, nlohmann::json::object());
+  EXPECT_NE(session->document(GeminiTag), nullptr);
 }
 
 // An attempt's view is the session as it stands; it takes only the empty write ending the
@@ -183,33 +186,33 @@ TEST_F(RetryBodySessionTest, StoreFailureFailsReadsAndTellsTheWriter) {
   EXPECT_EQ(session->attachWriter(callbacks_, session->length()), nullptr);
 }
 
-// One writer at a time: the next attaches where the last stopped and replaces it, and is told at
-// once when the session is still pushing back.
-TEST_F(RetryBodySessionTest, ANewWriterReplacesTheLast) {
+// One writer at a time; the next attaches where the last stopped, and is told at once when the
+// session is still pushing back.
+TEST_F(RetryBodySessionTest, WriterHandsOffAtTheSessionsLength) {
   auto session = makeSession(nullptr, /*high_watermark=*/4);
-  append("hello");
-  EXPECT_EQ(callbacks_.above_, 1);
   TestWriter next;
+  EXPECT_EQ(session->attachWriter(next, 0), nullptr);
+  append("hello");
+  writer_.reset();
+
   EXPECT_EQ(session->attachWriter(next, 4), nullptr);
   auto writer = session->attachWriter(next, 5);
   ASSERT_NE(writer, nullptr);
   EXPECT_EQ(next.above_, 1);
-
-  // The replaced writer takes no more bytes and hears nothing more.
-  append("lost");
-  EXPECT_EQ(session->length(), 5);
   drain();
   EXPECT_EQ(next.below_, 1);
-  EXPECT_EQ(callbacks_.below_, 0);
-  writer_.reset();
 
   Buffer::OwnedImpl rest(" world");
   writer->append(rest);
   writer->end();
   drain();
+  writer.reset();
   EXPECT_EQ(session->attachWriter(callbacks_, session->length()), nullptr);
   ExternalBufferPtr view = session->view();
   EXPECT_EQ(readOnce(*view, 0, 11), "hello world");
+  // The first writer went before the session drained, and heard nothing after it went.
+  EXPECT_EQ(callbacks_.above_, 1);
+  EXPECT_EQ(callbacks_.below_, 0);
 }
 
 TEST_F(RetryBodySessionTest, AdoptStampsTheAttemptAndHandOverSticks) {

@@ -2505,6 +2505,7 @@ public:
   AiProtocolManagerFilterSessionTest() {
     ON_CALL(callbacks_, upstreamCallbacks())
         .WillByDefault(testing::Return(OptRef<Http::UpstreamStreamFilterCallbacks>{upstream_}));
+    ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(64 * 1024));
     setRouteConfig();
     startAttempt(1);
   }
@@ -2701,10 +2702,14 @@ TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackALargeSessionAcrossPasses) 
   EXPECT_EQ(counterValue("request_session_reparsed"), 1);
 }
 
-// A document parsed another way is no use to this attempt, which parses the session back.
+// A document parsed another way is no use to this attempt, which parses the session back and
+// leaves that document for the attempts that parse that way.
 TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackForAnotherParse) {
+  // Over the snapshot cap, so the writer keeps no document of its own.
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(16));
   writeHandedOverSession();
   session()->setDocument({LLMProtocol::GeminiGenerateContent, 1024}, nlohmann::json::object());
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(64 * 1024));
   startAttempt(2);
   ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   Buffer::OwnedImpl end_of_body;
@@ -2712,7 +2717,32 @@ TEST_F(AiProtocolManagerFilterSessionTest, ParsesBackForAnotherParse) {
   runReplay();
   EXPECT_EQ(injected_.toString(), Body);
   EXPECT_EQ(counterValue("request_session_reparsed"), 1);
-  EXPECT_NE(session()->document(parseTag()), nullptr);
+  EXPECT_EQ(session()->document(parseTag()), nullptr);
+  EXPECT_NE(session()->document({LLMProtocol::GeminiGenerateContent, 1024}), nullptr);
+}
+
+// A stream that buffers nothing keeps no document either.
+TEST_F(AiProtocolManagerFilterSessionTest, KeepsNoDocumentWithoutABufferLimit) {
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
+  startAttempt(1);
+  writeHandedOverSession();
+  EXPECT_EQ(session()->document(parseTag()), nullptr);
+}
+
+// A reply sent while the session is parsed back may tear the filter down inside the read callback.
+TEST_F(AiProtocolManagerFilterSessionTest, SurvivesTeardownWhileParsingBack) {
+  const std::string body = absl::StrCat(R"({"model":"m","messages":[{"role":"user","content":")",
+                                        std::string(300 * 1024, 'x'), R"("}])");
+  EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::BadRequest, testing::_, testing::_, testing::_,
+                                         testing::_))
+      .WillOnce(testing::Invoke([this](Http::Code, absl::string_view,
+                                       std::function<void(Http::ResponseHeaderMap&)>,
+                                       const std::optional<Grpc::Status::GrpcStatus>,
+                                       absl::string_view) { filter_->onDestroy(); }));
+  claimAndFinishFromTheRouter(body, 10);
+  runReplay();
+  EXPECT_EQ(counterValue("request_parse_error"), 1);
+  EXPECT_EQ(inject_calls_, 0);
 }
 
 // A document larger than a body the stream would buffer is not kept; later attempts parse back.
@@ -2741,6 +2771,7 @@ TEST_F(AiProtocolManagerFilterSessionTest, RejectsTheEndOfASessionStillBeingWrit
 // A failed session is not claimed; the attempt does not stamp it, so the router fails the retry.
 TEST_F(AiProtocolManagerFilterSessionTest, DoesNotClaimAFailedSession) {
   factory_ = std::make_shared<SyncFailingBufferFactory>();
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
   startAttempt(1);
   ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   session()->handOver();
@@ -2756,6 +2787,8 @@ TEST_F(AiProtocolManagerFilterSessionTest, DoesNotClaimAFailedSession) {
 // A store that fails stops the request at the frame that found it, with one reply.
 TEST_F(AiProtocolManagerFilterSessionTest, FailedStoreRejectsOnce) {
   factory_ = std::make_shared<SyncFailingBufferFactory>();
+  // Nothing stays in memory, so the first frame reaches the store.
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(testing::Return(0));
   startAttempt(1);
   ASSERT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
   Buffer::OwnedImpl body(Body);

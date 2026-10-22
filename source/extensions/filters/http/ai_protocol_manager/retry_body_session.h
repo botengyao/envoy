@@ -51,7 +51,8 @@ public:
   bool ended() const { return ended_; }
   // Records that `attempt` takes its body from the session.
   void adopt(uint32_t attempt) { attempt_ = attempt; }
-  // Keeps a copy of `document`, parsed as `tag`.
+  // Keeps a copy of `document`, parsed as `tag`, unless it keeps one already: a later attempt that
+  // parses another way leaves the earlier attempts' document in place.
   void setDocument(const ParseTag& tag, const nlohmann::json& document);
   // The document, if it was parsed as `tag`; otherwise null.
   const nlohmann::json* document(const ParseTag& tag) const;
@@ -71,8 +72,8 @@ private:
   };
   using PendingReadSharedPtr = std::shared_ptr<PendingRead>;
 
-  void append(WriterImpl& writer, Buffer::Instance& data);
-  void end(WriterImpl& writer);
+  void append(Buffer::Instance& data);
+  void end();
   void detach(WriterImpl& writer);
   void maybeWrite();
   void onWriteComplete(ExternalBufferStatus status);

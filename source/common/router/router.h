@@ -637,7 +637,7 @@ private:
   // Whether the router writes the next body bytes to the session itself: the attempt the body was
   // handed over to is gone, and a retry takes the body from the session.
   bool routerWritesRetrySession() const;
-  // Returns false if it ended the stream.
+  // Returns false if the session can serve no retry, in which case the stream is ended or answered.
   bool writeRetrySession(Buffer::Instance& data, bool end_stream);
   void failRetrySession(Stats::Counter& counter, absl::string_view details);
 
