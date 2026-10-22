@@ -2,7 +2,8 @@
 //
 // Model routing: a request for `coding_model` goes to Claude on Vertex AI while the tenant has
 // Claude budget left, and to Gemini on Vertex AI after that. The choice leaves as x-ai-backend-*
-// request headers, which the gateway turns into the AI Protocol Manager's filter state keys.
+// request headers, which the gateway turns into the AI Protocol Manager's filter state keys, along
+// with the backend's credential.
 //
 // Token management: the tenant's spend is what the backend reported, read from the
 // envoy.ai.token_usage record the AI Protocol Manager publishes and Envoy forwards on the response
@@ -133,7 +134,12 @@ func (s *server) route(tenant string, body []byte, req *extprocv3.ProcessingRequ
 			header("x-ai-backend-binding", b.binding),
 			header("x-ai-backend-model", b.model),
 			header("x-ai-backend-host", s.vertexHost),
-		}},
+			// Local run: a static token; a real gateway fetches one, e.g. with gcp_authn.
+			header("authorization", "Bearer test-access-token"),
+		},
+			// The transcoder rewrites the response, so it asks for one it can read.
+			RemoveHeaders: []string{"accept-encoding"},
+		},
 	}
 }
 

@@ -12,3 +12,4 @@ vertex POST https://us-east5-aiplatform.googleapis.com:8444/v1/projects/acme/loc
        authorization: Bearer test-access-token
        body: {"anthropic_version":"vertex-2023-10-16","max_tokens":1024,"messages":[{"content":"Explain how Envoy routes an HTTP request.","role":"user"}],"stream":true,"system":"You are an expert in Envoy and distributed systems."}
        -> 200 streamRawPredict
+echo   POST https://us-east5-aiplatform.googleapis.com:8444/echo b'not JSON, and not for the AI Protocol Manager'

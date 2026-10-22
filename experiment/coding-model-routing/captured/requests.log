@@ -1,36 +1,34 @@
 == team-a, stream=false
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Envoy matches the request to a route, runs that route's HTTP filters, and forwards it to a host the route's cluster picks.","role":"assistant"}}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion","usage":{"completion_tokens":24,"prompt_tokens":27,"total_tokens":51}}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Envoy matches the request to a route, runs that route's HTTP filters, and forwards it to a host the route's cluster picks.","role":"assistant"}}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion","usage":{"completion_tokens":24,"prompt_tokens":27,"total_tokens":51}}
 == team-a, stream=true
-data: {"choices":[{"delta":{"content":"Envoy matches the request to a route, ","role":"assistant"},"finish_reason":null,"index":0}],"created":1792642684,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"Envoy matches the request to a route, ","role":"assistant"},"finish_reason":null,"index":0}],"created":1792644915,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"runs that route's HTTP filters, ","role":"assistant"},"finish_reason":null,"index":0}],"created":1792642684,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"runs that route's HTTP filters, ","role":"assistant"},"finish_reason":null,"index":0}],"created":1792644915,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"and forwards it to a host the route's cluster picks.","role":"assistant"},"finish_reason":"stop","index":0}],"created":1792642684,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk","usage":{"completion_tokens":22,"prompt_tokens":25,"total_tokens":47}}
+data: {"choices":[{"delta":{"content":"and forwards it to a host the route's cluster picks.","role":"assistant"},"finish_reason":"stop","index":0}],"created":1792644915,"id":"vertex-response-1","model":"coding_model","object":"chat.completion.chunk","usage":{"completion_tokens":22,"prompt_tokens":25,"total_tokens":47}}
 
 data: [DONE]
 
 
 == team-b, stream=true
-data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"Envoy matches the request to a route, "},"finish_reason":null,"index":0}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"Envoy matches the request to a route, "},"finish_reason":null,"index":0}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"runs that route's HTTP filters, "},"finish_reason":null,"index":0}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"runs that route's HTTP filters, "},"finish_reason":null,"index":0}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"and forwards it to a host the route's cluster picks."},"finish_reason":null,"index":0}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"and forwards it to a host the route's cluster picks."},"finish_reason":null,"index":0}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1792642684,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk","usage":{"completion_tokens":24,"prompt_tokens":27,"total_tokens":51}}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1792644915,"id":"msg_vrtx_01","model":"coding_model","object":"chat.completion.chunk","usage":{"completion_tokens":24,"prompt_tokens":27,"total_tokens":51}}
 
 data: [DONE]
 
 
+== not LLM traffic: a plain-text body to another service
+not JSON, and not for the AI Protocol Manager
 == counters
-ai_protocol_manager.token_usage_duplicate: 0
-ai_protocol_manager.token_usage_failed: 0
+ai_protocol_manager.request_parsed: 6
 ai_protocol_manager.token_usage_found: 3
-ai_protocol_manager.token_usage_missing: 0
-ai_protocol_manager.token_usage_partial: 0
-ai_protocol_manager.token_usage_total_mismatch: 0
 ai_protocol_manager.transcoder.failed: 0
 ai_protocol_manager.transcoder.transcoded: 13
 ai_protocol_manager.transcoder.unresolved: 0

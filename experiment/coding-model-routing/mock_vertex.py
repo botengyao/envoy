@@ -73,6 +73,15 @@ class VertexHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length", "0")))
+        if self.path == "/echo":
+            # Any other service the forward proxy reaches.
+            log(f"echo   POST https://{self.headers.get('host')}{self.path} {body!r}")
+            self.send_response(200)
+            self.send_header("content-type", self.headers.get("content-type", "text/plain"))
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         log(f"vertex POST https://{self.headers.get('host')}{self.path}")
         log(f"       authorization: {self.headers.get('authorization')}")
         log(f"       body: {body.decode(errors='replace')}")
