@@ -122,9 +122,9 @@ the implementation, `RetryBodySessionImpl` in the APM.
 
 **One writer at a time.**
 - The APM attaches as the writer when it creates the session.
-- The router attaches once the attempt the body was handed over to is gone. That attempt's filters
-  are destroyed on a deferred delete, possibly after the router's next frame, so attaching
-  replaces any writer before it, which takes no more bytes and hears nothing more.
+- The router attaches once the attempt the body was handed over to is gone. Removing an attempt
+  destroys its filters at once (`deferredDelete` runs `cleanUp()`), so its writer has detached by
+  then; an attach that finds a writer fails, and so does the retry.
 - A writer attached above the high watermark is told at once, so the watermark calls it gets stay
   balanced.
 
@@ -166,7 +166,7 @@ later attempt while the router still holds the body.
    transcoder rewrites it in place.
 
 The snapshot is tagged with how it was parsed: the request API and the inline-string threshold.
-It is kept only when its estimated size fits the stream buffer limit:
+It is kept only when its estimated size fits the stream buffer limit (so never at a limit of 0):
 `parsed bytes - externalRefBytes + nodes x 64`. A document of many short strings is otherwise
 copied for every attempt; above the cap, each adopter parses the session back instead.
 
@@ -180,7 +180,8 @@ A later attempt takes its body from a session that was handed over.
    - **with a snapshot of the same tag**, deep-copy it as this attempt's document: inline values
      are copied, large strings stay 16-byte references;
    - **otherwise**, parse the session back from its store, in 64 KiB reads, a few per event-loop
-     pass, and keep the result as the snapshot for later attempts.
+     pass. The result becomes the snapshot if the session has none; an earlier attempt's snapshot,
+     parsed another way, stays for the clusters that parse that way.
 3. **Output.** Transcoding renders this cluster's request. The serializer reads the large strings
    through the view, paced by this attempt's codec watermarks.
 
@@ -251,7 +252,8 @@ The router forwards the session's watermarks to the downstream as its own.
 A retry needs the session not failed and holding every byte the router received. A body still
 arriving is fine. Otherwise the router gives up on retries, as on today's overflow, and counts
 `retry_session_incomplete`; the failing attempt's own error reaches the client. That happens when
-a filter ahead of the APM held bytes back, or the APM rejected the payload.
+a filter ahead of the APM held bytes back, or the APM rejected the payload. The counter also counts
+a reset the retry policy would not have retried: the gate runs first.
 
 ### 5.5 Retry send
 
@@ -265,7 +267,8 @@ a filter ahead of the APM held bytes back, or the APM rejected the payload.
 
 **Store failure.** A session that fails while the router writes it can serve no retry: 503
 `retry_session_failed`, from outside the append that found it. So does a session the router cannot
-attach to.
+attach to, and one found failed when the retry starts. Once a response is under way, a failure no
+longer ends the stream; an adopter that still needs the bytes fails its own reads.
 
 ### 5.6 Unchanged and related
 
@@ -432,7 +435,7 @@ cluster.
 | Retry target without the session APM | 503 `retry_session_not_adopted` |
 | A cluster that parses with another tag, or a snapshot over the cap | The adopter parses the session back |
 | Store fails while an attempt takes the body | That APM's 500 at the next frame; an upstream filter's reply is not retried |
-| Store fails while the router writes the body | 503 `retry_session_failed` |
+| Store fails while the router writes the body, or before a retry starts | 503 `retry_session_failed` |
 | Store read fails in an adopted attempt | That APM's 500 (`ai_protocol_manager_external_buffer_error`), not retried |
 | Hedging, internal redirect, CONNECT, upgrade | Never handed over: today's behavior |
 | Request trailers | Kept by the router and sent in place of the empty end frame |
