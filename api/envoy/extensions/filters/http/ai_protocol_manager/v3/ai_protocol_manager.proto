@@ -37,7 +37,9 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // of ``request_handling`` and ``response_handling``. Which routes are AI
 // endpoints — and which :ref:`wire API <envoy_v3_api_enum_type.ai.v3.LLMProtocol>`
 // each speaks — is declared with the :ref:`per-route configuration
-// <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`.
+// <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`,
+// or for one request by the ``envoy.ai.llm_protocol.request`` filter state
+// object, which needs no per-route configuration.
 message AiProtocolManager {
   // Request-side AI protocol processing. When unset, the decode path is a
   // pure passthrough — including on routes carrying per-route configuration.
@@ -156,7 +158,9 @@ message TokenUsageExtraction {
   // Defaults to ``false``: only routes carrying an
   // :ref:`AiProtocolManagerPerRoute
   // <envoy_v3_api_msg_extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute>`
-  // configuration are inspected, so enabling token usage on a mixed listener
+  // configuration, and streams whose request or backend API is in the
+  // ``envoy.ai.llm_protocol.request`` or ``envoy.ai.llm_protocol.response``
+  // filter state object, are inspected, so enabling token usage on a mixed listener
   // does not silently parse unrelated JSON/SSE responses. Enable this for
   // response-only installations whose routes cannot be declared — for
   // example an upstream installation on a dynamic-forward-proxy cluster.
@@ -228,7 +232,8 @@ message TokenUsageExtractionLimits {
 // the provider's response API. For response token-usage extraction the
 // effective wire API is resolved in precedence order: the
 // ``envoy.ai.llm_protocol.response`` filter state object, then per-route
-// ``response.llm_protocol``, then per-route ``request.llm_protocol``, then
+// ``response.llm_protocol``, then per-route ``request.llm_protocol``, then the
+// ``envoy.ai.llm_protocol.request`` filter state object, then
 // :ref:`default_llm_protocol
 // <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.default_llm_protocol>`,
 // then auto-detection.

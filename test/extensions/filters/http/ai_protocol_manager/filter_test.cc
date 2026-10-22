@@ -1140,6 +1140,40 @@ TEST_F(AiProtocolManagerFilterResponseTest, RouteScopingDefaultsToConfiguredRout
   EXPECT_EQ(counterValue("token_usage_found"), 1);
 }
 
+// A stream whose request API filter state names is inspected without a per-route config, and read
+// in that API.
+TEST_F(AiProtocolManagerFilterResponseTest, RequestApiInFilterStateScopesTheStreamIn) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  proto_config.mutable_response_handling()->mutable_token_usage();
+  setupWithProto(proto_config);
+  encoder_callbacks_.stream_info_.filterState()->setData(
+      FilterStateKeys::LlmProtocolRequest,
+      std::make_shared<RequestLlmProtocol>(LLMProtocol::AnthropicMessages),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  sendHeaders("application/json");
+  sendData("{\"usage\":{\"input_tokens\":5,\"output_tokens\":7}}", true);
+  const auto typed = singleTypedWrite("envoy.ai.token_usage");
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->llm_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+}
+
+// So is one whose backend API filter state names.
+TEST_F(AiProtocolManagerFilterResponseTest, BackendApiInFilterStateScopesTheStreamIn) {
+  envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManager proto_config;
+  proto_config.mutable_response_handling()->mutable_token_usage();
+  setupWithProto(proto_config);
+  encoder_callbacks_.stream_info_.filterState()->setData(
+      FilterStateKeys::LlmProtocolResponse,
+      std::make_shared<ResponseLlmProtocol>(LLMProtocol::GeminiGenerateContent),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  sendHeaders("application/json");
+  sendData("{\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":7}}", true);
+  const auto typed = singleTypedWrite("envoy.ai.token_usage");
+  ASSERT_TRUE(typed.has_value());
+  EXPECT_EQ(typed->llm_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  EXPECT_EQ(typed->input_tokens().value(), 5);
+}
+
 // The backend API left in filter state outranks the per-route response API,
 // which outranks the per-route request API, which outranks the configured
 // fallback.
@@ -1591,6 +1625,44 @@ TEST_F(AiProtocolManagerFilterStateTest, UnspecifiedFilterStateLeavesTheRoute) {
   ASSERT_EQ(seen.size(), 1);
   EXPECT_EQ(seen[0].protocol, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(seen[0].request_protocol, LLMProtocol::OpenAiChatCompletions);
+}
+
+// A request whose API filter state names is an AI endpoint on a route that declares none, such as
+// a forward proxy's catch-all.
+TEST_F(AiProtocolManagerFilterStateTest, FilterStateDeclaresAnEndpointWithoutARoute) {
+  std::vector<ContextRecordingAiFilter::Seen> seen;
+  createFilterWithAiFilters({[&seen](const AiFilterContext& context) -> AiFilterSharedPtr {
+    return std::make_unique<ContextRecordingAiFilter>(context, seen);
+  }});
+  callbacks_.stream_info_.filterState()->setData(
+      FilterStateKeys::LlmProtocolRequest,
+      std::make_shared<RequestLlmProtocol>(LLMProtocol::AnthropicMessages),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl body(R"({"model":"claude","messages":[{"role":"user","content":"hi"}]})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  ASSERT_EQ(seen.size(), 1);
+  EXPECT_EQ(seen[0].protocol, LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(seen[0].request_binding, nullptr);
+  EXPECT_EQ(seen[0].response_binding, nullptr);
+}
+
+// It is parsed as strictly as a route's declared endpoint, without parse_unconfigured_routes.
+TEST_F(AiProtocolManagerFilterStateTest, FilterStateDeclaredEndpointRejectsMalformedJson) {
+  callbacks_.stream_info_.filterState()->setData(
+      FilterStateKeys::LlmProtocolRequest,
+      std::make_shared<RequestLlmProtocol>(LLMProtocol::OpenAiChatCompletions),
+      StreamInfo::FilterState::LifeSpan::FilterChain);
+  EXPECT_EQ(decodeHeadersEngaging(), Http::FilterHeadersStatus::StopIteration);
+  Buffer::OwnedImpl body(R"({"model" "gpt-4"})");
+  EXPECT_EQ(filter_->decodeData(body, true), Http::FilterDataStatus::StopIterationNoBuffer);
+  drain();
+
+  EXPECT_EQ(local_reply_calls_, 1);
+  EXPECT_EQ(local_reply_code_, Http::Code::BadRequest);
+  EXPECT_EQ(counterValue("request_parse_error"), 1);
 }
 
 TEST_F(AiProtocolManagerFilterTest, DoesNotRunAiFiltersOnUnconfiguredRoute) {

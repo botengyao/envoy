@@ -292,29 +292,32 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::decodeHeaders(Http::RequestHe
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // Copy what the route declared; see the note on route_has_request_ for why the
-  // config is not held by pointer.
+  const LLMProtocol declared =
+      RequestLlmProtocol::fromFilterState(*decoder_callbacks_->streamInfo().filterState());
+  // Copy what the route declared; see the note on ai_endpoint_ for why the config is not held by
+  // pointer.
   if (const RouteConfig* route_config =
           Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(decoder_callbacks_);
       route_config != nullptr) {
-    route_has_request_ = route_config->hasRequest();
+    ai_endpoint_ = route_config->hasRequest();
     request_protocol_ = route_config->requestProtocol();
     route_response_protocol_ = route_config->responseProtocol();
     route_request_binding_ = route_config->requestBinding();
     route_response_binding_ = route_config->responseBinding();
-    if (route_has_request_) {
-      if (const LLMProtocol declared =
-              RequestLlmProtocol::fromFilterState(*decoder_callbacks_->streamInfo().filterState());
-          declared != LLMProtocol::Unspecified) {
-        request_protocol_ = declared;
-      }
-      // The route's binding is how its clients carry the route's API, so it lapses for another.
-      if (request_protocol_ != route_config->requestProtocol()) {
-        route_request_binding_ = nullptr;
-      }
-      ENVOY_LOG(debug, "ai_protocol_manager: AI endpoint with request API {}",
-                llmProtocolName(request_protocol_));
+  }
+  // The request API in filter state declares the endpoint on its own, so a route that also carries
+  // other traffic, such as a forward proxy's catch-all, needs no request declaration.
+  if (declared != LLMProtocol::Unspecified) {
+    ai_endpoint_ = true;
+    // The route's binding is how its clients carry the route's API, so it lapses for another.
+    if (declared != request_protocol_) {
+      route_request_binding_ = nullptr;
     }
+    request_protocol_ = declared;
+  }
+  if (ai_endpoint_) {
+    ENVOY_LOG(debug, "ai_protocol_manager: AI endpoint with request API {}",
+              llmProtocolName(request_protocol_));
   }
 
   // A declared AI endpoint is parsed strictly. Any other route is parsed only if
@@ -561,16 +564,22 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
 
   // Route scoping: only declared AI endpoints are inspected unless the filter
   // opted into unconfigured routes, so enabling token usage on a mixed
-  // listener does not silently parse unrelated JSON/SSE responses. Resolved
-  // fresh here rather than cached from the decode path: the decode-path copy
-  // is not taken when request handling is disabled, and it could be stale --
-  // a later decode filter may refresh the route (clearRouteCache), and by
-  // response time the route is frozen as the one that actually routed the
-  // request.
+  // listener does not silently parse unrelated JSON/SSE responses. A stream is
+  // declared by the route, or by a filter that named its request or backend API
+  // in filter state. Resolved fresh here rather than cached from the decode
+  // path: the decode-path copy is not taken when request handling is disabled,
+  // and it could be stale -- a later decode filter may refresh the route
+  // (clearRouteCache), and by response time the route is frozen as the one that
+  // actually routed the request.
+  const StreamInfo::FilterState& filter_state = *encoder_callbacks_->streamInfo().filterState();
+  const LLMProtocol declared_request = RequestLlmProtocol::fromFilterState(filter_state);
   const RouteConfig* route_config =
       Http::Utility::resolveMostSpecificPerFilterConfig<RouteConfig>(encoder_callbacks_);
-  const bool want_token_usage = config_->tokenUsageEnabled() &&
-                                (route_config != nullptr || config_->includeUnconfiguredRoutes());
+  const bool want_token_usage =
+      config_->tokenUsageEnabled() &&
+      (route_config != nullptr || config_->includeUnconfiguredRoutes() ||
+       declared_request != LLMProtocol::Unspecified ||
+       ResponseLlmProtocol::fromFilterState(filter_state) != LLMProtocol::Unspecified);
 
   if (!can_filter_response && !want_token_usage) {
     return Http::FilterHeadersStatus::Continue;
@@ -636,15 +645,17 @@ Http::FilterHeadersStatus AiProtocolManagerFilter::encodeHeaders(Http::ResponseH
   if (want_token_usage) {
     // The wire API to extract against, in precedence order: the backend API a filter left in
     // filter state, the route's declared response API, the route's declared request API, the
-    // configured fallback; Unspecified auto-detects from the response shape. Resolved through
-    // the same rule the transcoder follows, so the two cannot disagree about the backend.
+    // request API in filter state, the configured fallback; Unspecified auto-detects from the
+    // response shape. Resolved through the same rule the transcoder follows, so the two cannot
+    // disagree about the backend.
     LLMProtocol protocol = config_->defaultLLMProtocol();
     if (route_config != nullptr &&
         route_config->effectiveResponseProtocol() != LLMProtocol::Unspecified) {
       protocol = route_config->effectiveResponseProtocol();
+    } else if (declared_request != LLMProtocol::Unspecified) {
+      protocol = declared_request;
     }
-    protocol =
-        ResponseLlmProtocol::resolve(*encoder_callbacks_->streamInfo().filterState(), protocol);
+    protocol = ResponseLlmProtocol::resolve(filter_state, protocol);
 
     // Observation buffers charge the stream's memory account when tracking is
     // enabled; in an upstream installation the decoder callbacks resolve to the
