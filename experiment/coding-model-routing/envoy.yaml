@@ -1,0 +1,179 @@
+# The composite model `coding_model`, served by Claude or Gemini on Vertex AI.
+#
+#   agent_registry -> input schema update -> ai_gateway (AIPM) -> ext_proc (model routing + token
+#   management) -> model_routing_keys -> ai_transcoder (AIPM) -> dynamic forward proxy
+#
+# Clients speak OpenAI Chat Completions. ext_proc picks the backend and names it in x-ai-backend-*
+# headers; model_routing_keys turns them into the AI Protocol Manager's filter state keys; the
+# second AIPM transcodes to the backend's API under its binding, extracts token usage from the
+# backend's response, and adds trailers so ext_proc receives the usage record on them.
+#
+# Local run: the DNS resolver and the trusted CA serve mock_vertex.py, and ext_proc adds the mock's
+# port to the host it names.
+
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9981}
+
+static_resources:
+  listeners:
+  - name: gateway
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 10081}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: gateway
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              log_format:
+                json_format:
+                  status: "%RESPONSE_CODE%"
+                  details: "%RESPONSE_CODE_DETAILS%"
+                  tenant: "%REQ(x-tenant)%"
+                  client_model: "%FILTER_STATE(envoy.ai.model.request:PLAIN)%"
+                  backend_api: "%FILTER_STATE(envoy.ai.llm_protocol.response:PLAIN)%"
+                  backend_model: "%FILTER_STATE(envoy.ai.model.resolved:PLAIN)%"
+                  upstream: "%REQ(:AUTHORITY)%%REQ(:PATH)%"
+                  token_usage: "%TYPED_CEL(metadata.typed_filter_metadata['envoy.ai.token_usage'])%"
+          route_config:
+            virtual_hosts:
+            - name: ai
+              domains: ["*"]
+              routes:
+              - match: {path: /v1/chat/completions}
+                route: {cluster: vertex, timeout: 300s}
+                request_headers_to_add:
+                # The gcp_authn filter supplies a real access token.
+                - header: {key: authorization, value: "Bearer test-access-token"}
+                  append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                request_headers_to_remove:
+                - x-ai-backend-api
+                - x-ai-backend-binding
+                - x-ai-backend-model
+                - x-ai-backend-host
+                # The transcoder rewrites the response, so it asks for one it can read.
+                - accept-encoding
+                typed_per_filter_config:
+                  ai_gateway:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    request: {llm_protocol: OPENAI_CHAT_COMPLETIONS}
+                  # The backend's API and binding come from filter state, per request.
+                  ai_transcoder:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManagerPerRoute
+                    request: {llm_protocol: OPENAI_CHAT_COMPLETIONS}
+                  envoy.filters.http.dynamic_forward_proxy:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.PerRouteConfig
+                    host_rewrite_header: x-ai-backend-host
+          http_filters:
+          # - agent_registry: your filter.
+          # - input schema update: your filter.
+          - name: ai_gateway
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+              request_handling: {}
+              filters:
+              - name: envoy.http.ai_filters.schema_validation
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
+              # Publishes envoy.ai.request_info, with the input token estimate ext_proc reads.
+              - name: envoy.http.ai_filters.request_info
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
+                  token_estimation: {tokens_per_byte: 0.25}
+          - name: model_router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+              grpc_service:
+                envoy_grpc: {cluster_name: ext_proc}
+              message_timeout: 2s
+              processing_mode:
+                request_header_mode: SEND
+                request_body_mode: BUFFERED
+                response_header_mode: SKIP
+                response_body_mode: NONE
+                # The usage record rides the trailers ai_transcoder adds.
+                response_trailer_mode: SEND
+              metadata_options:
+                forwarding_namespaces:
+                  typed: [envoy.ai.request_info, envoy.ai.token_usage]
+          # Stands in for customized_model_routing: ext_proc's choice, as filter state keys.
+          - name: model_routing_keys
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
+              on_request_headers:
+              - object_key: envoy.ai.llm_protocol.response
+                format_string: {text_format_source: {inline_string: "%REQ(x-ai-backend-api)%"}, omit_empty_values: true}
+              - object_key: envoy.ai.binding.response
+                format_string: {text_format_source: {inline_string: "%REQ(x-ai-backend-binding)%"}, omit_empty_values: true}
+              - object_key: envoy.ai.model.resolved
+                format_string: {text_format_source: {inline_string: "%REQ(x-ai-backend-model)%"}, omit_empty_values: true}
+          - name: ai_transcoder
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+              request_handling: {}
+              response_handling:
+                token_usage:
+                  usage_signal: SYNTHESIZE_TRAILERS
+              filters:
+              - name: envoy.http.ai_filters.transcoder
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
+                  request_handling: FROM_IR
+                  response_handling: TO_IR
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: &vertex_dns
+                name: vertex
+                dns_lookup_family: V4_ONLY
+                # Local run: mock_vertex.py answers for *-aiplatform.googleapis.com.
+                typed_dns_resolver_config:
+                  name: envoy.network.dns_resolver.cares
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+                    resolvers:
+                    - socket_address: {address: 127.0.0.1, port_value: 15354}
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  - name: vertex
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config: *vertex_dns
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        upstream_http_protocol_options: {auto_sni: true, auto_san_validation: true}
+        auto_config:
+          http2_protocol_options: {}
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          validation_context:
+            # Local run: the CA gen_certs.sh made for mock_vertex.py.
+            trusted_ca: {filename: certs/ca.pem}
+  - name: ext_proc
+    type: STATIC
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: {http2_protocol_options: {}}
+    load_assignment:
+      cluster_name: ext_proc
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: {address: 127.0.0.1, port_value: 50061}

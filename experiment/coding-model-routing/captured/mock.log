@@ -1,0 +1,14 @@
+mock Vertex AI: DNS on 127.0.0.1:15354, HTTPS on 127.0.0.1:8444
+dns    us-east5-aiplatform.googleapis.com -> 127.0.0.1
+vertex POST https://us-east5-aiplatform.googleapis.com:8444/v1/projects/acme/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict
+       authorization: Bearer test-access-token
+       body: {"anthropic_version":"vertex-2023-10-16","max_tokens":1024,"messages":[{"content":"Explain how Envoy routes an HTTP request.","role":"user"}],"stream":false,"system":"You are an expert in Envoy and distributed systems."}
+       -> 200 rawPredict
+vertex POST https://us-east5-aiplatform.googleapis.com:8444/v1/projects/acme/locations/us-east5/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse
+       authorization: Bearer test-access-token
+       body: {"contents":[{"parts":[{"text":"Explain how Envoy routes an HTTP request."}],"role":"user"}],"generationConfig":{"maxOutputTokens":1024},"systemInstruction":{"parts":[{"text":"You are an expert in Envoy and distributed systems."}]}}
+       -> 200 streamGenerateContent?alt=sse
+vertex POST https://us-east5-aiplatform.googleapis.com:8444/v1/projects/acme/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict
+       authorization: Bearer test-access-token
+       body: {"anthropic_version":"vertex-2023-10-16","max_tokens":1024,"messages":[{"content":"Explain how Envoy routes an HTTP request.","role":"user"}],"stream":true,"system":"You are an expert in Envoy and distributed systems."}
+       -> 200 streamRawPredict

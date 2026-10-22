@@ -1,0 +1,7 @@
+2026/10/22 00:18:04 ext_proc on 127.0.0.1:50061, Claude budget 50 tokens per tenant
+2026/10/22 00:18:04 route  tenant=team-a model=coding_model estimated_input_tokens=81 -> ANTHROPIC_MESSAGES claude-sonnet-4-5@20250929
+2026/10/22 00:18:04 usage  tenant=team-a model=claude-sonnet-4-5@20250929 input=27 output=24 total=51 -> tenant spent 51, Claude budget 50
+2026/10/22 00:18:04 route  tenant=team-a model=coding_model estimated_input_tokens=80 -> GEMINI_GENERATE_CONTENT gemini-2.5-flash
+2026/10/22 00:18:04 usage  tenant=team-a model=gemini-2.5-flash input=25 output=22 total=47 -> tenant spent 98, Claude budget 50
+2026/10/22 00:18:04 route  tenant=team-b model=coding_model estimated_input_tokens=80 -> ANTHROPIC_MESSAGES claude-sonnet-4-5@20250929
+2026/10/22 00:18:04 usage  tenant=team-b model=claude-sonnet-4-5@20250929 input=27 output=24 total=51 -> tenant spent 51, Claude budget 50
