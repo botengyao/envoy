@@ -592,11 +592,17 @@ Both streaming shapes are handled:
   body is a root-level JSON array of chunks.
 
 The response's :ref:`wire API <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` is
-resolved in precedence order: the route's declared response API, the route's
-declared request API, then :ref:`default_llm_protocol
+resolved in precedence order: the ``envoy.ai.llm_protocol.response`` filter
+state object, the route's declared response API, the route's declared request
+API, then :ref:`default_llm_protocol
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.default_llm_protocol>`;
 when none is declared it is auto-detected from the response shape (only
 strong, dialect-unique markers lock detection).
+Usage is read from the response as it reaches this filter, before its AI filters
+transcode it. When transcoding is split across two instances with a model router
+between them, the first reading the client's API into the IR and the second
+writing it out in the backend's API, enable token usage on the second: it sees
+the backend's response in the API the router left in filter state.
 Cumulative streaming counters (Anthropic ``message_delta``, Gemini snapshots)
 are merged with last-value-wins semantics per native field, and the canonical
 values are computed once, after the last event.
