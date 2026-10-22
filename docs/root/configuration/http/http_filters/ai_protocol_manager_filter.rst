@@ -129,7 +129,13 @@ A filter ahead of this one that knows the caller better than the route does
 can name the request API itself, with the ``envoy.ai.llm_protocol.request``
 filter state object. On a declared AI endpoint the object wins over the route's
 ``llm_protocol``; one naming ``LLM_PROTOCOL_UNSPECIFIED`` leaves the route's
-declaration standing. Its object factory builds it from an :ref:`LLMProtocol
+declaration standing. The object also declares an AI endpoint on its own, so a
+route that carries other traffic as well, such as a dynamic forward proxy's
+catch-all, needs no per-route configuration: a filter that recognizes LLM
+traffic sets it on those requests alone, which are then parsed strictly and run
+through the AI filters, while every other request passes straight through.
+Response token usage is extracted on such a stream as well, and on one whose
+backend API is in the ``envoy.ai.llm_protocol.response`` object. Its object factory builds it from an :ref:`LLMProtocol
 <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` enum-value name, so
 :ref:`set_filter_state <config_http_filters_set_filter_state>`, Lua and
 ext_proc can all set it. It is read when the request headers arrive. Access
@@ -537,7 +543,8 @@ When :ref:`response_handling.token_usage
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.ResponseHandling.token_usage>`
 is configured, 2xx responses with a ``text/event-stream`` or
 ``application/json`` content type are observed as they stream through the
-filter. Inspection is scoped to routes carrying a per-route configuration;
+filter. Inspection is scoped to routes carrying a per-route configuration, and
+to streams whose request or backend API is in filter state;
 setting :ref:`include_unconfigured_routes
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.include_unconfigured_routes>`
 widens it to every route, for response-only installations whose routes cannot
@@ -592,11 +599,18 @@ Both streaming shapes are handled:
   body is a root-level JSON array of chunks.
 
 The response's :ref:`wire API <envoy_v3_api_enum_type.ai.v3.LLMProtocol>` is
-resolved in precedence order: the route's declared response API, the route's
-declared request API, then :ref:`default_llm_protocol
+resolved in precedence order: the ``envoy.ai.llm_protocol.response`` filter
+state object, the route's declared response API, the route's declared request
+API, the ``envoy.ai.llm_protocol.request`` filter state object, then
+:ref:`default_llm_protocol
 <envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.TokenUsageExtraction.default_llm_protocol>`;
 when none is declared it is auto-detected from the response shape (only
 strong, dialect-unique markers lock detection).
+Usage is read from the response as it reaches this filter, before its AI filters
+transcode it. When transcoding is split across two instances with a model router
+between them, the first reading the client's API into the IR and the second
+writing it out in the backend's API, enable token usage on the second: it sees
+the backend's response in the API the router left in filter state.
 Cumulative streaming counters (Anthropic ``message_delta``, Gemini snapshots)
 are merged with last-value-wins semantics per native field, and the canonical
 values are computed once, after the last event.

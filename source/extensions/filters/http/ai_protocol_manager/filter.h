@@ -162,8 +162,10 @@ private:
 // not after the whole upload.
 //
 // A route carrying a per-route request declaration is a declared AI endpoint,
-// and its payload is the filter's to manage: parsed strictly, with a malformed
-// one rejected so Envoy and the backend cannot read the same body differently.
+// and so is a request whose API a filter ahead of this one named in the
+// envoy.ai.llm_protocol.request filter state object. Its payload is the filter's
+// to manage: parsed strictly, with a malformed one rejected so Envoy and the
+// backend cannot read the same body differently.
 // A route without one is parsed only if the filter opted into
 // parse_unconfigured_routes -- offered for compatibility with chains that want
 // a parsed body on ordinary routes, never a reason to fail a request -- and is
@@ -178,7 +180,8 @@ private:
 //
 // Encode (response) path: observe-only token-usage extraction. When
 // response_handling.token_usage is configured, 2xx SSE/JSON responses on
-// configured routes (or on all routes with include_unconfigured_routes) are
+// configured routes, on streams whose request or backend API is in filter state
+// (or on all routes with include_unconfigured_routes) are
 // teed into a ResponseHandler; at end of stream the normalized usage is
 // published as dynamic metadata on the downstream StreamInfo, from downstream
 // and upstream installations alike. The filter never stops iteration or
@@ -213,9 +216,9 @@ private:
   // Terminates the stream with a 400 for a payload that failed to parse.
   void rejectInvalidPayload(const absl::Status& status);
 
-  // Whether the route handed its request payload to the filter, which is also
-  // what makes a parse failure fatal.
-  bool isAiEndpoint() const { return route_has_request_; }
+  // Whether the route, or the request API in filter state, handed the request
+  // payload to the filter, which is also what makes a parse failure fatal.
+  bool isAiEndpoint() const { return ai_endpoint_; }
 
   // The inline-string threshold for this stream: the route's payload schema
   // when it pins one, otherwise the filter's configured default.
@@ -250,7 +253,7 @@ private:
   // Copied out of the route configuration rather than held by pointer: the route
   // can be re-resolved mid-stream, which would leave a cached pointer dangling,
   // and these are scalars or shared.
-  bool route_has_request_{false};
+  bool ai_endpoint_{false};
   LLMProtocol request_protocol_{LLMProtocol::Unspecified};
   LLMProtocol route_response_protocol_{LLMProtocol::Unspecified};
   LlmBindingConstSharedPtr route_request_binding_;

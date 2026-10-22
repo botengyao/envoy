@@ -3,6 +3,7 @@
 #include <utility>
 #include <vector>
 
+#include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
 #include "envoy/type/ai/v3/llm_protocol.pb.h"
 
@@ -32,6 +33,9 @@ constexpr absl::string_view StreamQuestion = "Explain HTTP/2 flow control step b
 
 // The route's credential, as `gcp_authn` would set it: bindings leave credentials to the route.
 constexpr absl::string_view AccessToken = "Bearer test-access-token";
+
+// The AI Protocol Manager instance after the model router, when the hop is split across two.
+constexpr absl::string_view BackendInstance = "ai_protocol_manager_backend";
 
 // Gemini on Vertex AI's `GenerateContentResponse`s for "Hello from Gemini.": the unary response,
 // and the stream's chunks, the last of which finishes the candidate and counts the tokens.
@@ -110,29 +114,33 @@ std::vector<std::pair<std::string, nlohmann::json>> sseEvents(absl::string_view 
 // come from a filter ahead of the AI Protocol Manager for Claude, as from a model router; that
 // filter names the model either way, and the client's path supplies the project and the region.
 // The upstream answers as Vertex AI does.
+//
+// With `split`, the hop runs through two AI Protocol Manager instances with the model router
+// between them: the first reads the client's API into the IR, and the second, configured for the
+// IR, writes it out in the backend's API and extracts token usage from the backend's response.
 class TranscoderIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                   public HttpIntegrationTest {
 public:
   TranscoderIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
   // Gemini's own edits apply to a binding with only a pattern: `model` and `stream` leave the body.
-  void initializeForGemini() {
+  void initializeForGemini(bool split = false) {
     initializeRoute(envoy::type::ai::v3::ANTHROPIC_MESSAGES,
                     envoy::type::ai::v3::GEMINI_GENERATE_CONTENT,
                     "/{version}/projects/{project}/locations/{location}/publishers/google/models/"
                     "{model}:{generateContent|streamGenerateContent?alt=sse}",
-                    GeminiModel, /*binding_on_route=*/true);
+                    GeminiModel, /*binding_on_route=*/true, split);
   }
 
   // Claude on Vertex AI needs edits of its own, so the binding is spelled out in JSON.
-  void initializeForClaude() {
+  void initializeForClaude(bool split = false) {
     initializeRoute(
         envoy::type::ai::v3::GEMINI_GENERATE_CONTENT, envoy::type::ai::v3::ANTHROPIC_MESSAGES,
         R"({"uri_pattern": "/{version}/projects/{project}/locations/{location}/publishers/)"
         R"(anthropic/models/{model}:{rawPredict|streamRawPredict}", "mutations": [)"
         R"({"body_field": "model"}, {"body_field": "anthropic_version", )"
         R"("value": "vertex-2023-10-16", "keep_existing": true}]})",
-        ClaudeModel, /*binding_on_route=*/false);
+        ClaudeModel, /*binding_on_route=*/false, split);
   }
 
   IntegrationStreamDecoderPtr sendClientRequest(absl::string_view path,
@@ -189,27 +197,43 @@ public:
     EXPECT_EQ(nlohmann::json::parse(upstream_body_), body);
   }
 
+  // The token usage record the backend instance published, as the access log printed it.
+  envoy::data::ai::v3::TokenUsage tokenUsageRecord() {
+    envoy::data::ai::v3::TokenUsage usage;
+    EXPECT_TRUE(Protobuf::TextFormat::ParseFromString(waitForAccessLog(access_log_name_), &usage));
+    return usage;
+  }
+
 private:
   // The backend's API and its binding, a URI pattern when on the route, go on the route when
   // `binding_on_route`, and otherwise in filter state beside the resolved model.
   void initializeRoute(envoy::type::ai::v3::LLMProtocol client_api,
                        envoy::type::ai::v3::LLMProtocol backend_api,
                        absl::string_view response_binding, absl::string_view resolved_model,
-                       bool binding_on_route) {
-    config_helper_.addConfigModifier([client_api, backend_api, response_binding,
-                                      binding_on_route](ConfigHelper::HttpConnectionManager& hcm) {
+                       bool binding_on_route, bool split) {
+    config_helper_.addConfigModifier([client_api, backend_api, response_binding, binding_on_route,
+                                      split](ConfigHelper::HttpConnectionManager& hcm) {
       envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
           per_route;
       per_route.mutable_request()->set_llm_protocol(client_api);
+      envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
+          backend_per_route;
+      backend_per_route.mutable_request()->set_llm_protocol(
+          envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
       if (binding_on_route) {
-        per_route.mutable_response()->set_llm_protocol(backend_api);
-        per_route.mutable_response()->mutable_binding()->set_uri_pattern(
-            std::string(response_binding));
+        auto* response =
+            split ? backend_per_route.mutable_response() : per_route.mutable_response();
+        response->set_llm_protocol(backend_api);
+        response->mutable_binding()->set_uri_pattern(std::string(response_binding));
       }
       auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
       std::ignore =
           (*route->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
               .PackFrom(per_route);
+      if (split) {
+        std::ignore = (*route->mutable_typed_per_filter_config())[BackendInstance].PackFrom(
+            backend_per_route);
+      }
       auto* authorization = route->mutable_request_headers_to_add()->Add();
       authorization->mutable_header()->set_key("authorization");
       authorization->mutable_header()->set_value(std::string(AccessToken));
@@ -222,23 +246,36 @@ private:
       location->set_value("%FILTER_STATE(envoy.ai.binding.read:FIELD:location)%");
     });
 
-    config_helper_.prependFilter(R"EOF(
-name: envoy.filters.http.ai_protocol_manager
-typed_config:
-  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
-  request_handling: {}
-  filters:
+    constexpr absl::string_view ClientTranscoder = R"EOF(
   - name: envoy.http.ai_filters.transcoder
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
       request_handling: TO_IR
-      response_handling: FROM_IR
+      response_handling: FROM_IR)EOF";
+    constexpr absl::string_view BackendTranscoder = R"EOF(
   - name: envoy.http.ai_filters.transcoder
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
       request_handling: FROM_IR
-      response_handling: TO_IR
-)EOF");
+      response_handling: TO_IR)EOF";
+    constexpr absl::string_view Instance = R"EOF(
+name: $0
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling: {}$1
+  filters:$2)EOF";
+    // Filters are prepended, so the one nearest the router goes first.
+    if (split) {
+      config_helper_.prependFilter(absl::Substitute(Instance, BackendInstance, R"EOF(
+  response_handling:
+    token_usage: {})EOF",
+                                                    BackendTranscoder));
+      useAccessLog("%TYPED_CEL(metadata.typed_filter_metadata['envoy.ai.token_usage'])%");
+    } else {
+      config_helper_.prependFilter(
+          absl::Substitute(Instance, "envoy.filters.http.ai_protocol_manager", "",
+                           absl::StrCat(ClientTranscoder, BackendTranscoder)));
+    }
 
     std::string instructions = absl::Substitute(R"EOF(
   - object_key: envoy.ai.model.resolved
@@ -268,6 +305,10 @@ typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config
   on_request_headers:)EOF",
                                               instructions));
+    if (split) {
+      config_helper_.prependFilter(absl::Substitute(
+          Instance, "envoy.filters.http.ai_protocol_manager", "", ClientTranscoder));
+    }
 
     initialize();
   }
@@ -429,6 +470,72 @@ TEST_P(TranscoderIntegrationTest, VertexGeminiStreamGenerateContentReachesClaude
   EXPECT_EQ(text, "Hello from Claude.");
   EXPECT_EQ(last["candidates"][0]["finishReason"], "STOP");
   EXPECT_EQ(last["usageMetadata"]["candidatesTokenCount"], 6);
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
+}
+
+// The backend instance extracts usage in the backend's API the route declares to it, Gemini's.
+TEST_P(TranscoderIntegrationTest, SplitInstancesExtractGeminiUsageFromTheRoute) {
+  initializeForGemini(/*split=*/true);
+  IntegrationStreamDecoderPtr response =
+      sendClientRequest(absl::StrCat(VertexClaudePath, ":rawPredict"),
+                        {{"anthropic_version", "vertex-2023-10-16"},
+                         {"max_tokens", 1024},
+                         {"messages", {{{"role", "user"}, {"content", Question}}}}});
+  serveAsVertexGemini(/*stream=*/false);
+  expectUpstreamRequest(absl::StrCat(VertexGeminiPath, ":generateContent"),
+                        {{"contents", {{{"role", "user"}, {"parts", {{{"text", Question}}}}}}},
+                         {"generationConfig", {{"maxOutputTokens", 1024}}}});
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_EQ(response->headers().getStatusValue(), "200") << response->body();
+  const nlohmann::json message = nlohmann::json::parse(response->body());
+  EXPECT_EQ(message["model"], ClaudeModel);
+  EXPECT_EQ(message["content"],
+            nlohmann::json::parse(R"([{"type": "text", "text": "Hello from Gemini."}])"));
+  EXPECT_EQ(message["usage"]["input_tokens"], 9);
+  EXPECT_EQ(message["usage"]["output_tokens"], 5);
+
+  const envoy::data::ai::v3::TokenUsage usage = tokenUsageRecord();
+  EXPECT_EQ(usage.llm_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  EXPECT_EQ(usage.model(), GeminiModel);
+  EXPECT_EQ(usage.input_tokens().value(), 9);
+  EXPECT_EQ(usage.output_tokens().value(), 5);
+  EXPECT_EQ(usage.extraction_status(), envoy::data::ai::v3::TokenUsage::COMPLETE);
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
+}
+
+// The backend instance extracts usage in the backend's API the model router left in filter state,
+// Anthropic Messages streamed from Claude on Vertex AI, though its route declares none.
+TEST_P(TranscoderIntegrationTest, SplitInstancesExtractClaudeUsageFromFilterState) {
+  initializeForClaude(/*split=*/true);
+  IntegrationStreamDecoderPtr response = sendClientRequest(
+      absl::StrCat(VertexGeminiPath, ":streamGenerateContent?alt=sse"),
+      {{"contents", {{{"role", "user"}, {"parts", {{{"text", StreamQuestion}}}}}}},
+       {"generationConfig", {{"maxOutputTokens", 1024}}}});
+  serveAsVertexClaude(/*stream=*/true);
+  expectUpstreamRequest(absl::StrCat(VertexClaudePath, ":streamRawPredict"),
+                        {{"anthropic_version", "vertex-2023-10-16"},
+                         {"max_tokens", 1024},
+                         {"stream", true},
+                         {"messages", {{{"role", "user"}, {"content", StreamQuestion}}}}});
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_EQ(response->headers().getStatusValue(), "200") << response->body();
+  std::string text;
+  for (const auto& [name, data] : sseEvents(response->body())) {
+    EXPECT_EQ(data["modelVersion"], GeminiModel);
+    for (const nlohmann::json& part : data["candidates"][0]["content"]["parts"]) {
+      text += part["text"].get<std::string>();
+    }
+  }
+  EXPECT_EQ(text, "Hello from Claude.");
+
+  const envoy::data::ai::v3::TokenUsage usage = tokenUsageRecord();
+  EXPECT_EQ(usage.llm_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  EXPECT_EQ(usage.model(), "claude-sonnet-4-5-20250929");
+  EXPECT_EQ(usage.input_tokens().value(), 12);
+  EXPECT_EQ(usage.output_tokens().value(), 6);
+  EXPECT_EQ(usage.extraction_status(), envoy::data::ai::v3::TokenUsage::COMPLETE);
   EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
 }
 
