@@ -109,7 +109,8 @@ std::vector<std::pair<std::string, nlohmann::json>> sseEvents(absl::string_view 
 // route declares the client's API. The backend's API and binding are the route's for Gemini, and
 // come from a filter ahead of the AI Protocol Manager for Claude, as from a model router; that
 // filter names the model either way, and the client's path supplies the project and the region.
-// The upstream answers as Vertex AI does.
+// Schema validation runs first and reads the client's path under the same binding. The upstream
+// answers as Vertex AI does.
 class TranscoderIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                   public HttpIntegrationTest {
 public:
@@ -228,6 +229,9 @@ typed_config:
   "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
   request_handling: {}
   filters:
+  - name: envoy.http.ai_filters.schema_validation
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
   - name: envoy.http.ai_filters.transcoder
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
@@ -328,6 +332,7 @@ TEST_P(TranscoderIntegrationTest, VertexClaudeRawPredictReachesGeminiGenerateCon
   EXPECT_EQ(message["usage"]["output_tokens"], 5);
   test_server_->waitForCounter("ai_protocol_manager.transcoder.transcoded", testing::Eq(4));
   EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.schema_validation.valid")->value(), 1);
 }
 
 TEST_P(TranscoderIntegrationTest, VertexClaudeStreamRawPredictReachesGeminiStreamGenerateContent) {
@@ -366,6 +371,7 @@ TEST_P(TranscoderIntegrationTest, VertexClaudeStreamRawPredictReachesGeminiStrea
   EXPECT_EQ(events[5].second["usage"]["input_tokens"], 9);
   EXPECT_EQ(events[5].second["usage"]["output_tokens"], 5);
   EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.schema_validation.valid")->value(), 1);
 }
 
 TEST_P(TranscoderIntegrationTest, VertexGeminiGenerateContentReachesClaudeRawPredict) {
@@ -396,6 +402,7 @@ TEST_P(TranscoderIntegrationTest, VertexGeminiGenerateContentReachesClaudeRawPre
   EXPECT_EQ(reply["usageMetadata"]["candidatesTokenCount"], 6);
   test_server_->waitForCounter("ai_protocol_manager.transcoder.transcoded", testing::Eq(4));
   EXPECT_EQ(test_server_->counter("ai_protocol_manager.transcoder.failed")->value(), 0);
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.schema_validation.valid")->value(), 1);
 }
 
 TEST_P(TranscoderIntegrationTest, VertexGeminiStreamGenerateContentReachesClaudeStreamRawPredict) {

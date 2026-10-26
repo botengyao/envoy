@@ -253,6 +253,36 @@ TEST(LlmBindingReadTest, ReadsTheClientPathUnderTheFirstBindingThatMatches) {
   EXPECT_EQ(readClientPath(gateway, own, clients, "/gw/m", body)->model, "m");
 }
 
+TEST(LlmBindingReadTest, ReadsVertexAiPathsUnderTheBuiltInBindings) {
+  const BuiltInBindings& claude = builtInBindings(LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(claude.api, nullptr);
+  nlohmann::json body = {{"anthropic_version", "vertex-2023-10-16"}};
+  std::optional<LlmBindingRead> arrived = readClientPath(
+      nullptr, claude.api, claude.clients,
+      "/v1/projects/p/locations/l/publishers/anthropic/models/c@1:streamRawPredict", body);
+  ASSERT_TRUE(arrived.has_value());
+  EXPECT_EQ(body, nlohmann::json({{"model", "c@1"}, {"stream", true}}));
+  EXPECT_EQ(arrived->written_fields.at("anthropic_version"), "vertex-2023-10-16");
+
+  const BuiltInBindings& gemini = builtInBindings(LLMProtocol::GeminiGenerateContent);
+  body = nlohmann::json::object();
+  arrived = readClientPath(nullptr, gemini.api, gemini.clients,
+                           "/v1/projects/p/locations/l/publishers/google/models/"
+                           "g:streamGenerateContent?alt=sse",
+                           body);
+  ASSERT_TRUE(arrived.has_value());
+  EXPECT_EQ(arrived->path_variables.at("location"), "l");
+  arrived =
+      readClientPath(nullptr, gemini.api, gemini.clients, "/v1beta/models/g:generateContent", body);
+  ASSERT_TRUE(arrived.has_value());
+  EXPECT_EQ(arrived->binding, gemini.api);
+  EXPECT_EQ(body, nlohmann::json({{"model", "g"}, {"stream", false}}));
+
+  const BuiltInBindings& chat = builtInBindings(LLMProtocol::OpenAiChatCompletions);
+  EXPECT_EQ(chat.api, nullptr);
+  EXPECT_TRUE(chat.clients.empty());
+}
+
 // `{model}` is the body's; every other variable is the client's path's, even when the body has a
 // field of that name.
 TEST(LlmBindingWriteTest, RendersTheModelFromTheBodyAndTheRestFromThePath) {

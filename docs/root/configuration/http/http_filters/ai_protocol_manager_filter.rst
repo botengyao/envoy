@@ -236,6 +236,19 @@ suffix against each provider's REST path (``/chat/completions``,
 ``:streamGenerateContent``); then the ``anthropic-version`` header; then the
 payload's shape.
 
+The payload is validated as the client's :ref:`binding
+<config_http_filters_ai_protocol_manager_transcoder_instructions>` carries it,
+the way the transcoder reads it: the ``envoy.ai.binding.request`` filter state
+object, else the route's :ref:`request.binding
+<envoy_v3_api_field_extensions.filters.http.ai_protocol_manager.v3.RequestPerRoute.binding>`,
+else the API's own binding and those Envoy defines for it. A field the path
+carries counts as sent, and a body field the binding writes is left to it: a
+Claude on Vertex AI request to ``.../models/{model}:rawPredict`` or
+``:streamRawPredict`` is valid without ``model`` in the body, and with Vertex
+AI's ``anthropic_version`` in it. The payload is forwarded as the client sent
+it. A binding in filter state that does not parse is ignored here; the
+transcoder fails the request for it.
+
 Chat Completions and Anthropic Messages share the ``messages[]`` request
 shape, so only keys exclusive to one of them tell the two apart. A payload
 carrying markers of both, or of neither -- including
@@ -417,8 +430,10 @@ independent, and a key that is not set leaves today's behavior in place.
 
 ``envoy.ai.binding.request``
   How the client's request carries its API on HTTP. The ``TO_IR`` leg reads the client's path
-  and body under it; the path itself is not rewritten. Without it, the route's binding applies,
-  and without that, the client API's own binding and those Envoy knows for it are tried: Gemini's
+  and body under it, as :ref:`schema validation
+  <config_http_filters_ai_protocol_manager_schema_validation>` does; the path itself is not
+  rewritten. Without it, the route's binding applies, and without that, the client API's own
+  binding and those Envoy knows for it are tried: Gemini's
   ``/v1beta/models/{model}:generateContent`` and its Vertex AI form, and Claude on Vertex AI's
   ``rawPredict`` and ``streamRawPredict`` for Anthropic Messages. A gateway that serves an API
   under its own prefix names the prefix here.

@@ -123,7 +123,9 @@ envoy_cc_library(
     srcs = ["llm_binding.cc"],
     hdrs = ["llm_binding.h"],
     deps = [
+        ":token_usage_lib",
         ":uri_pattern_lib",
+        "//source/common/common:macros",
         "//source/common/protobuf",
         "//source/common/protobuf:utility_lib",
         "@abseil-cpp//absl/container:flat_hash_map",

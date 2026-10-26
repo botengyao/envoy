@@ -1147,12 +1147,6 @@ StreamGrammar anthropicStreamFromIr() {
   };
 }
 
-// A binding Envoy defines. Its pattern is a constant, so it parses.
-LlmBindingConstSharedPtr builtInBinding(absl::string_view pattern,
-                                        std::vector<LlmBinding::Mutation>&& mutations) {
-  return std::make_shared<const LlmBinding>(*UriPattern::parse(pattern), std::move(mutations));
-}
-
 // Builds the declarative transcoding pack for Anthropic Messages <-> IR (OpenAI Chat).
 DialectTranscodePack createAnthropicTranscodePack() {
   return DialectTranscodePack{
@@ -1160,20 +1154,8 @@ DialectTranscodePack createAnthropicTranscodePack() {
       .request = {.to_ir = anthropicRequestToIr(), .from_ir = anthropicRequestFromIr()},
       .response = {.to_ir = anthropicResponseToIr(), .from_ir = anthropicResponseFromIr()},
       .stream = {.to_ir = anthropicStreamToIr(), .from_ir = anthropicStreamFromIr()},
-      // Claude on Vertex AI: the model in the path alone, and the Vertex API version in the body.
-      .client_bindings = {builtInBinding(
-          "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/"
-          "{model}:{rawPredict|streamRawPredict}",
-          {{.body_field = "model"},
-           {.body_field = "anthropic_version",
-            .value = nlohmann::json("vertex-2023-10-16"),
-            .keep_existing = true}})},
+      .client_bindings = builtInBindings(LLMProtocol::AnthropicMessages).clients,
   };
-}
-
-// Gemini names the model and the streaming mode in the path alone.
-std::vector<LlmBinding::Mutation> geminiMutations() {
-  return {{.body_field = "model"}, {.body_field = "stream"}};
 }
 
 // Gemini GenerateContent request -> IR request.
@@ -1518,15 +1500,10 @@ DialectTranscodePack createGeminiTranscodePack() {
       .request = {.to_ir = geminiRequestToIr(), .from_ir = geminiRequestFromIr()},
       .response = {.to_ir = geminiResponseToIr(), .from_ir = geminiResponseFromIr()},
       .stream = {.to_ir = geminiStreamToIr(), .from_ir = geminiStreamFromIr()},
-      // The Gemini API's layout. A request leaves in it unless a binding names another, such as
-      // Vertex AI's, which nests the same methods under a project and a location.
-      .binding =
-          builtInBinding("/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}",
-                         geminiMutations()),
-      .client_bindings = {builtInBinding(
-          "/{version}/projects/{project}/locations/{location}/publishers/google/models/"
-          "{model}:{generateContent|streamGenerateContent?alt=sse}",
-          geminiMutations())},
+      // A request leaves in the Gemini API's layout unless a binding names another, such as
+      // Vertex AI's.
+      .binding = builtInBindings(LLMProtocol::GeminiGenerateContent).api,
+      .client_bindings = builtInBindings(LLMProtocol::GeminiGenerateContent).clients,
   };
 }
 

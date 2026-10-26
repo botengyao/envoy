@@ -8,6 +8,7 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
+#include "source/extensions/filters/http/ai_protocol_manager/schema.h"
 #include "source/extensions/http/ai_filters/common/sync_filter.h"
 
 #include "absl/status/status.h"
@@ -55,12 +56,22 @@ public:
                          const HttpFilters::AiProtocolManager::AiFilterContext& context);
 
   // Common::SyncAiFilter
+  HttpFilters::AiProtocolManager::BindingUse bindingUse() const override {
+    return {.request = true};
+  }
   absl::Status decodeSync(HttpFilters::AiProtocolManager::AiRequest& request,
                           HttpFilters::AiProtocolManager::LocalReplier reply_locally) override;
 
 private:
   HttpFilters::AiProtocolManager::LLMProtocol
   resolveLlmProtocol(const HttpFilters::AiProtocolManager::AiRequest& request) const;
+  // Validates the payload as the client's binding carries it, the way the transcoder reads it: a
+  // field the path holds counts as sent, and a body field the binding writes is left to it. The
+  // payload is restored afterwards.
+  absl::Status validate(const HttpFilters::AiProtocolManager::PayloadSchema& schema,
+                        HttpFilters::AiProtocolManager::AiRequest& request) const;
+  // The envoy.ai.binding.request object, else the route's binding; null when neither is set.
+  HttpFilters::AiProtocolManager::LlmBindingConstSharedPtr requestBinding() const;
 
   SchemaValidationFilterConfigSharedPtr config_;
   const HttpFilters::AiProtocolManager::AiFilterContext context_;

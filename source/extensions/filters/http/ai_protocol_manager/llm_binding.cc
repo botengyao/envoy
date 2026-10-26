@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "source/common/common/macros.h"
 #include "source/common/protobuf/protobuf.h"
 #include "source/common/protobuf/utility.h"
 
@@ -113,7 +114,47 @@ std::optional<LlmBindingRead> readRequest(const LlmBindingConstSharedPtr& bindin
   return read;
 }
 
+// A binding Envoy defines. Its pattern is a constant, so it parses.
+LlmBindingConstSharedPtr builtInBinding(absl::string_view pattern,
+                                        std::vector<LlmBinding::Mutation>&& mutations) {
+  return std::make_shared<const LlmBinding>(*UriPattern::parse(pattern), std::move(mutations));
+}
+
+// Gemini names the model and the streaming mode in the path alone.
+std::vector<LlmBinding::Mutation> geminiMutations() {
+  return {{.body_field = "model"}, {.body_field = "stream"}};
+}
+
 } // namespace
+
+const BuiltInBindings& builtInBindings(LLMProtocol api) {
+  switch (api) {
+  case LLMProtocol::AnthropicMessages:
+    // Claude on Vertex AI: the model in the path alone, and the Vertex API version in the body.
+    CONSTRUCT_ON_FIRST_USE(
+        BuiltInBindings,
+        .clients = {builtInBinding(
+            "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/"
+            "{model}:{rawPredict|streamRawPredict}",
+            {{.body_field = "model"},
+             {.body_field = "anthropic_version",
+              .value = nlohmann::json("vertex-2023-10-16"),
+              .keep_existing = true}})});
+  case LLMProtocol::GeminiGenerateContent:
+    // Vertex AI nests the Gemini API's methods under a project and a location.
+    CONSTRUCT_ON_FIRST_USE(
+        BuiltInBindings,
+        .api =
+            builtInBinding("/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}",
+                           geminiMutations()),
+        .clients = {builtInBinding(
+            "/{version}/projects/{project}/locations/{location}/publishers/google/models/"
+            "{model}:{generateContent|streamGenerateContent?alt=sse}",
+            geminiMutations())});
+  default:
+    CONSTRUCT_ON_FIRST_USE(BuiltInBindings);
+  }
+}
 
 LlmBinding::LlmBinding(std::optional<UriPattern>&& pattern, std::vector<Mutation>&& mutations)
     : pattern_(std::move(pattern)), mutations_(std::move(mutations)) {

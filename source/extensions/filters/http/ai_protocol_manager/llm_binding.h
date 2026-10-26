@@ -7,6 +7,7 @@
 
 #include "envoy/type/ai/v3/llm_binding.pb.h"
 
+#include "source/extensions/filters/http/ai_protocol_manager/token_usage.h"
 #include "source/extensions/filters/http/ai_protocol_manager/uri_pattern.h"
 
 #include "absl/container/flat_hash_map.h"
@@ -57,6 +58,17 @@ private:
   bool removes_model_{false};
   bool removes_stream_{false};
 };
+
+// The bindings Envoy defines for an API.
+struct BuiltInBindings {
+  // The API's own, where its path carries request values (Gemini's); null otherwise.
+  LlmBindingConstSharedPtr api;
+  // Others a client of the API may arrive in, e.g. Claude on Vertex AI.
+  std::vector<LlmBindingConstSharedPtr> clients;
+};
+
+// The bindings Envoy defines for `api`; empty for an API it defines none for.
+const BuiltInBindings& builtInBindings(LLMProtocol api);
 
 // What a request's path and body held under the binding it arrived in.
 struct LlmBindingRead {

@@ -1,9 +1,11 @@
 #include <string>
 
 #include "envoy/extensions/filters/http/ai_protocol_manager/v3/ai_protocol_manager.pb.h"
+#include "envoy/type/ai/v3/llm_protocol.pb.h"
 
 #include "test/integration/http_integration.h"
 
+#include "absl/strings/str_cat.h"
 #include "nlohmann/json.hpp"
 
 namespace Envoy {
@@ -11,18 +13,24 @@ namespace {
 
 constexpr absl::string_view AnthropicPayload =
     R"({"model":"claude","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})";
+// Claude on Vertex AI names the model in the path alone, and the Vertex AI API version in the body.
+constexpr absl::string_view VertexClaudePayload =
+    R"({"anthropic_version":"vertex-2023-10-16","max_tokens":8,)"
+    R"("messages":[{"role":"user","content":"hi"}]})";
+constexpr absl::string_view VertexClaudePath =
+    "/v1/projects/acme/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5@20250929";
 
 class SchemaValidationIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                         public HttpIntegrationTest {
 public:
   SchemaValidationIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
-  // The route declares an AI endpoint without naming its API.
+  // The route declares an AI endpoint as `route_request_` does, by default without naming its API.
   void initializeFilters(bool with_filter_state, bool fail_open = false) {
-    config_helper_.addConfigModifier([](ConfigHelper::HttpConnectionManager& hcm) {
+    config_helper_.addConfigModifier([this](ConfigHelper::HttpConnectionManager& hcm) {
       envoy::extensions::filters::http::ai_protocol_manager::v3::AiProtocolManagerPerRoute
           per_route;
-      per_route.mutable_request();
+      *per_route.mutable_request() = route_request_;
       auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
       std::ignore =
           (*route->mutable_typed_per_filter_config())["envoy.filters.http.ai_protocol_manager"]
@@ -81,11 +89,14 @@ typed_config:
     EXPECT_EQ("200", response->headers().getStatusValue());
   }
 
-  void expectRejected(IntegrationStreamDecoderPtr response) {
+  void expectRejected(IntegrationStreamDecoderPtr response, absl::string_view details = "") {
     ASSERT_TRUE(response->waitForEndStream());
     EXPECT_EQ("400", response->headers().getStatusValue());
+    EXPECT_THAT(response->body(), testing::HasSubstr(details));
     test_server_->waitForCounter("ai_protocol_manager.schema_validation.invalid", testing::Eq(1));
   }
+
+  envoy::extensions::filters::http::ai_protocol_manager::v3::RequestPerRoute route_request_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, SchemaValidationIntegrationTest,
@@ -122,6 +133,58 @@ TEST_P(SchemaValidationIntegrationTest, FilterStateNamesTheApi) {
   EXPECT_EQ(
       test_server_->counter("ai_protocol_manager.schema_validation.llm_protocol_detected")->value(),
       0);
+}
+
+// The route names the API and no binding, so the client's path is read under the bindings Envoy
+// defines for it. The body goes upstream as the client sent it.
+TEST_P(SchemaValidationIntegrationTest, VertexClaudeRawPredictIsForwardedUnchanged) {
+  route_request_.set_llm_protocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  initializeFilters(/*with_filter_state=*/false);
+  expectForwarded(sendRequest(absl::StrCat(VertexClaudePath, ":rawPredict"), VertexClaudePayload),
+                  VertexClaudePayload);
+  test_server_->waitForCounter("ai_protocol_manager.schema_validation.valid", testing::Eq(1));
+}
+
+TEST_P(SchemaValidationIntegrationTest, VertexClaudeStreamRawPredictIsForwardedUnchanged) {
+  route_request_.set_llm_protocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  initializeFilters(/*with_filter_state=*/false);
+  const std::string payload =
+      R"({"anthropic_version":"vertex-2023-10-16","max_tokens":8,"stream":true,)"
+      R"("messages":[{"role":"user","content":"hi"}]})";
+  expectForwarded(sendRequest(absl::StrCat(VertexClaudePath, ":streamRawPredict"), payload),
+                  payload);
+  test_server_->waitForCounter("ai_protocol_manager.schema_validation.valid", testing::Eq(1));
+}
+
+TEST_P(SchemaValidationIntegrationTest, MalformedVertexClaudeBodyIsRejected) {
+  route_request_.set_llm_protocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  initializeFilters(/*with_filter_state=*/false);
+  expectRejected(sendRequest(absl::StrCat(VertexClaudePath, ":rawPredict"),
+                             R"({"anthropic_version":"vertex-2023-10-16",)"
+                             R"("messages":[{"role":"user","content":"hi"}]})"),
+                 "missing required field: max_tokens");
+}
+
+// Off a binding, the body still has to name the model.
+TEST_P(SchemaValidationIntegrationTest, AnthropicBodyWithoutModelIsRejected) {
+  route_request_.set_llm_protocol(envoy::type::ai::v3::ANTHROPIC_MESSAGES);
+  initializeFilters(/*with_filter_state=*/false);
+  expectRejected(sendRequest("/v1/messages", VertexClaudePayload), "missing required field: model");
+}
+
+// The route's binding serves Gemini under a gateway prefix. Schema validation applies it, so the
+// route counts no unused binding.
+TEST_P(SchemaValidationIntegrationTest, PrefixedGeminiRouteBindingIsForwardedUnchanged) {
+  route_request_.set_llm_protocol(envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
+  route_request_.mutable_binding()->set_uri_pattern(
+      "/gemini/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}");
+  initializeFilters(/*with_filter_state=*/false);
+  const std::string payload = R"({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})";
+  expectForwarded(
+      sendRequest("/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", payload),
+      payload);
+  test_server_->waitForCounter("ai_protocol_manager.schema_validation.valid", testing::Eq(1));
+  EXPECT_EQ(test_server_->counter("ai_protocol_manager.route_binding_unused")->value(), 0);
 }
 
 } // namespace
