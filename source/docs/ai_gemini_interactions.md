@@ -27,6 +27,10 @@ The design gets there in three phases (see [Phased plan](#phased-plan)):
 
 Schema validation checks what the client sent, before anything converts it.
 
+Interactions keeps state per provider account, so a call that continues a chain must stay on the
+account that holds it. Failover across accounts comes after the three phases (see [Stateful calls
+and failover](#stateful-calls-and-failover)).
+
 ## Principles
 
 1. **AI filters work on the IR.** The exceptions are the transcoders, which convert, and schema
@@ -322,6 +326,242 @@ Protocol Manager, which needs the API before it holds the body. Schema validatio
 detection, by the `anthropic-version` header and then the payload, for a route that declares
 `request` without naming an API.
 
+## Stateful calls and failover
+
+Interactions keeps state at Google: stored interactions, the chains `previous_interaction_id`
+continues, background runs, and streams a client can resume. That state belongs to a provider
+account, not to a model or a host:
+
+| Backend | Account | Kept for |
+|---|---|---|
+| Gemini API | the Cloud project behind the API key, on one global host | 55 days on the paid tier, which can be set to 7, 14 or 28; 1 day on the free tier |
+| Vertex AI | the project and the location in the path: `global`, or the `us` or `eu` multi-region | 7 days |
+
+An interaction id names no account, and only the account that made it can find it. So any
+cluster of that account can serve a stateful call, and no cluster of another account can. A
+stateful call is one of these:
+
+- a create that sets `previous_interaction_id`;
+- a get, a stream resume (a get with `stream=true` and `last_event_id`), a cancel or a delete;
+- anything about a background run or an agent's environment.
+
+A create without `previous_interaction_id` starts a new conversation, and can go to any account.
+With `store` true, its default, the account that serves it holds the new chain from then on.
+
+This design treats one Vertex AI project in two locations as two accounts, until a chain is shown
+to cross them (see [Open questions](#open-questions)).
+
+### Three kinds of failover
+
+| Failover to | A new conversation | A stateful call |
+|---|---|---|
+| another host of the cluster | yes | yes |
+| another cluster of the same account | yes | yes |
+| a cluster of another account | yes | no: it fails closed, or is rehydrated where configured |
+
+When all of a route's clusters belong to one account, none of this needs anything new. When they
+span accounts, the AI Protocol Managers must know each call's account. Changing the model on a
+retry is a separate matter: Google lets one chain mix models, within their modality limits, so a
+chain can change models within its account.
+
+### Account groups
+
+Envoy fails over between clusters with the route's `refresh_cluster_on_retry` and the priority
+group cluster specifier. The first attempt uses the first group, each retry the next, and the last
+group serves every attempt after the list runs out. A group picks a cluster by weight, from one
+random value per request, so a retry within a group goes back to the same cluster. Two clusters of
+one account that back each other up therefore go in two groups.
+
+Each group holds the clusters of one account. The first AI Protocol Manager's config lists the
+accounts and their groups in order. For a stateful call, it writes that account's groups as the
+specifier's per-request override, a `PriorityGroupsOverride` in dynamic metadata, and clears the
+route cache. The override's last group repeats, so no retry leaves the account. A new conversation
+gets no override, and follows the route's groups across accounts.
+
+Here two Vertex AI projects back each other up; the first is reached two ways, such as two egress
+paths. `stateful_calls` does not exist yet.
+
+```yaml
+# The route.
+- match: {prefix: /}
+  route:
+    timeout: 300s
+    inline_cluster_specifier_plugin:
+      extension:
+        name: envoy.router.cluster_specifier_plugin.priority_group
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.router.cluster_specifiers.priority_group.v3.PriorityGroupClusterSpecifier
+          override_metadata_namespace: envoy.filters.http.ai_protocol_manager
+          priority_groups:
+          - name: a-1
+            clusters: [{cluster_name: vertex_a_1, weight: 1}]
+          - name: a-2
+            clusters: [{cluster_name: vertex_a_2, weight: 1}]
+          - name: b
+            clusters: [{cluster_name: vertex_b, weight: 1}]
+    retry_policy:
+      retry_on: connect-failure,refused-stream,reset-before-request,retriable-status-codes
+      retriable_status_codes: [429, 503]
+      num_retries: 2
+      refresh_cluster_on_retry: true
+
+# The first AI Protocol Manager, in the listener.
+- name: envoy.filters.http.ai_protocol_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+    request_handling: {reserialize_body: DISABLE}
+    stateful_calls:
+      id_envelope: {hmac_keys: {name: interaction-id-keys}}
+      accounts:
+      - label: project-a
+        priority_groups: [a-1, a-2]
+      - label: project-b
+        priority_groups: [b]
+
+# The second, in the cluster vertex_b.
+- name: envoy.filters.http.ai_protocol_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+    request_handling: {}
+    response_handling: {token_usage: {}}
+    stateful_calls:
+      account: project-b
+      id_envelope: {hmac_keys: {name: interaction-id-keys}}
+      path_prefix: /v1beta1/projects/project-b/locations/global
+```
+
+A new conversation tries `vertex_a_1`, then `vertex_a_2`, then `vertex_b`. A call chained in
+`project-a` tries `vertex_a_1`, then `vertex_a_2` twice.
+
+### Who knows the account
+
+| | The first AI Protocol Manager, before the router | The second, in each cluster |
+|---|---|---|
+| Knows the account | from the envelope on the call's id: `previous_interaction_id` in the body, or the id in the path | from its config: the account its cluster serves |
+| The request | verifies the envelope; writes the account and the provider's id to filter state, and the account's groups as the override; forwards the body as received | checks that the call's account is its own; writes the provider's id, and the path for its account |
+| The response | not touched | wraps every interaction id with its own account |
+
+- **The winning attempt names the account.** Only the response of the attempt that succeeded
+  reaches the client, and that attempt's second AI Protocol Manager wrapped its ids. So an id
+  always names the account that holds it, whichever cluster served it. The first AI Protocol
+  Manager runs once, before any attempt has succeeded, so it cannot know. Nor can the route's
+  config, once its groups span accounts.
+- **Every attempt starts from the client's request.** The router sends each attempt its own copy
+  of the client's body, envelope included. Headers are shared: on main, an upstream filter's
+  header edits stay for the next attempt. So the second AI Protocol Manager renders the whole path
+  from filter state and its `path_prefix`, rather than editing the path it receives. Credential
+  injectors overwrite their header. A header one cluster adds and the next does not still reaches
+  the next; a router change that restores the request headers before each retry would end that,
+  and is separate.
+- **A call in the wrong account fails there.** When a call bound to one account reaches a cluster
+  of another, and rehydration does not cover it, the second AI Protocol Manager refuses the attempt
+  locally, and counts `stateful.account_mismatch`. This means the config is wrong: the override
+  should have kept the call in its account.
+- **The ids.** The second wraps the `id` and `previous_interaction_id` of every interaction it
+  returns: in the response to a create or a get, and in the stream's `interaction.created` and
+  `interaction.completed` events. The first reads `previous_interaction_id`, and the id in the
+  path of a get, a stream resume, a cancel or a delete. Those four become calls the AI Protocol
+  Managers take for their ids: no request body is held, and no usage is recorded.
+
+### Id envelopes
+
+An envelope carries the account with the id, so a later call finds its account whichever route
+it takes. It is a version prefix, then the URL-safe base64 of the account's label, the provider's
+id, and an HMAC-SHA256 over both.
+
+- **The label** is the operator's name for the account, not its project id.
+- **The HMAC** keeps a client from moving a chain to another account by editing the label. The
+  keys come from SDS: the first signs, and all of them verify. A retired key stays as long as an
+  id it signed can still be used: up to 55 days on the Gemini API's paid tier.
+- **An id without a valid envelope** is refused with 400, and counted `stateful.envelope_invalid`.
+  While clients move over, `accept_plain_ids` sends it on with no override, to the route's groups.
+- **Without envelopes**, a route keeps each call in its account only when all its groups belong to
+  that account. Ids then pass untouched. That is where to start: envelopes are for a route whose
+  groups span accounts.
+
+### Fail closed
+
+By default, a stateful call never leaves its account. When every group of the account has failed,
+the client gets the last attempt's error. It can then send the turn again in stateless form, with
+the whole conversation in `input`.
+
+Some calls never leave their account, even with rehydration: a get, a stream resume, a cancel, a
+delete, a background run, and anything about an agent's environment. What they name exists only
+where it was made.
+
+### Rehydration, opt in
+
+Rehydration turns a chained create into a stateless one, for an account that does not hold the
+chain. Envoy asks an external service for the conversation. It neither reads chains from Google
+nor keeps them.
+
+1. The first AI Protocol Manager's config lets an account rehydrate into others, with
+   `rehydrate_into` on the account. For a call chained in `project-a`, the override lists
+   `project-a`'s groups, then `project-b`'s.
+2. An attempt reaches a cluster of `project-b`. Its second AI Protocol Manager sees that the chain
+   is in `project-a`, and sends the rehydration service the account, the provider's id and the
+   request, over gRPC.
+3. The service answers with the conversation as a list of steps, or refuses. It can read the chain
+   from `project-a` with gets, following each interaction's `previous_interaction_id` back, since
+   a stored interaction keeps its `user_input` steps. Or it can read a copy it keeps itself.
+4. The second AI Protocol Manager puts those steps ahead of the request's `input`, and removes
+   `previous_interaction_id`. `tools`, `system_instruction` and `generation_config` belong to each
+   interaction, not to the chain, so the request already carries them.
+5. `project-b` answers with a new id, which the second wraps with `project-b`. The conversation
+   goes on there, and its earlier ids still name `project-a`.
+
+The service refuses when:
+
+- it cannot read the chain: a 429 leaves `project-a` readable, but an outage may not;
+- the chain uses what the other account cannot reach, such as Files API files, or an agent's
+  environment;
+- the chain's last interaction is still running.
+
+What it costs:
+
+- **Tokens.** The new account bills the whole conversation as input, with no cache for that turn.
+- **Signatures.** Thought and tool steps carry signatures. Whether one account accepts the
+  signatures another made is not known yet (see [Open questions](#open-questions)).
+- **Data location.** The conversation is copied between accounts, so `rehydrate_into` lists only
+  accounts that may hold each other's data.
+- **Latency.** The attempt waits for the service, and the wait counts against the route's timeout.
+
+The second AI Protocol Manager counts `stateful.rehydrated` and `stateful.rehydration_refused`.
+
+### Retry policy
+
+The router never retries once the response has started. So a stream cut halfway does not fail
+over: the client resumes it on the same account, with a get, `stream=true` and the last
+`event_id` it saw. Before the response starts, what a retry may do depends on the call:
+
+| Call | Repeatable | `retry_on` |
+|---|---|---|
+| A create | No. A retry after Google started work can leave a second stored interaction the client never sees, or start a second background run, and both are billed. | `connect-failure`, `refused-stream`, `reset-before-request`, and `retriable-status-codes` with 429 and 503 |
+| A get, a stream resume, a cancel or a delete | Yes, by id. | Also `reset` and `5xx`. |
+
+- `reset-before-request` retries a reset only when no byte of the request was sent. `reset`
+  retries any reset.
+- A 429 or a 503 says Google turned the call away, for quota or load. A 500 or a 504 may come
+  after it started work.
+- No `per_try_timeout` and no hedging on a create: each sends another create while the first may
+  still be running.
+- A route that serves every call, such as a DFP's single route, gives them one policy, so it takes
+  the create's.
+- A retry to another cluster keeps the first cluster's circuit breakers and retry policy (a TODO
+  in `Filter::doRetry`), so accounts share one retry budget.
+- A body larger than the route's `request_body_buffer_limit` is not retried at all.
+
+### Plan
+
+| PR | Change |
+|---|---|
+| 9. `ai_protocol_manager: keep Interactions calls on their account` | `stateful_calls` in both AI Protocol Managers. The second wraps ids with its account, unwraps the call's id, renders its path, and refuses a call of another account. The first verifies the envelope, records the account and the id in filter state, and writes the account's groups as the priority group override. Get, stream resume, cancel and delete are taken for their ids. |
+| 10. `ai_protocol_manager: rehydrate a chain into another account` | `rehydrate_into`, and the gRPC callout from the second AI Protocol Manager. |
+
+PR 9's integration test: a create fails over from one account to another on a 429, and its id
+names the second; the next chained create goes straight to the second; and a get for an id whose
+account's clusters are all down fails closed.
+
 ## Examples
 
 ### 1. Same API, new model
@@ -368,7 +608,9 @@ request goes out as it came in, with the gateway's model. The client sees the mo
 The AI Protocol Manager does not take these as AI calls: a get or a delete has no body, and a
 cancel's path ends in `/cancel`, which no declared route or recognized path covers. They are
 forwarded without AI processing. A get returns a stored interaction, which can carry the usage of
-the request that created it, so that usage is not counted twice.
+the request that created it, so that usage is not counted twice. With id envelopes (PR 9), the AI
+Protocol Managers take these calls for their ids only (see [Who knows the
+account](#who-knows-the-account)).
 
 ## Configuration
 
@@ -670,7 +912,9 @@ into the IR and back unchanged, and every golden IR document passes the IR schem
 - writing the model without re-serializing the whole body;
 - an AI filter for picking the model, in place of ext_proc;
 - the Anthropic and Gemini conversions carrying thoughts and unmapped members the same way;
-- tools and media.
+- tools and media;
+- stateful calls across accounts: id envelopes, then rehydration (PRs 9 and 10; see [Stateful
+  calls and failover](#stateful-calls-and-failover)).
 
 ## Limits of the first release
 
@@ -683,6 +927,8 @@ into the IR and back unchanged, and every golden IR document passes the IR schem
 - **Recognition** is phase 2. Until then a route declares the API.
 - **Get, delete and cancel.** These calls are not AI calls, and are forwarded without AI processing
   or usage records.
+- **Failover across accounts.** Nothing keeps a chained call on the account that holds it, so all
+  of a route's clusters must belong to one account until PR 9.
 
 ## Decisions
 
@@ -707,6 +953,14 @@ into the IR and back unchanged, and every golden IR document passes the IR schem
    conversion loses nothing be recognized by default instead?
 6. **`accept-encoding`.** Should the AI Protocol Manager remove it only from the calls it takes,
    instead of the route removing it from all traffic?
+7. **Vertex AI locations.** Can a chain made in one location of a project be continued, or read,
+   from another? Until it is shown, each location is its own account.
+8. **Signatures across accounts.** Does one account accept the thought and tool signatures another
+   made? Rehydration depends on it, and it needs a test against both backends.
+9. **A typed error when failing closed.** Should a stateful call whose account is down get an error
+   that tells the client to resend the turn in stateless form, rather than the last attempt's?
+10. **The label in the envelope.** It is readable, which helps an operator reading logs but shows
+    clients how accounts are split. Should the envelope encrypt it?
 
 ## References
 
@@ -714,3 +968,7 @@ into the IR and back unchanged, and every golden IR document passes the IR schem
   https://ai.google.dev/api/interactions-api-v1
 - Streaming: https://ai.google.dev/gemini-api/docs/streaming
 - Errors, including `missing_thought_signature`: https://ai.google.dev/gemini-api/docs/api-errors
+- State and retention: https://ai.google.dev/gemini-api/docs/interactions-overview
+- Background runs: https://ai.google.dev/gemini-api/docs/background-execution
+- The priority group cluster specifier:
+  `api/envoy/extensions/router/cluster_specifiers/priority_group/v3/priority_group.proto`
