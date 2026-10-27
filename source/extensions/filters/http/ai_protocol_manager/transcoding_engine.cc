@@ -1500,8 +1500,6 @@ DialectTranscodePack createGeminiTranscodePack() {
       .request = {.to_ir = geminiRequestToIr(), .from_ir = geminiRequestFromIr()},
       .response = {.to_ir = geminiResponseToIr(), .from_ir = geminiResponseFromIr()},
       .stream = {.to_ir = geminiStreamToIr(), .from_ir = geminiStreamFromIr()},
-      // A request leaves in the Gemini API's layout unless a binding names another, such as
-      // Vertex AI's.
       .binding = builtInBindings(LLMProtocol::GeminiGenerateContent).api,
       .client_bindings = builtInBindings(LLMProtocol::GeminiGenerateContent).clients,
   };

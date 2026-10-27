@@ -79,7 +79,6 @@ envoy_extension_cc_test(
         "//source/extensions/filters/http/set_filter_state:config",
         "//source/extensions/http/ai_filters/schema_validation:config",
         "//test/integration:http_integration_lib",
-        "@abseil-cpp//absl/strings",
         "@envoy_api//envoy/extensions/filters/http/ai_protocol_manager/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
         "@nlohmann_json//:json",

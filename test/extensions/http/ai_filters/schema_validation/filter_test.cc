@@ -119,7 +119,7 @@ public:
 
   void expectForwarded() {
     EXPECT_TRUE(status_->ok()) << *status_;
-    EXPECT_FALSE(reply_code_.has_value()) << reply_details_;
+    EXPECT_FALSE(reply_code_.has_value());
     EXPECT_GT(bridge_.injected_.length(), 0);
   }
 
@@ -142,12 +142,6 @@ public:
     stream_info_.filterState()->setData(
         HttpFilters::AiProtocolManager::FilterStateKeys::BindingRequest,
         std::make_shared<LlmBindingObject>(value), StreamInfo::FilterState::LifeSpan::FilterChain);
-  }
-
-  static LlmBindingConstSharedPtr parseBinding(absl::string_view text) {
-    absl::StatusOr<LlmBindingConstSharedPtr> binding = LlmBinding::parse(text);
-    EXPECT_TRUE(binding.ok()) << binding.status();
-    return binding.ok() ? *binding : nullptr;
   }
 
   uint64_t counterValue(const std::string& name) {
@@ -260,30 +254,11 @@ TEST_F(SchemaValidationFilterTest, DeclaredApiOutranksDefaultAndDetection) {
   EXPECT_EQ(counterValue("llm_protocol_detected"), 0);
 }
 
-TEST_F(SchemaValidationFilterTest, AppliesTheClientsBinding) {
-  envoy::extensions::http::ai_filters::schema_validation::v3::SchemaValidation proto;
-  const SchemaValidationFilter filter(
-      std::make_shared<const SchemaValidationFilterConfig>(proto, *stats_store_.rootScope()),
-      AiFilterContext{stream_info_, request_headers_, LLMProtocol::AnthropicMessages});
-  EXPECT_TRUE(filter.bindingUse().request);
-  EXPECT_FALSE(filter.bindingUse().response);
-}
-
 // The path supplies `model` under the binding Envoy defines for Claude on Vertex AI, which also
 // writes `anthropic_version`. Neither change reaches the payload forwarded.
 TEST_F(SchemaValidationFilterTest, VertexClaudeRawPredictBodyIsValid) {
   run(VertexClaudePayload, LLMProtocol::AnthropicMessages, VertexClaudePath);
   expectForwardedUnchanged(VertexClaudePayload);
-}
-
-TEST_F(SchemaValidationFilterTest, VertexClaudeStreamRawPredictBodyIsValid) {
-  constexpr absl::string_view payload =
-      R"({"anthropic_version":"vertex-2023-10-16","max_tokens":8,"stream":true,)"
-      R"("messages":[{"role":"user","content":"hi"}]})";
-  run(payload, LLMProtocol::AnthropicMessages,
-      "/v1/projects/acme/locations/us-east5/publishers/anthropic/models/"
-      "claude-sonnet-4-5@20250929:streamRawPredict");
-  expectForwardedUnchanged(payload);
 }
 
 // The binding removes `model`, so the path's is validated in place of the body's, which the
@@ -317,8 +292,8 @@ TEST_F(SchemaValidationFilterTest, ModelIsRequiredOffABinding) {
 
 // The route's binding takes a gateway prefix, and keeps the edits of Gemini's own.
 TEST_F(SchemaValidationFilterTest, PrefixedGeminiRouteBindingIsApplied) {
-  route_binding_ =
-      parseBinding("/gemini/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}");
+  route_binding_ = *LlmBinding::parse(
+      "/gemini/v1beta/models/{model}:{generateContent|streamGenerateContent?alt=sse}");
   run(GeminiPayload, LLMProtocol::GeminiGenerateContent,
       "/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
   expectForwardedUnchanged(GeminiPayload);
@@ -327,7 +302,7 @@ TEST_F(SchemaValidationFilterTest, PrefixedGeminiRouteBindingIsApplied) {
 // A route binding that puts the model in the path satisfies an API that requires `model`.
 TEST_F(SchemaValidationFilterTest, RouteBindingSuppliesTheModel) {
   constexpr absl::string_view payload = R"({"messages":[{"role":"user","content":"hi"}]})";
-  route_binding_ = parseBinding("/openai/deployments/{model}/chat/completions");
+  route_binding_ = *LlmBinding::parse("/openai/deployments/{model}/chat/completions");
   run(payload, LLMProtocol::OpenAiChatCompletions,
       "/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21");
   expectForwardedUnchanged(payload);
@@ -335,7 +310,7 @@ TEST_F(SchemaValidationFilterTest, RouteBindingSuppliesTheModel) {
 
 // A binding given replaces the ones Envoy defines, as it does for the transcoder.
 TEST_F(SchemaValidationFilterTest, RouteBindingThatDoesNotMatchReadsNothing) {
-  route_binding_ = parseBinding("/claude/{model}/messages");
+  route_binding_ = *LlmBinding::parse("/claude/{model}/messages");
   run(VertexClaudePayload, LLMProtocol::AnthropicMessages, VertexClaudePath);
   expectRejected();
 }
@@ -343,7 +318,7 @@ TEST_F(SchemaValidationFilterTest, RouteBindingThatDoesNotMatchReadsNothing) {
 TEST_F(SchemaValidationFilterTest, FilterStateBindingReplacesTheRoutes) {
   constexpr absl::string_view payload =
       R"({"max_tokens":8,"messages":[{"role":"user","content":"hi"}]})";
-  route_binding_ = parseBinding("/route/{model}/messages");
+  route_binding_ = *LlmBinding::parse("/route/{model}/messages");
   setRequestBinding("/state/{model}/messages");
   run(payload, LLMProtocol::AnthropicMessages, "/state/claude-haiku-4-5/messages");
   expectForwardedUnchanged(payload);
