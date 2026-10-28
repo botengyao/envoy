@@ -26,10 +26,11 @@ using ::testing::HasSubstr;
 
 constexpr absl::string_view VertexClaude = R"({
   "uri_pattern": "/{version}/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}",
-  "mutations": [
-    {"body_field": "model"},
-    {"body_field": "anthropic_version", "value": "vertex-2023-10-16", "keep_existing": true},
-    {"header": "anthropic-version"}
+  "headers_mutations": [{"remove": "anthropic-version"}],
+  "body_mutations": [
+    {"remove": "model"},
+    {"append": {"record": {"key": "anthropic_version", "value": "vertex-2023-10-16"},
+                "action": "ADD_IF_ABSENT"}}
   ]
 })";
 constexpr absl::string_view VertexGemini =
@@ -37,7 +38,7 @@ constexpr absl::string_view VertexGemini =
     "{model}:{generateContent|streamGenerateContent?alt=sse}";
 constexpr absl::string_view GeminiApi =
     R"({"uri_pattern": "/v1beta/models/{model}:{generateContent|streamGenerateContent}",)"
-    R"( "mutations": [{"body_field": "model"}, {"body_field": "stream"}]})";
+    R"( "body_mutations": [{"remove": "model"}, {"remove": "stream"}]})";
 
 LlmBindingConstSharedPtr parseOk(absl::string_view text) {
   absl::StatusOr<LlmBindingConstSharedPtr> binding = LlmBinding::parse(text);
@@ -90,12 +91,16 @@ absl::StatusOr<std::optional<std::string>> writeUnresolved(const LlmBinding& bin
 }
 
 TEST(LlmBindingParseTest, ConvertsEveryValueKind) {
-  const LlmBindingConstSharedPtr binding = parseOk(R"({"mutations": [
-    {"body_field": "max_tokens", "value": 4096},
-    {"body_field": "temperature", "value": 0.5},
-    {"body_field": "stream", "value": false},
-    {"body_field": "metadata", "value": {"user_id": "u", "tags": ["a", 1]}},
-    {"body_field": "drop"}
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "max_tokens", "value": 4096},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "temperature", "value": 0.5},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "stream", "value": false},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "metadata", "value": {"user_id": "u", "tags": ["a", 1]}},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"remove": "drop"}
   ]})");
   ASSERT_NE(binding, nullptr);
   EXPECT_FALSE(binding->pattern().has_value());
@@ -110,10 +115,9 @@ TEST(LlmBindingParseTest, ConvertsEveryValueKind) {
   EXPECT_FALSE(binding->removesModel());
 }
 
-// A null value removes the field, as an unset one does.
-TEST(LlmBindingParseTest, NullValueRemovesTheField) {
-  const LlmBindingConstSharedPtr binding =
-      parseOk(R"({"mutations": [{"body_field": "model", "value": null}]})");
+// A removal writes no value.
+TEST(LlmBindingParseTest, ARemovalHasNoValue) {
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [{"remove": "model"}]})");
   ASSERT_EQ(binding->mutations().size(), 1);
   EXPECT_FALSE(binding->mutations()[0].value.has_value());
   EXPECT_TRUE(binding->removesModel());
@@ -126,25 +130,35 @@ TEST(LlmBindingParseTest, RejectsWhatCannotBeApplied) {
            "/v1/{model",
            R"({"uri_pattern": "/v1/{a|b}/{c|d}"})",
            R"({"uri_pattern": "/v1/{model}/{rest=**}"})",
-           R"({"mutations": [{"value": "x"}]})",
-           R"({"mutations": [{"body_field": ""}]})",
-           R"({"mutations": [{"header": ""}]})",
+           R"({"body_mutations": [{}]})",
+           R"({"body_mutations": [{"remove": ""}]})",
+           R"({"headers_mutations": [{"remove": ""}]})",
            // Headers Envoy frames itself, and the pseudo-headers.
-           R"({"mutations": [{"header": ":path", "value": "/x"}]})",
-           R"({"mutations": [{"header": "host", "value": "h"}]})",
-           R"({"mutations": [{"header": "content-length", "value": "0"}]})",
-           R"({"mutations": [{"header": "transfer-encoding"}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": ":path", "value": "/x"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "host", "value": "h"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "content-length",)"
+           R"( "value": "0"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"remove": "transfer-encoding"}]})",
            // Header names are matched lower-case.
-           R"({"mutations": [{"header": "Anthropic-Version", "value": "v"}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "Anthropic-Version",)"
+           R"( "value": "v"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
            // And are RFC 7230 tokens: the filter-state path is not PGV-checked.
-           R"({"mutations": [{"header": "x@a", "value": "v"}]})",
-           R"({"mutations": [{"header": "x a", "value": "v"}]})",
-           R"({"mutations": [{"header": "x:a", "value": "v"}]})",
-           R"({"mutations": [{"header": "x/a", "value": "v"}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x@a", "value": "v"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x a", "value": "v"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x:a", "value": "v"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x/a", "value": "v"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
            // A header's value is text.
-           R"({"mutations": [{"header": "x-a", "value": 1}]})",
-           R"({"mutations": [{"header": "x-a", "value": {"k": "v"}}]})",
-           R"({"mutations": [{"body_field": "a", "keep": true}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "value": 1},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "value": {"k": "v"}},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}]})",
+           R"({"body_mutations": [{"remove": "a", "keep": true}]})",
            "{not json",
        }) {
     EXPECT_THAT(LlmBinding::parse(text), HasStatusCode(absl::StatusCode::kInvalidArgument)) << text;
@@ -152,12 +166,16 @@ TEST(LlmBindingParseTest, RejectsWhatCannotBeApplied) {
 }
 
 TEST(LlmBindingParseTest, ConvertsHeaderMutations) {
-  const LlmBindingConstSharedPtr binding = parseOk(R"({"mutations": [
-    {"header": "anthropic-version", "value": "2023-06-01", "keep_existing": true},
-    {"header": "x-tenant", "value": "{project}"},
-    {"header": "x-drop"},
-    {"body_field": "model"}
-  ]})");
+  const LlmBindingConstSharedPtr binding = parseOk(R"({
+    "headers_mutations": [
+      {"append": {"header": {"key": "anthropic-version", "value": "2023-06-01"},
+                  "append_action": "ADD_IF_ABSENT"}},
+      {"append": {"header": {"key": "x-tenant", "value": "{project}"},
+                  "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+      {"remove": "x-drop"}
+    ],
+    "body_mutations": [{"remove": "model"}]
+  })");
   ASSERT_NE(binding, nullptr);
   const std::vector<LlmBinding::Mutation>& mutations = binding->mutations();
   ASSERT_EQ(mutations.size(), 4);
@@ -170,7 +188,7 @@ TEST(LlmBindingParseTest, ConvertsHeaderMutations) {
   EXPECT_FALSE(mutations[3].isHeader());
   // Removing a header named `model` is not removing the body's model.
   EXPECT_TRUE(binding->removesModel());
-  EXPECT_FALSE(parseOk(R"({"mutations": [{"header": "model"}]})")->removesModel());
+  EXPECT_FALSE(parseOk(R"({"headers_mutations": [{"remove": "model"}]})")->removesModel());
 }
 
 // A YAML block scalar leaves a newline after the value.
@@ -180,8 +198,9 @@ TEST(LlmBindingParseTest, IgnoresWhitespaceAroundTheValue) {
 }
 
 TEST(LlmBindingParseTest, KnowsWhatItRemoves) {
-  const LlmBindingConstSharedPtr binding = parseOk(R"({"mutations": [
-    {"body_field": "model"}, {"body_field": "stream"}, {"body_field": "labels", "value": "x"}
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"remove": "model"}, {"remove": "stream"},
+    {"append": {"record": {"key": "labels", "value": "x"}, "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
   ]})");
   EXPECT_TRUE(binding->removesModel());
   EXPECT_TRUE(binding->removesStream());
@@ -191,8 +210,9 @@ TEST(LlmBindingParseTest, KnowsWhatItRemoves) {
 TEST(LlmBindingTest, EmptyPartsFallBackToTheApis) {
   const LlmBindingConstSharedPtr api = parseOk(GeminiApi);
   const LlmBindingConstSharedPtr pattern_only = parseOk("/gw/{model}");
-  const LlmBindingConstSharedPtr edits_only =
-      parseOk(R"({"mutations": [{"body_field": "x", "value": 1}]})");
+  const LlmBindingConstSharedPtr edits_only = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "x", "value": 1}, "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
 
   // The API removes `model`, so the path's replaces the body's.
   nlohmann::json body = nlohmann::json::parse(R"({"model": "from-body"})");
@@ -214,8 +234,10 @@ TEST(LlmBindingTest, EmptyPartsFallBackToTheApis) {
 // binding does not undo its body edits, on the way out or on the way in.
 TEST(LlmBindingTest, MutationsAddToTheApis) {
   const LlmBindingConstSharedPtr api = parseOk(GeminiApi);
-  const LlmBindingConstSharedPtr header_only =
-      parseOk(R"({"mutations": [{"header": "x-goog-user-project", "value": "{project}"}]})");
+  const LlmBindingConstSharedPtr header_only = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "x-goog-user-project", "value": "{project}"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   const LlmBindingRead arrived{nullptr, "", {{"project", "acme"}}, {}, {}};
 
   nlohmann::json body = nlohmann::json::parse(R"({"model": "m", "stream": false})");
@@ -241,8 +263,9 @@ TEST(LlmBindingTest, MutationsAddToTheApis) {
 TEST(LlmBindingTest, ABindingOverridesAnApiEditByNamingItsTarget) {
   const LlmBindingConstSharedPtr api = parseOk(GeminiApi);
   // Keeps `model` in the body (the API would remove it); `stream` is still removed.
-  const LlmBindingConstSharedPtr keeps_model = parseOk(
-      R"({"mutations": [{"body_field": "model", "value": "{model}", "keep_existing": true}]})");
+  const LlmBindingConstSharedPtr keeps_model = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "model", "value": "{model}"}, "action": "ADD_IF_ABSENT"}}
+  ]})");
   nlohmann::json body = nlohmann::json::parse(R"({"model": "m", "stream": true})");
   EXPECT_THAT(
       write(*keeps_model, nullptr, body, api.get()),
@@ -289,7 +312,7 @@ TEST(LlmBindingReadTest, TheBodyWinsForAFieldTheBindingKeeps) {
   // A removed `stream` takes the path's value either way.
   const LlmBindingConstSharedPtr removes_stream =
       parseOk(R"({"uri_pattern": "/gw/{model}/{chat|chat-stream}",)"
-              R"( "mutations": [{"body_field": "stream"}]})");
+              R"( "body_mutations": [{"remove": "stream"}]})");
   body = nlohmann::json::parse(R"({"stream": true})");
   ASSERT_TRUE(read(removes_stream, "/gw/m/chat", body).has_value());
   EXPECT_EQ(body, nlohmann::json::parse(R"({"model": "m", "stream": false})"));
@@ -318,8 +341,10 @@ TEST(LlmBindingReadTest, APathThatDoesNotMatchReadsNothing) {
 // A binding without a pattern reads the API's, or no path at all, and still takes out the fields
 // it writes.
 TEST(LlmBindingReadTest, ABindingWithoutAPatternReadsNoPath) {
-  const LlmBindingConstSharedPtr edits_only = parseOk(
-      R"({"mutations": [{"body_field": "anthropic_version", "value": "bedrock-2023-05-31"}]})");
+  const LlmBindingConstSharedPtr edits_only = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "anthropic_version", "value": "bedrock-2023-05-31"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   nlohmann::json body = nlohmann::json::parse(R"({"anthropic_version": "bedrock-2023-05-31"})");
   std::optional<LlmBindingRead> arrived = read(edits_only, "/anything", body);
   ASSERT_TRUE(arrived.has_value());
@@ -394,7 +419,7 @@ TEST(LlmBindingWriteTest, RendersTheModelFromTheBodyAndTheRestFromThePath) {
   EXPECT_THAT(write(*binding, &arrived, no_model),
               HasStatusCode(absl::StatusCode::kInvalidArgument));
   // Without a pattern there is no path to render.
-  EXPECT_THAT(write(*parseOk(R"({"mutations": [{"body_field": "a"}]})"), nullptr, body),
+  EXPECT_THAT(write(*parseOk(R"({"body_mutations": [{"remove": "a"}]})"), nullptr, body),
               IsOkAndHolds(std::nullopt));
 }
 
@@ -415,8 +440,11 @@ TEST(LlmBindingWriteTest, FlagsAValueTheClientsPathDidNotHold) {
   expect_unresolved(*vertex, nullptr, "`{version}`");
   expect_unresolved(*parseOk(absl::StrCat("/v1/", std::string(1, '*'), "/{model}")), &arrived,
                     "wildcard");
-  expect_unresolved(*parseOk(R"({"mutations": [{"body_field": "labels", "value": "{tenant}"}]})"),
-                    &arrived, "`{tenant}`");
+  const LlmBindingConstSharedPtr labels = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "labels", "value": "{tenant}"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
+  expect_unresolved(*labels, &arrived, "`{tenant}`");
 
   nlohmann::json body = nlohmann::json::parse(R"({"model": "m"})");
   bool unresolved = true;
@@ -425,13 +453,16 @@ TEST(LlmBindingWriteTest, FlagsAValueTheClientsPathDidNotHold) {
 }
 
 TEST(LlmBindingWriteTest, AppliesTheMutationsInOrder) {
-  const LlmBindingConstSharedPtr binding = parseOk(R"({"mutations": [
-    {"body_field": "model"},
-    {"body_field": "max_tokens", "value": 4096, "keep_existing": true},
-    {"body_field": "top_k", "value": 40, "keep_existing": true},
-    {"body_field": "temperature", "value": 0.5},
-    {"body_field": "labels", "value": {"tenant": "{project}"}},
-    {"body_field": "user", "value": "{project}-{model}"}
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"remove": "model"},
+    {"append": {"record": {"key": "max_tokens", "value": 4096}, "action": "ADD_IF_ABSENT"}},
+    {"append": {"record": {"key": "top_k", "value": 40}, "action": "ADD_IF_ABSENT"}},
+    {"append": {"record": {"key": "temperature", "value": 0.5},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "labels", "value": {"tenant": "{project}"}},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "user", "value": "{project}-{model}"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
   ]})");
   const LlmBindingRead arrived{nullptr, "", {{"project", "acme"}}, {}};
   nlohmann::json body =
@@ -446,8 +477,9 @@ TEST(LlmBindingWriteTest, AppliesTheMutationsInOrder) {
 
 // A mutation that keeps the body's field writes nothing, so it needs no values.
 TEST(LlmBindingWriteTest, KeepingAFieldNeedsNoValues) {
-  const LlmBindingConstSharedPtr binding = parseOk(
-      R"({"mutations": [{"body_field": "x", "value": "{tenant}", "keep_existing": true}]})");
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "x", "value": "{tenant}"}, "action": "ADD_IF_ABSENT"}}
+  ]})");
   nlohmann::json body = nlohmann::json::parse(R"({"x": "existing"})");
   const nlohmann::json original = body;
   ASSERT_THAT(write(*binding, nullptr, body), IsOkAndHolds(std::nullopt));
@@ -457,17 +489,23 @@ TEST(LlmBindingWriteTest, KeepingAFieldNeedsNoValues) {
 // A placeholder fills a JSON string, so any value the request has will do.
 TEST(LlmBindingWriteTest, FillsAPlaceholderWithAnyValueTheRequestHas) {
   nlohmann::json body = nlohmann::json::parse(R"({"model": "ibm/granite-3-8b-instruct"})");
-  ASSERT_THAT(write(*parseOk(R"({"mutations": [{"body_field": "model_id", "value": "{model}"}]})"),
-                    nullptr, body),
-              IsOk());
+  const LlmBindingConstSharedPtr model_id = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "model_id", "value": "{model}"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
+  ASSERT_THAT(write(*model_id, nullptr, body), IsOk());
   EXPECT_EQ(body["model_id"], "ibm/granite-3-8b-instruct");
-  EXPECT_THAT(write(*parseOk(R"({"mutations": [{"body_field": "x", "value": "{tenant}"}]})"),
-                    nullptr, body),
+  const LlmBindingConstSharedPtr tenant = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "x", "value": "{tenant}"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
+  EXPECT_THAT(write(*tenant, nullptr, body),
               HasStatus(absl::StatusCode::kFailedPrecondition, HasSubstr("`{tenant}`")));
   // An unclosed brace is text.
-  ASSERT_THAT(
-      write(*parseOk(R"({"mutations": [{"body_field": "x", "value": "a{b"}]})"), nullptr, body),
-      IsOk());
+  const LlmBindingConstSharedPtr unclosed = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "x", "value": "a{b"}, "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
+  ASSERT_THAT(write(*unclosed, nullptr, body), IsOk());
   EXPECT_EQ(body["x"], "a{b");
 }
 
@@ -476,10 +514,12 @@ TEST(LlmBindingWriteTest, FillsAPlaceholderWithAnyValueTheRequestHas) {
 TEST(LlmBindingWriteTest, TheSameBindingRestoresWhatTheClientSent) {
   const LlmBindingConstSharedPtr binding = parseOk(R"({
     "uri_pattern": "/v1/projects/acme/locations/us-east5/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}",
-    "mutations": [
-      {"body_field": "model"},
-      {"body_field": "anthropic_version", "value": "vertex-2023-10-16"},
-      {"body_field": "service_tier", "value": "auto"}
+    "body_mutations": [
+      {"remove": "model"},
+      {"append": {"record": {"key": "anthropic_version", "value": "vertex-2023-10-16"},
+                  "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+      {"append": {"record": {"key": "service_tier", "value": "auto"},
+                  "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
     ]
   })");
   const LlmBindingRead arrived{binding, "m", {}, {{"anthropic_version", "vertex-2099-01-01"}}};
@@ -498,8 +538,10 @@ TEST(LlmBindingWriteTest, TheSameBindingRestoresWhatTheClientSent) {
 
 // A restored field needs none of the values its default would.
 TEST(LlmBindingWriteTest, ARestoredFieldNeedsNoValues) {
-  const LlmBindingConstSharedPtr binding =
-      parseOk(R"({"mutations": [{"body_field": "tenant", "value": "{project}"}]})");
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "tenant", "value": "{project}"},
+                "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   nlohmann::json body = nlohmann::json::parse(R"({"model": "m", "tenant": "client-tenant"})");
   const nlohmann::json original = body;
   const std::optional<LlmBindingRead> arrived = read(binding, "/v1/messages", body);
@@ -510,8 +552,9 @@ TEST(LlmBindingWriteTest, ARestoredFieldNeedsNoValues) {
 }
 
 TEST(LlmBindingWriteTest, EditsOnlyAnObjectBody) {
-  const LlmBindingConstSharedPtr binding =
-      parseOk(R"({"mutations": [{"body_field": "a", "value": 1}]})");
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "a", "value": 1}, "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   nlohmann::json array = nlohmann::json::array();
   ASSERT_THAT(write(*binding, nullptr, array), IsOk());
   EXPECT_EQ(array, nlohmann::json::array());
@@ -521,17 +564,23 @@ TEST(LlmBindingWriteTest, EditsOnlyAnObjectBody) {
 // caller rather than writing itself.
 constexpr absl::string_view AnthropicApi = R"({
   "uri_pattern": "/v1/messages",
-  "mutations": [{"header": "anthropic-version", "value": "2023-06-01", "keep_existing": true}]
+  "headers_mutations": [{"append": {"header": {"key": "anthropic-version", "value": "2023-06-01"},
+                                    "append_action": "ADD_IF_ABSENT"}}]
 })";
 
 TEST(LlmBindingHeaderTest, WritesTheHeadersBesideTheBody) {
   const LlmBindingConstSharedPtr binding = parseOk(R"({
     "uri_pattern": "/gw/{model}",
-    "mutations": [
-      {"header": "anthropic-version", "value": "2023-06-01"},
-      {"header": "x-model", "value": "{model}-{project}"},
-      {"header": "x-client-key"},
-      {"body_field": "tenant", "value": "{project}"}
+    "headers_mutations": [
+      {"append": {"header": {"key": "anthropic-version", "value": "2023-06-01"},
+                  "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+      {"append": {"header": {"key": "x-model", "value": "{model}-{project}"},
+                  "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+      {"remove": "x-client-key"}
+    ],
+    "body_mutations": [
+      {"append": {"record": {"key": "tenant", "value": "{project}"},
+                  "action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
     ]
   })");
   const LlmBindingRead arrived{nullptr, "", {{"project", "acme"}}, {}, {}};
@@ -559,8 +608,10 @@ TEST(LlmBindingHeaderTest, KeepsAHeaderTheRequestHas) {
 // earlier edit set is present, one an earlier edit removed is absent, whatever the request had.
 TEST(LlmBindingHeaderTest, KeepExistingSeesEarlierHeaderEdits) {
   // Absent in the request; set a, then set b only if absent: a stands.
-  const LlmBindingConstSharedPtr set_then_keep = parseOk(R"({"mutations": [
-    {"header": "x-a", "value": "a"}, {"header": "x-a", "value": "b", "keep_existing": true}
+  const LlmBindingConstSharedPtr set_then_keep = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "x-a", "value": "a"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"header": {"key": "x-a", "value": "b"}, "append_action": "ADD_IF_ABSENT"}}
   ]})");
   nlohmann::json body = nlohmann::json::object();
   std::vector<HeaderMutation> headers;
@@ -568,8 +619,9 @@ TEST(LlmBindingHeaderTest, KeepExistingSeesEarlierHeaderEdits) {
   EXPECT_THAT(describe(headers), ::testing::ElementsAre("x-a: a"));
 
   // Present in the request; remove, then set b only if absent: b is written.
-  const LlmBindingConstSharedPtr remove_then_keep = parseOk(R"({"mutations": [
-    {"header": "x-a"}, {"header": "x-a", "value": "b", "keep_existing": true}
+  const LlmBindingConstSharedPtr remove_then_keep = parseOk(R"({"headers_mutations": [
+    {"remove": "x-a"},
+    {"append": {"header": {"key": "x-a", "value": "b"}, "append_action": "ADD_IF_ABSENT"}}
   ]})");
   headers.clear();
   ASSERT_THAT(write(*remove_then_keep, nullptr, body, nullptr, &headers, {{"x-a", "original"}}),
@@ -577,8 +629,9 @@ TEST(LlmBindingHeaderTest, KeepExistingSeesEarlierHeaderEdits) {
   EXPECT_THAT(describe(headers), ::testing::ElementsAre("x-a", "x-a: b"));
 
   // The same two edits on a body field, for comparison.
-  const LlmBindingConstSharedPtr body_edits = parseOk(R"({"mutations": [
-    {"body_field": "f", "value": "a"}, {"body_field": "f", "value": "b", "keep_existing": true}
+  const LlmBindingConstSharedPtr body_edits = parseOk(R"({"body_mutations": [
+    {"append": {"record": {"key": "f", "value": "a"}, "action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"record": {"key": "f", "value": "b"}, "action": "ADD_IF_ABSENT"}}
   ]})");
   ASSERT_THAT(write(*body_edits, nullptr, body), IsOk());
   EXPECT_EQ(body, nlohmann::json::parse(R"({"f": "a"})"));
@@ -587,8 +640,10 @@ TEST(LlmBindingHeaderTest, KeepExistingSeesEarlierHeaderEdits) {
 // A binding's header edit stands in for the API's edit to the same header.
 TEST(LlmBindingHeaderTest, ABindingOverridesAnApiHeaderEditByNamingIt) {
   const LlmBindingConstSharedPtr anthropic = parseOk(AnthropicApi);
-  const LlmBindingConstSharedPtr newer =
-      parseOk(R"({"mutations": [{"header": "anthropic-version", "value": "2024-01-01"}]})");
+  const LlmBindingConstSharedPtr newer = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "anthropic-version", "value": "2024-01-01"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   nlohmann::json body = nlohmann::json::object();
   std::vector<HeaderMutation> headers;
   ASSERT_THAT(write(*newer, nullptr, body, anthropic.get(), &headers),
@@ -614,8 +669,10 @@ TEST(LlmBindingHeaderTest, TheSameBindingRestoresTheClientsHeader) {
   EXPECT_THAT(describe(headers), ::testing::ElementsAre("anthropic-version: 2024-01-01"));
 
   // Out in another binding that writes the same header: that binding's value.
-  const LlmBindingConstSharedPtr gateway = parseOk(
-      R"({"uri_pattern": "/gw", "mutations": [{"header": "anthropic-version", "value": "gw"}]})");
+  const LlmBindingConstSharedPtr gateway = parseOk(R"({"uri_pattern": "/gw", "headers_mutations": [
+    {"append": {"header": {"key": "anthropic-version", "value": "gw"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   headers.clear();
   ASSERT_THAT(write(*gateway, &*arrived, body, nullptr, &headers), IsOkAndHolds("/gw"));
   EXPECT_THAT(describe(headers), ::testing::ElementsAre("anthropic-version: gw"));
@@ -638,8 +695,11 @@ TEST(LlmBindingHeaderTest, HeadersDoNotDependOnTheBody) {
   ASSERT_THAT(write(*binding, nullptr, array, nullptr, &headers), IsOk());
   EXPECT_THAT(describe(headers), ::testing::ElementsAre("anthropic-version: 2023-06-01"));
 
-  const LlmBindingConstSharedPtr needs_project = parseOk(R"({"mutations": [
-    {"header": "x-a", "value": "a"}, {"header": "x-tenant", "value": "{project}"}
+  const LlmBindingConstSharedPtr needs_project = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "x-a", "value": "a"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"header": {"key": "x-tenant", "value": "{project}"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
   ]})");
   nlohmann::json body = nlohmann::json::object();
   headers.clear();
@@ -651,8 +711,11 @@ TEST(LlmBindingHeaderTest, HeadersDoNotDependOnTheBody) {
 // A value is checked once its placeholders are filled, since a placeholder takes what the client
 // sent: a CR, LF or NUL in the result would end the header and start another.
 TEST(LlmBindingHeaderTest, RejectsAValueThatWouldSplitTheHeader) {
-  const LlmBindingConstSharedPtr binding = parseOk(R"({"mutations": [
-    {"header": "x-a", "value": "a"}, {"header": "x-model", "value": "{model}"}
+  const LlmBindingConstSharedPtr binding = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "x-a", "value": "a"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+    {"append": {"header": {"key": "x-model", "value": "{model}"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
   ]})");
   std::vector<HeaderMutation> headers;
   for (absl::string_view model : {absl::string_view("m\r\nx-admin: true"), absl::string_view("m\n"),
@@ -666,11 +729,44 @@ TEST(LlmBindingHeaderTest, RejectsAValueThatWouldSplitTheHeader) {
   }
 
   // Set in the binding itself, from filter state, the value is caught the same way.
-  const LlmBindingConstSharedPtr injected =
-      parseOk(R"({"mutations": [{"header": "x-a", "value": "a\r\nx-admin: true"}]})");
+  const LlmBindingConstSharedPtr injected = parseOk(R"({"headers_mutations": [
+    {"append": {"header": {"key": "x-a", "value": "a\r\nx-admin: true"},
+                "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+  ]})");
   nlohmann::json body = nlohmann::json::object();
   EXPECT_THAT(write(*injected, nullptr, body, nullptr, &headers),
               HasStatusCode(absl::StatusCode::kInvalidArgument));
+}
+
+// A binding writes with ADD_IF_ABSENT or OVERWRITE_IF_EXISTS_OR_ADD, which it can take back out of
+// a request that arrives in it; it rejects the rest of the shared mutation messages.
+TEST(LlmBindingParseTest, RejectsMutationsItCannotTakeBack) {
+  for (absl::string_view text : {
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "value": "v"}}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "value": "v"},)"
+           R"( "append_action": "OVERWRITE_IF_EXISTS"}}]})",
+           R"({"headers_mutations": [{"remove_on_match": {"key_matcher": {"prefix": "x-"}}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "raw_value": "dg=="},)"
+           R"( "append_action": "ADD_IF_ABSENT"}}]})",
+           R"({"headers_mutations": [{"append": {"header": {"key": "x-a", "value": "v"},)"
+           R"( "append": false}}]})",
+           R"({"headers_mutations": [{}]})",
+           R"({"body_mutations": [{"append": {"record": {"key": "a", "value": 1}}}]})",
+           R"({"body_mutations": [{"append": {"record": {"key": "a", "value": 1},)"
+           R"( "action": "OVERWRITE_IF_EXISTS"}}]})",
+           R"({"body_mutations": [{"append": {"record": {"key": "a", "value": null},)"
+           R"( "action": "ADD_IF_ABSENT"}}]})",
+           R"({"body_mutations": [{"append": {"record": {"key": "a"},)"
+           R"( "action": "ADD_IF_ABSENT"}}]})",
+           R"({"body_mutations": [{"append": {"record": {"key": "a", "value": 1},)"
+           R"( "action": "ADD_IF_ABSENT"}, "remove": "a"}]})",
+           R"({"body_mutations": [{"append": {"action": "ADD_IF_ABSENT"}}]})",
+           R"({"body_mutations": [{"append": {"entry": {"key": "a", "value": "MQ=="},)"
+           R"( "action": "ADD_IF_ABSENT"}}]})",
+           R"({"mutations": [{"body_field": "model"}]})",
+       }) {
+    EXPECT_THAT(LlmBinding::parse(text), HasStatusCode(absl::StatusCode::kInvalidArgument)) << text;
+  }
 }
 
 } // namespace

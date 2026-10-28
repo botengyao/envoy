@@ -133,6 +133,8 @@ envoy_cc_library(
         "@abseil-cpp//absl/status:statusor",
         "@abseil-cpp//absl/strings",
         "@abseil-cpp//absl/types:span",
+        "@envoy_api//envoy/config/common/mutation_rules/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
         "@nlohmann_json//:json",
     ],

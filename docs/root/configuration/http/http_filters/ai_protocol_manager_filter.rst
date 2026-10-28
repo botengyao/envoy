@@ -523,10 +523,11 @@ model in the path alone and the Vertex AI API version in the body, not in the AP
 
   {
     "uri_pattern": "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/{model}:{rawPredict|streamRawPredict}",
-    "mutations": [
-      {"body_field": "model"},
-      {"body_field": "anthropic_version", "value": "vertex-2023-10-16", "keep_existing": true},
-      {"header": "anthropic-version"}
+    "headers_mutations": [{"remove": "anthropic-version"}],
+    "body_mutations": [
+      {"remove": "model"},
+      {"append": {"record": {"key": "anthropic_version", "value": "vertex-2023-10-16"},
+                  "action": "ADD_IF_ABSENT"}}
     ]
   }
 
@@ -537,14 +538,21 @@ automatically, so requests to Anthropic need no extra path or header configurati
 
   {
     "uri_pattern": "/v1/messages",
-    "mutations": [
-      {"header": "anthropic-version", "value": "2023-06-01", "keep_existing": true}
+    "headers_mutations": [
+      {"append": {"header": {"key": "anthropic-version", "value": "2023-06-01"},
+                  "append_action": "ADD_IF_ABSENT"}}
     ]
   }
 
 A binding's mutations apply on top of the API's own, so a binding that only adds a header keeps
 the API's body edits. A mutation naming a field or header the API's also name replaces that one
 edit, which is how the Vertex binding above removes the API's version header.
+
+The mutations are the :ref:`header mutation filter's <config_http_filters_header_mutation>`
+messages, limited to what a binding can take back out of a request that arrives in it: ``remove``,
+and ``append`` with ``ADD_IF_ABSENT`` or ``OVERWRITE_IF_EXISTS_OR_ADD``, which must be named. A
+value is not a format string; ``{model}`` and the client's path variables are its only
+placeholders.
 
 Use header mutations only for non-secret API headers; pass credentials via
 ``request_headers_to_add`` or :ref:`credential_injector <config_http_filters_credential_injector>`.

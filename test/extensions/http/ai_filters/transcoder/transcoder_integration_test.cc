@@ -129,9 +129,11 @@ public:
     initializeRoute(
         envoy::type::ai::v3::GEMINI_GENERATE_CONTENT, envoy::type::ai::v3::ANTHROPIC_MESSAGES,
         R"({"uri_pattern": "/{version}/projects/{project}/locations/{location}/publishers/)"
-        R"(anthropic/models/{model}:{rawPredict|streamRawPredict}", "mutations": [)"
-        R"({"body_field": "model"}, {"body_field": "anthropic_version", )"
-        R"("value": "vertex-2023-10-16", "keep_existing": true}, {"header": "anthropic-version"}]})",
+        R"(anthropic/models/{model}:{rawPredict|streamRawPredict}",)"
+        R"( "headers_mutations": [{"remove": "anthropic-version"}],)"
+        R"( "body_mutations": [{"remove": "model"},)"
+        R"( {"append": {"record": {"key": "anthropic_version", "value": "vertex-2023-10-16"},)"
+        R"( "action": "ADD_IF_ABSENT"}}]})",
         ClaudeModel, /*binding_on_route=*/false);
   }
 
