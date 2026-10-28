@@ -62,8 +62,6 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 message LLMBinding {
   reserved 2;
 
-  reserved "mutations";
-
   // The request path, as a :ref:`URI pattern
   // <config_http_filters_ai_protocol_manager_transcoder_instructions>`: a two-way map between the
   // path and the request's named values, each matching one path segment. ``{model}`` is the
