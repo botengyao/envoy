@@ -890,10 +890,14 @@ Http::FilterDataStatus McpFilter::completeParsing() {
     }
   }
 
-  if (!is_mcp_request_ && shouldRejectRequest()) {
-    sendErrorReply("request must be a valid JSON-RPC 2.0 message for MCP",
-                   Filters::Common::Mcp::Status::NotJsonRpc);
-    return Http::FilterDataStatus::StopIterationNoBuffer;
+  if (!is_mcp_request_) {
+    if (shouldRejectRequest()) {
+      sendErrorReply("request must be a valid JSON-RPC 2.0 message for MCP",
+                     Filters::Common::Mcp::Status::NotJsonRpc);
+      return Http::FilterDataStatus::StopIterationNoBuffer;
+    } else if (parser_->isBatch() && !passthrough_reason_.has_value()) {
+      passthrough_reason_ = Filters::Common::Mcp::Status::NotJsonRpc;
+    }
   }
 
   const auto version_validation = validateProtocolVersion();

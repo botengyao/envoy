@@ -153,6 +153,7 @@ public:
 
   // MCP validation getters
   bool isValidMcp() const { return is_valid_mcp_; }
+  bool isBatch() const { return is_batch_; }
   bool isResponse() const { return has_result_ || has_error_; }
   const std::string& getMethod() const { return method_; }
 
@@ -210,6 +211,7 @@ private:
   // MCP state
   std::string method_;
   bool is_valid_mcp_{false};
+  bool is_batch_{false};
   bool has_jsonrpc_{false};
   bool has_method_{false};
   bool has_result_{false};
@@ -258,6 +260,9 @@ public:
 
   // Check if this is a valid MCP request
   bool isValidMcpRequest() const;
+
+  // Check if the root JSON value is a top-level array (JSON-RPC batch)
+  bool isBatch() const;
 
   // Check if parsing is complete (root JSON object has closed)
   bool isParsingComplete() const { return extractor_ && extractor_->shouldStopParsing(); }

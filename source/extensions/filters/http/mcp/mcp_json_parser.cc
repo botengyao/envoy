@@ -467,6 +467,11 @@ McpFieldExtractor* McpFieldExtractor::EndObject() {
 }
 
 McpFieldExtractor* McpFieldExtractor::StartList(absl::string_view) {
+  if (depth_ == 0 && array_depth_ == 0) {
+    is_batch_ = true;
+    is_valid_mcp_ = false;
+    can_stop_parsing_ = true;
+  }
   // Arrays not supported - skip
   array_depth_++;
   return this;
@@ -721,7 +726,7 @@ bool McpFieldExtractor::requiredFieldsCollected() const {
 }
 
 void McpFieldExtractor::finalizeExtraction() {
-  if (!has_jsonrpc_ || (!has_method_ && !has_result_ && !has_error_)) {
+  if (is_batch_ || !has_jsonrpc_ || (!has_method_ && !has_result_ && !has_error_)) {
     ENVOY_LOG(debug, "not a valid MCP message");
     is_valid_mcp_ = false;
     return;
@@ -856,6 +861,11 @@ absl::Status McpJsonParser::parse(absl::string_view data) {
     return status;
   }
   if (extractor_->shouldStopParsing()) {
+    if (extractor_->isBatch()) {
+      ENVOY_LOG(trace, "Parsing stopped early - top-level JSON array (batch) detected");
+      extractor_->finalizeExtraction();
+      return status;
+    }
     ENVOY_LOG(trace, "Parsing complete - root object closed");
     return finishParse();
   }
@@ -873,6 +883,8 @@ absl::Status McpJsonParser::finishParse() {
 }
 
 bool McpJsonParser::isValidMcpRequest() const { return extractor_ && extractor_->isValidMcp(); }
+
+bool McpJsonParser::isBatch() const { return extractor_ && extractor_->isBatch(); }
 
 bool McpJsonParser::isResponse() const { return extractor_ && extractor_->isResponse(); }
 

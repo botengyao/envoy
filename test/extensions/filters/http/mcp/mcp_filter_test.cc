@@ -4079,6 +4079,108 @@ TEST_F(McpFilterTest, TracingHeadersNotClearedWhenTraceParentInvalid) {
             headers.get(Http::LowerCaseString("baggage"))[0]->value().getStringView());
 }
 
+TEST_F(McpFilterTest, TopLevelBatchArrayRejectedInRejectMode) {
+  setupRejectMode();
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers, false));
+
+  std::string json = R"([{"jsonrpc": "2.0", "method": "tools/list", "id": 1}])";
+  Buffer::OwnedImpl buffer(json);
+
+  EXPECT_CALL(decoder_callbacks_,
+              sendLocalReply(Http::Code::BadRequest,
+                             "request must be a valid JSON-RPC 2.0 message for MCP", _, _,
+                             "mcp_not_jsonrpc"));
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(
+                      Pair("status", Property(&Protobuf::Value::string_value, "mcp_not_jsonrpc"))),
+                  Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false)))));
+      });
+
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_->decodeData(buffer, true));
+  EXPECT_EQ(1U, config_->stats().requests_rejected_.value());
+  EXPECT_EQ(1U, config_->stats().body_not_jsonrpc_.value());
+}
+
+TEST_F(McpFilterTest, TopLevelBatchArrayPassThroughModeSetsMetadata) {
+  envoy::extensions::filters::http::mcp::v3::Mcp proto_config;
+  proto_config.set_traffic_mode(envoy::extensions::filters::http::mcp::v3::Mcp::PASS_THROUGH);
+  proto_config.set_request_storage_mode(
+      envoy::extensions::filters::http::mcp::v3::Mcp::DYNAMIC_METADATA_AND_FILTER_STATE);
+  config_ = std::make_shared<McpFilterConfig>(proto_config, "test.", stats_store_);
+  filter_ = std::make_unique<McpFilter>(config_);
+  filter_->setDecoderFilterCallbacks(decoder_callbacks_);
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers, false));
+
+  std::string json = R"([{"jsonrpc": "2.0", "method": "tools/list", "id": 1}])";
+  Buffer::OwnedImpl buffer(json);
+
+  Protobuf::Struct captured_metadata;
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([&captured_metadata](const std::string&, const Protobuf::Struct& metadata) {
+        captured_metadata = metadata;
+      });
+  EXPECT_CALL(decoder_callbacks_, sendLocalReply).Times(0);
+
+  EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
+
+  ASSERT_TRUE(captured_metadata.fields().contains("is_mcp_request"));
+  EXPECT_FALSE(captured_metadata.fields().at("is_mcp_request").bool_value());
+  ASSERT_TRUE(captured_metadata.fields().contains("status"));
+  EXPECT_EQ("mcp_ok", captured_metadata.fields().at("status").string_value());
+  ASSERT_TRUE(captured_metadata.fields().contains("passthrough_reason"));
+  EXPECT_EQ("mcp_not_jsonrpc", captured_metadata.fields().at("passthrough_reason").string_value());
+
+  const auto* filter_state =
+      decoder_callbacks_.stream_info_.filterState()->getDataReadOnly<McpFilterStateObject>(
+          McpFilterStateObject::FilterStateKey);
+  ASSERT_NE(nullptr, filter_state);
+  EXPECT_FALSE(filter_state->isMcpRequest());
+}
+
+TEST_F(McpFilterTest, TopLevelBatchArrayMultiChunkCompletesOnFirstChunk) {
+  setupRejectMode();
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers, false));
+
+  Buffer::OwnedImpl chunk1(R"([{"jsonrpc": "2.0", )");
+
+  EXPECT_CALL(decoder_callbacks_,
+              sendLocalReply(Http::Code::BadRequest,
+                             "request must be a valid JSON-RPC 2.0 message for MCP", _, _,
+                             "mcp_not_jsonrpc"));
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(
+                      Pair("status", Property(&Protobuf::Value::string_value, "mcp_not_jsonrpc"))),
+                  Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false)))));
+      });
+
+  // Should stop parsing and reject immediately on the first chunk without buffering more data.
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_->decodeData(chunk1, false));
+}
+
 } // namespace
 } // namespace Mcp
 } // namespace HttpFilters

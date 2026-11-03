@@ -2166,6 +2166,40 @@ TEST(McpJsonParserMemoryTest, HeavyObjectFieldsUnorderedMethod) {
   }
 }
 
+TEST_F(McpJsonParserTest, TopLevelArrayBatchFlaggedAsInvalidMcp) {
+  std::string json = R"([{"jsonrpc": "2.0", "method": "tools/list", "id": 1}])";
+
+  auto status = parser_->parse(json);
+  EXPECT_OK(status);
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_TRUE(parser_->isBatch());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, TopLevelEmptyArrayFlaggedAsInvalidMcp) {
+  std::string json = "[]";
+
+  auto status = parser_->parse(json);
+  EXPECT_OK(status);
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_TRUE(parser_->isBatch());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+}
+
+TEST_F(McpJsonParserTest, TopLevelArrayPartialChunkStopsEarly) {
+  // Even when a top-level batch array arrives in a partial chunk, the parser
+  // immediately flags it as a batch and signals that parsing can stop.
+  std::string chunk1 = R"([{"jsonrpc": "2.0", "method": )";
+
+  auto status = parser_->parse(chunk1);
+  EXPECT_OK(status);
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_TRUE(parser_->isBatch());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+}
+
 } // namespace
 } // namespace Mcp
 } // namespace HttpFilters
