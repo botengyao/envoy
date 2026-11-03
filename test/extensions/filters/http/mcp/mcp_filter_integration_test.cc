@@ -1520,6 +1520,64 @@ TEST_P(McpFilterIntegrationTest, PerRouteOverrideToNoop) {
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
+// Test that a parse error occurring after "method" was seen (such as a lone surrogate \ud800 or
+// excessive nesting depth) clears method-derived validity and never reports is_mcp_request=true
+// in PASS_THROUGH mode.
+TEST_P(McpFilterIntegrationTest, ParseErrorAfterMethodNeverReportsMcpRequest) {
+  FakeAccessLogFactory factory;
+  Registry::InjectFactory<AccessLog::AccessLogInstanceFactory> factory_register(factory);
+
+  bool metadata_verified = false;
+  factory.setLogCallback(
+      [&metadata_verified](const Formatter::Context&, const StreamInfo::StreamInfo& stream_info) {
+        const auto& dynamic_metadata = stream_info.dynamicMetadata().filter_metadata();
+        auto it = dynamic_metadata.find("envoy.filters.http.mcp");
+        if (it != dynamic_metadata.end()) {
+          Protobuf::Struct expected_metadata;
+          MessageUtil::loadFromJson(R"json({
+            "status": "mcp_ok",
+            "passthrough_reason": "mcp_not_jsonrpc",
+            "is_mcp_request": false
+          })json",
+                                    expected_metadata);
+          EXPECT_TRUE(TestUtility::protoEqual(expected_metadata, it->second))
+              << "got:\n"
+              << it->second.DebugString() << "\nexpected:\n"
+              << expected_metadata.DebugString();
+          EXPECT_FALSE(it->second.fields().contains("method"));
+          metadata_verified = true;
+        }
+      });
+
+  config_helper_.addConfigModifier([](ConfigHelper::HttpConnectionManager& hcm) {
+    auto* access_log = hcm.add_access_log();
+    access_log->set_name("envoy.access_loggers.test");
+    test::integration::accesslog::FakeAccessLog access_log_config;
+    std::ignore = access_log->mutable_typed_config()->PackFrom(access_log_config);
+  });
+
+  initializeFilter();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                     {":path", "/"},
+                                     {":scheme", "http"},
+                                     {":authority", "host"},
+                                     {"accept", "application/json"},
+                                     {"accept", "text/event-stream"},
+                                     {"content-type", "application/json"}},
+      R"({"jsonrpc":"2.0","method":"tools/call","params":{"bad":"\ud800"},"id":1})");
+
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_TRUE(metadata_verified);
+}
+
 } // namespace
 } // namespace Mcp
 } // namespace HttpFilters

@@ -587,18 +587,20 @@ TEST_F(McpJsonParserTest, PartialParsingMidString) {
 TEST_F(McpJsonParserTest, PartialParsingEscapeSequence) {
   // Split in the middle of an escape sequence inside params object.
   // The JSON parsing will fail due to incomplete escape sequence,
-  // but the MCP request is still valid if we have jsonrpc and method.
+  // and method-derived validity must be cleared on parse error.
   std::string json1 = R"({"jsonrpc": "2.0", "method": "test", "id": 1, "params": {"text": "line1\)";
 
   auto status = parser_->parse(json1);
 
   // In streaming mode, Parse() of a partial chunk succeeds because it expects more data.
   EXPECT_OK(status);
+  EXPECT_FALSE(parser_->isValidMcpRequest());
 
   // The parsing fails on finishParse() due to the incomplete escape sequence.
   auto finish_status = parser_->finishParse();
   EXPECT_THAT(finish_status, Not(IsOk()));
-  EXPECT_TRUE(parser_->isValidMcpRequest());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
 }
 
 TEST_F(McpJsonParserTest, FieldExtractionToolsCall) {
@@ -1918,7 +1920,7 @@ TEST_F(McpJsonParserTest, MultiChunkDuplicateKeyDetection) {
       R"({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_weather"}, "id": 1)";
 
   EXPECT_OK(parser->parse(chunk1));
-  EXPECT_TRUE(parser->isValidMcpRequest());
+  EXPECT_FALSE(parser->isValidMcpRequest());
 
   // CRITICAL: The parser must NOT have stopped yet — the root object hasn't closed.
   EXPECT_FALSE(parser->isParsingComplete());
@@ -1938,6 +1940,7 @@ TEST_F(McpJsonParserTest, MultiChunkDuplicateKeyDetection) {
 
   // NOW the root object closed, parser should be done
   EXPECT_TRUE(parser->isParsingComplete());
+  EXPECT_TRUE(parser->isValidMcpRequest());
 
   // The duplicate "params" key from chunk 2 must be detected
   EXPECT_TRUE(parser->hasDuplicateKeys());
@@ -2013,6 +2016,84 @@ TEST_F(McpJsonParserTest, TrailingGarbageRejected) {
   // Parse should fail because of trailing garbage in the chunk.
   auto status = parser_->parse(json);
   EXPECT_THAT(status, Not(IsOk()));
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, EmptyMethodInvalid) {
+  std::string json = R"({"jsonrpc": "2.0", "method": "", "id": 1})";
+
+  EXPECT_OK(parser_->parse(json));
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, DuplicateMethodOverwrittenWithEmptyInvalid) {
+  std::string json = R"({"jsonrpc": "2.0", "method": "tools/call", "method": "", "id": 1})";
+
+  EXPECT_OK(parser_->parse(json));
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, DuplicateMethodOverwrittenWithNonStringInvalid) {
+  std::string json = R"({"jsonrpc": "2.0", "method": "tools/call", "method": 123, "id": 1})";
+
+  EXPECT_OK(parser_->parse(json));
+  EXPECT_TRUE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, NestingDepth101AfterMethodClearsValidity) {
+  std::string json = R"({"jsonrpc": "2.0", "method": "tools/call", "id": 1, "params": )";
+  for (int i = 0; i < 101; ++i) {
+    json += R"({"a": )";
+  }
+  json += "1";
+  for (int i = 0; i < 101; ++i) {
+    json += "}";
+  }
+  json += "}";
+
+  auto status = parser_->parse(json);
+  EXPECT_THAT(status, Not(IsOk()));
+  EXPECT_FALSE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+}
+
+TEST_F(McpJsonParserTest, LoneSurrogateAfterMethodClearsValidity) {
+  std::string json =
+      R"({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "\ud800"}, "id": 1})";
+
+  auto status = parser_->parse(json);
+  EXPECT_THAT(status, Not(IsOk()));
+  EXPECT_FALSE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
+  EXPECT_TRUE(parser_->metadata().fields().empty());
+
+  // Also test when the lone surrogate is within the last 12 bytes so JsonStreamParser
+  // defers the error to finishParse().
+  parser_->reset();
+  std::string tail_surrogate_json =
+      R"({"jsonrpc": "2.0", "method": "tools/call", "id": 1, "params": {"name": "\ud800"}})";
+  status = parser_->parse(tail_surrogate_json);
+  if (status.ok()) {
+    status = parser_->finishParse();
+  }
+  EXPECT_THAT(status, Not(IsOk()));
+  EXPECT_FALSE(parser_->isParsingComplete());
+  EXPECT_FALSE(parser_->isValidMcpRequest());
+  EXPECT_TRUE(parser_->getMethod().empty());
 }
 
 // Test that default config has correct security settings.

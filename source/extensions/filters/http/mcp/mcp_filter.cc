@@ -875,7 +875,8 @@ McpFilter::ProtocolVersionValidationResult McpFilter::validateProtocolVersion() 
 
 Http::FilterDataStatus McpFilter::completeParsing() {
   parsing_complete_ = true;
-  is_mcp_request_ = parser_->isValidMcpRequest();
+  is_mcp_request_ = parser_->isParsingComplete() && parser_->isValidMcpRequest() &&
+                    (!parser_->getMethod().empty() || parser_->isResponse());
 
   ENVOY_LOG(debug, "parsing complete: is_mcp={}, bytes_parsed={}", is_mcp_request_, bytes_parsed_);
 
@@ -962,8 +963,15 @@ Http::FilterDataStatus McpFilter::completeParsing() {
   // For JSON-RPC responses (no method field), set a synthetic method so the
   // router can identify and dispatch them.
   if (is_mcp_request_ && parser_->isResponse()) {
+    effective_method = std::string(Filters::Common::Mcp::McpConstants::Methods::JSONRPC_RESPONSE);
     (*metadata.mutable_fields())["method"].set_string_value(
         Filters::Common::Mcp::McpConstants::Methods::JSONRPC_RESPONSE);
+  }
+
+  const auto method_it = metadata.fields().find("method");
+  if (effective_method.empty() || method_it == metadata.fields().end() ||
+      method_it->second.string_value().empty()) {
+    is_mcp_request_ = false;
   }
 
   const ParserConfig& active_parser_config = parserConfig();

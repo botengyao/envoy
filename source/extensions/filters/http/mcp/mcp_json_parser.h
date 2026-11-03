@@ -145,6 +145,9 @@ public:
   // Finalize extraction after parsing complete
   void finalizeExtraction();
 
+  // Clear method-derived validity state on parse error
+  void clearMethodValidity();
+
   // Check if optional fields are configured for the current method
   bool hasOptionalFields();
 
@@ -159,6 +162,9 @@ public:
 private:
   // Check for duplicate key in current scope. Returns true if key was a duplicate.
   bool checkDuplicateKey(absl::string_view name);
+
+  // Clear top-level jsonrpc/method state when overwritten by a non-string value.
+  void invalidateTopLevelNonStringField(absl::string_view name);
 
   // Update required/optional field lists once method is known
   void updateFieldRequirements();

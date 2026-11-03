@@ -346,6 +346,18 @@ bool McpFieldExtractor::checkDuplicateKey(absl::string_view name) {
   return false;
 }
 
+void McpFieldExtractor::invalidateTopLevelNonStringField(absl::string_view name) {
+  if (depth_ == 1) {
+    if (name == JSONRPC_FIELD) {
+      has_jsonrpc_ = false;
+    } else if (name == METHOD_FIELD) {
+      method_.clear();
+      has_method_ = false;
+      is_notification_ = false;
+    }
+  }
+}
+
 McpFieldExtractor* McpFieldExtractor::StartObject(absl::string_view name) {
   if (can_stop_parsing_) {
     return this;
@@ -379,14 +391,14 @@ McpFieldExtractor* McpFieldExtractor::StartObject(absl::string_view name) {
     if (depth_ == 2) {
       if (name == "result") {
         has_result_ = true;
-        if (has_jsonrpc_) {
-          is_valid_mcp_ = true;
-        }
       } else if (name == "error") {
         has_error_ = true;
-        if (has_jsonrpc_) {
-          is_valid_mcp_ = true;
-        }
+      } else if (name == JSONRPC_FIELD) {
+        has_jsonrpc_ = false;
+      } else if (name == METHOD_FIELD) {
+        method_.clear();
+        has_method_ = false;
+        is_notification_ = false;
       }
     }
   }
@@ -459,14 +471,18 @@ McpFieldExtractor* McpFieldExtractor::EndObject() {
   // Also set can_stop_parsing_ to avoid buffering more data — the root object
   // is complete, so no more top-level fields (jsonrpc, method, id) can appear.
   if (depth_ == 0 && !can_stop_parsing_) {
-    finalizeExtraction();
     can_stop_parsing_ = true;
+    finalizeExtraction();
   }
 
   return this;
 }
 
-McpFieldExtractor* McpFieldExtractor::StartList(absl::string_view) {
+McpFieldExtractor* McpFieldExtractor::StartList(absl::string_view name) {
+  if (!can_stop_parsing_ && array_depth_ == 0 && !name.empty()) {
+    checkDuplicateKey(name);
+    invalidateTopLevelNonStringField(name);
+  }
   // Arrays not supported - skip
   array_depth_++;
   return this;
@@ -510,22 +526,13 @@ McpFieldExtractor* McpFieldExtractor::RenderString(absl::string_view name,
 
   // Check top-level fields for method/response detection
   if (depth_ == 1) {
-    if (name == JSONRPC_FIELD && value == JSONRPC_VERSION) {
-      has_jsonrpc_ = true;
-      if (has_method_ || has_result_ || has_error_) {
-        is_valid_mcp_ = true;
-      }
+    if (name == JSONRPC_FIELD) {
+      has_jsonrpc_ = (value == JSONRPC_VERSION);
     } else if (name == RESULT_FIELD) {
       has_result_ = true;
-      if (has_jsonrpc_) {
-        is_valid_mcp_ = true;
-      }
     } else if (name == METHOD_FIELD) {
-      has_method_ = true;
-      if (has_jsonrpc_) {
-        is_valid_mcp_ = true;
-      }
       method_ = std::string(value);
+      has_method_ = !method_.empty();
       is_notification_ = absl::StartsWith(method_, Methods::NOTIFICATION_PREFIX);
       updateActiveTargetPaths();
     }
@@ -547,6 +554,7 @@ McpFieldExtractor* McpFieldExtractor::RenderBool(absl::string_view name, bool va
   }
 
   checkDuplicateKey(name);
+  invalidateTopLevelNonStringField(name);
 
   std::string full_path = buildFullPath(name);
 
@@ -573,6 +581,7 @@ McpFieldExtractor* McpFieldExtractor::RenderInt64(absl::string_view name, int64_
   }
 
   checkDuplicateKey(name);
+  invalidateTopLevelNonStringField(name);
 
   std::string full_path = buildFullPath(name);
 
@@ -591,6 +600,7 @@ McpFieldExtractor* McpFieldExtractor::RenderUint64(absl::string_view name, uint6
   }
 
   checkDuplicateKey(name);
+  invalidateTopLevelNonStringField(name);
 
   std::string full_path = buildFullPath(name);
 
@@ -609,6 +619,7 @@ McpFieldExtractor* McpFieldExtractor::RenderDouble(absl::string_view name, doubl
   }
 
   checkDuplicateKey(name);
+  invalidateTopLevelNonStringField(name);
 
   std::string full_path = buildFullPath(name);
 
@@ -631,6 +642,7 @@ McpFieldExtractor* McpFieldExtractor::RenderNull(absl::string_view name) {
   }
 
   checkDuplicateKey(name);
+  invalidateTopLevelNonStringField(name);
 
   std::string full_path = buildFullPath(name);
 
@@ -721,11 +733,13 @@ bool McpFieldExtractor::requiredFieldsCollected() const {
 }
 
 void McpFieldExtractor::finalizeExtraction() {
-  if (!has_jsonrpc_ || (!has_method_ && !has_result_ && !has_error_)) {
+  if (!has_jsonrpc_ || ((!has_method_ || method_.empty()) && !has_result_ && !has_error_)) {
     ENVOY_LOG(debug, "not a valid MCP message");
     is_valid_mcp_ = false;
     return;
   }
+
+  is_valid_mcp_ = can_stop_parsing_;
 
   if (!has_method_) {
     // JSON-RPC response: copy only always-extract fields (jsonrpc, id).
@@ -740,6 +754,16 @@ void McpFieldExtractor::finalizeExtraction() {
 
   // Validate required fields
   validateRequiredFields();
+}
+
+void McpFieldExtractor::clearMethodValidity() {
+  is_valid_mcp_ = false;
+  has_method_ = false;
+  method_.clear();
+  is_notification_ = false;
+  has_result_ = false;
+  has_error_ = false;
+  can_stop_parsing_ = false;
 }
 
 bool McpFieldExtractor::hasOptionalFields() {
@@ -853,6 +877,8 @@ absl::Status McpJsonParser::parse(absl::string_view data) {
   auto status = stream_parser_->Parse(data);
   ENVOY_LOG(trace, "status ok: {}, {}", status.ok(), status.message());
   if (!status.ok()) {
+    extractor_->clearMethodValidity();
+    metadata_.Clear();
     return status;
   }
   if (extractor_->shouldStopParsing()) {
@@ -867,8 +893,17 @@ absl::Status McpJsonParser::finishParse() {
     return absl::InvalidArgumentError("No data has been parsed");
   }
   ENVOY_LOG(debug, "parser finishParse");
+  const bool root_closed = extractor_->shouldStopParsing();
   auto status = stream_parser_->FinishParse();
-  extractor_->finalizeExtraction();
+  if (!root_closed) {
+    extractor_->finalizeExtraction();
+  }
+  if (!status.ok()) {
+    extractor_->clearMethodValidity();
+    if (root_closed) {
+      metadata_.Clear();
+    }
+  }
   return status;
 }
 

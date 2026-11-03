@@ -1912,8 +1912,16 @@ TEST_F(McpFilterTest, PartialJsonEndStreamPassThroughMode) {
   std::string json = R"({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "test")";
   Buffer::OwnedImpl buffer(json);
 
-  // Client-sent truncated data — allowed in PASS_THROUGH mode.
+  // Client-sent truncated data — allowed in PASS_THROUGH mode, but is_mcp_request is false.
   EXPECT_CALL(decoder_callbacks_, sendLocalReply).Times(0);
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false))),
+                  Contains(Pair("passthrough_reason",
+                                Property(&Protobuf::Value::string_value, "mcp_parse_error")))));
+      });
 
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
 }
@@ -2124,11 +2132,137 @@ TEST_F(McpFilterTest, TrailingGarbageRejectedInFilter) {
       R"({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "calculator"}, "id": 1} trailing garbage)";
   Buffer::OwnedImpl buffer(json);
 
-  // In PASS_THROUGH mode, it must be allowed.
+  // In PASS_THROUGH mode, it must be allowed, with is_mcp_request=false and no method.
   EXPECT_CALL(decoder_callbacks_, sendLocalReply).Times(0);
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false))),
+                  Not(Contains(Key("method")))));
+      });
 
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
   EXPECT_EQ(1u, config_->stats().invalid_json_.value());
+}
+
+TEST_F(McpFilterTest, NestingDepth101AfterMethodPassThroughNeverReportsMcpRequest) {
+  envoy::extensions::filters::http::mcp::v3::Mcp proto_config;
+  proto_config.set_traffic_mode(envoy::extensions::filters::http::mcp::v3::Mcp::PASS_THROUGH);
+  proto_config.set_request_storage_mode(
+      envoy::extensions::filters::http::mcp::v3::Mcp::DYNAMIC_METADATA_AND_FILTER_STATE);
+  config_ = std::make_shared<McpFilterConfig>(proto_config, "test.", factory_context_.scope());
+  filter_ = std::make_unique<McpFilter>(config_);
+  filter_->setDecoderFilterCallbacks(decoder_callbacks_);
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  filter_->decodeHeaders(headers, false);
+
+  std::string json = R"({"jsonrpc": "2.0", "method": "tools/call", "id": 1, "params": )";
+  for (int i = 0; i < 101; ++i) {
+    json += R"({"a": )";
+  }
+  json += "1";
+  for (int i = 0; i < 101; ++i) {
+    json += "}";
+  }
+  json += "}";
+  Buffer::OwnedImpl buffer(json);
+
+  EXPECT_CALL(decoder_callbacks_, sendLocalReply).Times(0);
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false))),
+                  Contains(Pair("passthrough_reason",
+                                Property(&Protobuf::Value::string_value, "mcp_not_jsonrpc"))),
+                  Not(Contains(Key("method")))));
+      });
+
+  EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
+  EXPECT_EQ(1u, config_->stats().invalid_json_.value());
+
+  const auto* filter_state_obj =
+      decoder_callbacks_.stream_info_.filterState()->getDataReadOnly<McpFilterStateObject>(
+          std::string(McpFilterStateObject::FilterStateKey));
+  ASSERT_NE(filter_state_obj, nullptr);
+  EXPECT_FALSE(filter_state_obj->isMcpRequest());
+  EXPECT_FALSE(filter_state_obj->method().has_value());
+}
+
+TEST_F(McpFilterTest, LoneSurrogateAfterMethodPassThroughNeverReportsMcpRequest) {
+  envoy::extensions::filters::http::mcp::v3::Mcp proto_config;
+  proto_config.set_traffic_mode(envoy::extensions::filters::http::mcp::v3::Mcp::PASS_THROUGH);
+  proto_config.set_request_storage_mode(
+      envoy::extensions::filters::http::mcp::v3::Mcp::DYNAMIC_METADATA_AND_FILTER_STATE);
+  config_ = std::make_shared<McpFilterConfig>(proto_config, "test.", factory_context_.scope());
+  filter_ = std::make_unique<McpFilter>(config_);
+  filter_->setDecoderFilterCallbacks(decoder_callbacks_);
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  filter_->decodeHeaders(headers, false);
+
+  std::string json =
+      R"({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "\ud800"}, "id": 1})";
+  Buffer::OwnedImpl buffer(json);
+
+  EXPECT_CALL(decoder_callbacks_, sendLocalReply).Times(0);
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false))),
+                  Contains(Pair("passthrough_reason",
+                                Property(&Protobuf::Value::string_value, "mcp_not_jsonrpc"))),
+                  Not(Contains(Key("method")))));
+      });
+
+  EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
+  EXPECT_EQ(1u, config_->stats().invalid_json_.value());
+
+  const auto* filter_state_obj =
+      decoder_callbacks_.stream_info_.filterState()->getDataReadOnly<McpFilterStateObject>(
+          std::string(McpFilterStateObject::FilterStateKey));
+  ASSERT_NE(filter_state_obj, nullptr);
+  EXPECT_FALSE(filter_state_obj->isMcpRequest());
+  EXPECT_FALSE(filter_state_obj->method().has_value());
+}
+
+TEST_F(McpFilterTest, EmptyMethodNeverReportsMcpRequest) {
+  setupRejectMode();
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"},
+                                         {"content-type", "application/json"},
+                                         {"accept", "application/json"},
+                                         {"accept", "text/event-stream"}};
+
+  filter_->decodeHeaders(headers, false);
+
+  std::string json = R"({"jsonrpc": "2.0", "method": "", "id": 1})";
+  Buffer::OwnedImpl buffer(json);
+
+  EXPECT_CALL(decoder_callbacks_,
+              sendLocalReply(Http::Code::BadRequest,
+                             "request must be a valid JSON-RPC 2.0 message for MCP", _, _,
+                             "mcp_not_jsonrpc"));
+  EXPECT_CALL(decoder_callbacks_.stream_info_, setDynamicMetadata("envoy.filters.http.mcp", _))
+      .WillOnce([](const std::string&, const Protobuf::Struct& metadata) {
+        EXPECT_THAT(
+            metadata.fields(),
+            AllOf(Contains(Pair("is_mcp_request", Property(&Protobuf::Value::bool_value, false))),
+                  Not(Contains(Key("method")))));
+      });
+
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationNoBuffer, filter_->decodeData(buffer, true));
 }
 
 // Test that a complete MCP JSON object followed by trailing garbage in the same data chunk
@@ -2636,14 +2770,15 @@ TEST_F(McpFilterTest, BodySizeLimitInPassThroughMode) {
 
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer, true));
 
-  // Verify dynamic metadata contents.
+  // Verify dynamic metadata contents: root object did not parse to completion, so
+  // is_mcp_request is false.
   EXPECT_THAT(
       captured_metadata.fields(),
-      AllOf(
-          Contains(
-              Pair(std::string(IS_EXCEEDING_LIMIT), Property(&Protobuf::Value::bool_value, true))),
-          Contains(Pair(std::string(IS_MCP_REQUEST), Property(&Protobuf::Value::bool_value, true))),
-          Contains(Pair("method", Property(&Protobuf::Value::string_value, "tools/call")))));
+      AllOf(Contains(Pair(std::string(IS_EXCEEDING_LIMIT),
+                          Property(&Protobuf::Value::bool_value, true))),
+            Contains(
+                Pair(std::string(IS_MCP_REQUEST), Property(&Protobuf::Value::bool_value, false))),
+            Contains(Pair("method", Property(&Protobuf::Value::string_value, "tools/call")))));
 }
 
 // Test body size check in PASS_THROUGH mode in a multi-chunk request.
@@ -2691,12 +2826,13 @@ TEST_F(McpFilterTest, BodySizeLimitInPassThroughModeMultiChunk) {
 
   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(buffer2, true));
 
-  // Verify dynamic metadata contents.
+  // Verify dynamic metadata contents: root object did not parse to completion, so
+  // is_mcp_request is false.
   EXPECT_THAT(captured_metadata.fields(),
               AllOf(Contains(Pair(std::string(IS_EXCEEDING_LIMIT),
                                   Property(&Protobuf::Value::bool_value, true))),
                     Contains(Pair(std::string(IS_MCP_REQUEST),
-                                  Property(&Protobuf::Value::bool_value, true)))));
+                                  Property(&Protobuf::Value::bool_value, false)))));
 }
 
 // Test route cache is NOT cleared by default when metadata is set
