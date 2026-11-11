@@ -756,7 +756,7 @@ public:
 
   void destroyFilters() {
     state_.destroyed_ = true;
-    state_.encoder_iteration_stopped_at_ = nullptr;
+    state_.encoder_trailers_waiting_at_ = nullptr;
 
     for (auto filter : filters_) {
       filter->onDestroy();
@@ -1023,12 +1023,9 @@ protected:
     ActiveStreamEncoderFilter* latest_data_encoding_filter_{};
     ActiveStreamDecoderFilter* latest_data_decoding_filter_{};
 
-    // The encoder filter at which the most recent encodeData()/encodeTrailers() pass stopped and
-    // that is still stopped, i.e. the filter that owns the body and/or trailers. Cleared when a
-    // pass started by that filter (or by the codec) reaches the codec. Used by
-    // ActiveStreamEncoderFilter::doTrailers() so that a filter resuming from StopAllIteration does
-    // not encode pending trailers ahead of an earlier filter that has not released the body yet.
-    ActiveStreamEncoderFilter* encoder_iteration_stopped_at_{};
+    // The StopAllIteration encoder filter at which the response trailers are waiting: every earlier
+    // encoder filter has processed them and this one has not.
+    ActiveStreamEncoderFilter* encoder_trailers_waiting_at_{};
   };
 
   State& state() { return state_; }

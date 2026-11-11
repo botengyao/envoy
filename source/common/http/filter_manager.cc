@@ -1558,9 +1558,6 @@ void FilterManager::encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instan
   StreamEncoderFilters::Iterator entry =
       commonEncodePrefix(filter, end_stream, filter_iteration_start_state);
   StreamEncoderFilters::Iterator trailers_added_entry = encoder_filters_.end();
-  // Whether this pass was started by the codec or by the filter that currently owns the stop
-  // point; only such a pass releases ownership when it reaches the codec.
-  const bool started_by_owner = filter == nullptr || filter == state_.encoder_iteration_stopped_at_;
 
   const bool trailers_exists_at_start = filter_manager_callbacks_.responseTrailers().has_value();
   for (; entry != encoder_filters_.end(); entry++) {
@@ -1568,7 +1565,6 @@ void FilterManager::encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instan
     // If the filter pointed by entry has stopped for all frame types, stop here. Break rather than
     // return so trailers added by an earlier filter can still be forwarded below.
     if (handleDataIfStopAll(**entry, data, state_.encoder_filters_streaming_)) {
-      state_.encoder_iteration_stopped_at_ = entry->get();
       break;
     }
     // If end_stream_ is marked for a filter, the data is not for this filter and filters after.
@@ -1614,9 +1610,6 @@ void FilterManager::encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instan
 
     if (!(*entry)->commonHandleAfterDataCallback(status, data, state_.encoder_filters_streaming_,
                                                  data_nonempty_before_callback)) {
-      if (!(*entry)->canIterate()) {
-        state_.encoder_iteration_stopped_at_ = entry->get();
-      }
       break;
     }
   }
@@ -1645,8 +1638,8 @@ void FilterManager::encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instan
     // If instead B had returned Continue from encodeData() while paused on headers
     // (StopIteration from encodeHeaders()), commonHandleAfterDataCallback() runs B's
     // commonContinue() inline: headers and data flow to C and the codec, and B.doTrailers()
-    // defers (B.end_stream_ is false and B is not re-iterating from itself) so that the
-    // encodeTrailers(A) call above, not B, delivers the trailers through C exactly once.
+    // defers (B has not been handed the trailers) so that the encodeTrailers(A) call above, not B,
+    // delivers the trailers through C exactly once.
     const bool trailers_added_by_earlier_filter =
         trailers_added_entry != encoder_filters_.end() && trailers_added_entry != entry;
     if (trailers_added_by_earlier_filter && (*entry)->canContinue() &&
@@ -1660,9 +1653,6 @@ void FilterManager::encodeData(ActiveStreamEncoderFilter* filter, Buffer::Instan
   }
 
   const bool modified_end_stream = end_stream && trailers_added_entry == encoder_filters_.end();
-  if (started_by_owner) {
-    state_.encoder_iteration_stopped_at_ = nullptr;
-  }
   filter_manager_callbacks_.encodeData(data, modified_end_stream);
   if (state_.saw_downstream_reset_) {
     return;
@@ -1689,12 +1679,11 @@ void FilterManager::encodeTrailers(ActiveStreamEncoderFilter* filter, ResponseTr
   // Filter iteration may start at the current filter.
   StreamEncoderFilters::Iterator entry =
       commonEncodePrefix(filter, true, filter_iteration_start_state);
-  const bool started_by_owner = filter == nullptr || filter == state_.encoder_iteration_stopped_at_;
   for (; entry != encoder_filters_.end(); entry++) {
     ENVOY_EXECUTION_SCOPE(trackedStream(), &(*entry)->filter_context_);
     // If the filter pointed by entry has stopped for all frame type, return now.
     if ((*entry)->stoppedAll()) {
-      state_.encoder_iteration_stopped_at_ = entry->get();
+      state_.encoder_trailers_waiting_at_ = entry->get();
       return;
     }
     ASSERT(!(state_.filter_call_state_ & FilterCallState::EncodeTrailers));
@@ -1706,16 +1695,10 @@ void FilterManager::encodeTrailers(ActiveStreamEncoderFilter* filter, ResponseTr
     ENVOY_STREAM_LOG(trace, "encode trailers called: filter={} status={}", *this,
                      (*entry)->filter_context_.config_name, static_cast<uint64_t>(status));
     if (!(*entry)->commonHandleAfterTrailersCallback(status)) {
-      if (!(*entry)->canIterate()) {
-        state_.encoder_iteration_stopped_at_ = entry->get();
-      }
       return;
     }
   }
 
-  if (started_by_owner) {
-    state_.encoder_iteration_stopped_at_ = nullptr;
-  }
   filter_manager_callbacks_.encodeTrailers(trailers);
   if (state_.saw_downstream_reset_) {
     return;
@@ -2109,22 +2092,13 @@ void ActiveStreamEncoderFilter::handleMetadataAfterHeadersCallback() {
   iterate_from_current_filter_ = saved_state;
 }
 void ActiveStreamEncoderFilter::doTrailers() {
-  // end_stream_ is false here only when trailers were added by an earlier filter during a data
-  // frame and FilterManager::encodeTrailers() has not yet visited this filter (it sets end_stream_
-  // on every filter it visits). In that case the owner of trailer iteration (the encodeData() pass
-  // still on the stack below commonContinue(), or an earlier filter that stopped trailer
-  // iteration) delivers them from the filter that added them; encoding from here would skip
-  // intermediate filters or encode the trailers twice. When resuming from StopAllIteration
-  // (iterate_from_current_filter_) no outer pass exists, so encode from here unless the most
-  // recent encode pass stopped at an earlier filter: that filter has not released the body yet,
-  // and its own continueEncoding() will deliver the trailers through this filter after the body.
-  // See the flow in FilterManager::encodeData() for the filter roles involved.
-  const ActiveStreamEncoderFilter* stopped_at = parent_.state_.encoder_iteration_stopped_at_;
-  if (!end_stream_ &&
+  // Only the filter holding the trailers resumes trailer iteration: one that was handed them
+  // (end_stream_), or one that stopped all iteration before they reached it. Otherwise an earlier
+  // filter, or the encodeData() pass that added them, delivers them through this filter.
+  if (!end_stream_ && parent_.state_.encoder_trailers_waiting_at_ != this &&
       Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.filter_manager_encode_trailers_on_stop_iteration") &&
-      (!iterate_from_current_filter_ || (stopped_at != nullptr && stopped_at != this))) {
-    ENVOY_STREAM_LOG(trace, "deferring trailers to the filter that owns them: filter={}", parent_,
+          "envoy.reloadable_features.filter_manager_encode_trailers_on_stop_iteration")) {
+    ENVOY_STREAM_LOG(trace, "deferring trailers to the filter that holds them: filter={}", parent_,
                      static_cast<const void*>(this));
     return;
   }
