@@ -38,6 +38,7 @@ public:
   void testNonTerminalEncodingFilterWithCompleteRequest();
   void testNonTerminalEncodingFilterWithIncompleteRequest();
   void testFilterAddsDataAndTrailersToHeaderOnlyRequest();
+  void testStopAllResumeAfterTrailersReachesBufferingFilter(bool guard_on);
 
   const int count_ = 70;
   const int size_ = 1000;
@@ -559,6 +560,53 @@ typed_config:
   codec_client_->sendReset(encoder);
   ASSERT_TRUE(response->waitForReset());
   codec_client_->close();
+}
+
+// Encode order: encode-headers-return-stop-all-filter, then encoder-decoder-buffer-filter. The
+// stop-all filter resumes 5s after the response headers, by which time the body and trailers from
+// the upstream are waiting at it. The buffering filter only releases the response once it sees the
+// end of the stream, which here are the trailers.
+void FilterIntegrationTest::testStopAllResumeAfterTrailersReachesBufferingFilter(bool guard_on) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.filter_manager_encode_trailers_on_stop_iteration",
+      guard_on ? "true" : "false");
+  prependFilter(R"EOF(
+name: encode-headers-return-stop-all-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.EncodeHeadersReturnStopAllFilterConfig
+)EOF");
+  prependFilter(R"EOF(
+name: encoder-decoder-buffer-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.EncoderDecoderBufferFilterConfig
+)EOF");
+  config_helper_.addConfigModifier(
+      [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void { hcm.mutable_http2_protocol_options()->set_allow_metadata(true); });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  waitForNextUpstreamRequest();
+  changeHeadersForStopAllTests(default_response_headers_, false);
+  upstream_request_->encodeHeaders(default_response_headers_, false);
+  upstream_request_->encodeData(count_ * size_, false);
+  upstream_request_->encodeTrailers(Http::TestResponseTrailerMapImpl{{"response", "trailer"}});
+
+  ASSERT_TRUE(response->waitForEndStream(std::chrono::seconds(20)));
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // The stop-all filter adds data in encodeData() and encodeTrailers().
+  EXPECT_EQ(count_ * size_ + 2 * added_decoded_data_size_, response->body().size());
+  ASSERT_NE(nullptr, response->trailers());
+}
+
+TEST_P(FilterIntegrationTest, StopAllResumeAfterTrailersReachesBufferingFilterGuardOn) {
+  testStopAllResumeAfterTrailersReachesBufferingFilter(true);
+}
+
+TEST_P(FilterIntegrationTest, StopAllResumeAfterTrailersReachesBufferingFilterGuardOff) {
+  testStopAllResumeAfterTrailersReachesBufferingFilter(false);
 }
 
 // Tests missing headers needed for H/1 codec first line.

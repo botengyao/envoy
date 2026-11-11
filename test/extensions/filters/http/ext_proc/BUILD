@@ -469,6 +469,7 @@ envoy_extension_cc_test(
         "//test/common/http:common_lib",
         "//test/integration:http_integration_lib",
         "//test/integration/filters:common_lib",
+        "//test/integration/filters:encode_headers_return_stop_all_filter_config_lib",
         "//test/integration/filters:stream_info_to_headers_filter_lib",
         "//test/proto:helloworld_proto_cc_proto",
         "//test/test_common:logging_lib",

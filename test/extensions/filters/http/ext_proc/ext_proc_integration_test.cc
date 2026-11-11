@@ -6299,6 +6299,67 @@ TEST_P(ExtProcIntegrationTest, StreamedBodyCompleteBeforeHeadersUnsetChunkSizePa
   EXPECT_EQ(response->body(), "mutated_response_body");
 }
 
+// A filter ahead of ext_proc on the encode path stops all iteration on the response headers and
+// resumes 5s later, once the upstream body and trailers are waiting at it (as a wasm or dynamic
+// module filter may). ext_proc buffers the response body until it sees the trailers, so it must
+// still receive them.
+class ExtProcStopAllResumeIntegrationTest : public ExtProcIntegrationTest {
+protected:
+  void runBufferedResponseBodyBehindStopAllFilter(bool guard_on) {
+    config_helper_.addRuntimeOverride(
+        "envoy.reloadable_features.filter_manager_encode_trailers_on_stop_iteration",
+        guard_on ? "true" : "false");
+    proto_config_.mutable_processing_mode()->set_request_header_mode(ProcessingMode::SKIP);
+    proto_config_.mutable_processing_mode()->set_response_header_mode(ProcessingMode::SKIP);
+    proto_config_.mutable_processing_mode()->set_response_body_mode(ProcessingMode::BUFFERED);
+    // initializeConfig() prepends ext_proc when the config is finalized, so ext_proc ends up in
+    // front of this filter and runs after it on the encode path.
+    config_helper_.prependFilter(R"EOF(
+name: encode-headers-return-stop-all-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.EncodeHeadersReturnStopAllFilterConfig
+)EOF");
+    config_helper_.addConfigModifier(
+        [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+               hcm) { hcm.mutable_http2_protocol_options()->set_allow_metadata(true); });
+    initializeConfig();
+    HttpIntegrationTest::initialize();
+
+    auto response = sendDownstreamRequest(std::nullopt);
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+    ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+    ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+    upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"},
+                                                                     {"content_size", "100"},
+                                                                     {"added_size", "1"}},
+                                     false);
+    upstream_request_->encodeData(100, false);
+    upstream_request_->encodeTrailers(Http::TestResponseTrailerMapImpl{{"x-trailer", "foo"}});
+
+    // The stop-all filter adds one byte in encodeData() and one in encodeTrailers().
+    processResponseBodyMessage(*grpc_upstreams_[0], true, [](const HttpBody& body, BodyResponse&) {
+      EXPECT_FALSE(body.end_of_stream());
+      EXPECT_EQ(102, body.body().size());
+      return true;
+    });
+    verifyDownstreamResponse(*response, 200);
+    EXPECT_EQ(102, response->body().size());
+    ASSERT_NE(nullptr, response->trailers());
+    EXPECT_THAT(*response->trailers(), ContainsHeader("x-trailer", "foo"));
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersionsClientTypeDeferredProcessing,
+                         ExtProcStopAllResumeIntegrationTest, GRPC_CLIENT_INTEGRATION_PARAMS);
+
+TEST_P(ExtProcStopAllResumeIntegrationTest, BufferedResponseBodyBehindStopAllFilterGuardOn) {
+  runBufferedResponseBodyBehindStopAllFilter(true);
+}
+
+TEST_P(ExtProcStopAllResumeIntegrationTest, BufferedResponseBodyBehindStopAllFilterGuardOff) {
+  runBufferedResponseBodyBehindStopAllFilter(false);
+}
+
 } // namespace ExternalProcessing
 } // namespace HttpFilters
 } // namespace Extensions
