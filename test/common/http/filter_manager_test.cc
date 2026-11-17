@@ -1777,7 +1777,15 @@ enum class TrailersDirection { Request, Response };
 
 enum class TrailersAddPhase { None, Data, StoppingData, HeaderOnlyHeaders };
 
-enum class TrailersStopKind { None, BufferData, ContinueOnData, StopAll, StopTrailers };
+enum class TrailersStopKind {
+  None,
+  BufferData,
+  ContinueOnData,
+  StopAll,
+  StopTrailers,
+  // Stops all iteration on headers, buffers the data on resume, and continues on trailers.
+  StopAllThenBufferData,
+};
 
 struct TrailersCase {
   TrailersDirection direction;
@@ -1792,8 +1800,8 @@ struct TrailersCase {
 std::string trailersCaseName(const testing::TestParamInfo<TrailersCase>& info) {
   constexpr std::array<absl::string_view, 4> phases{"CodecTrailers", "AddInData",
                                                     "AddInStoppingData", "AddInHeaderOnly"};
-  constexpr std::array<absl::string_view, 5> kinds{"NoStop", "BufferData", "ContinueOnData",
-                                                   "StopAll", "StopTrailers"};
+  constexpr std::array<absl::string_view, 6> kinds{
+      "NoStop", "BufferData", "ContinueOnData", "StopAll", "StopTrailers", "StopAllThenBufferData"};
   const TrailersCase& c = info.param;
   return absl::StrCat(c.direction == TrailersDirection::Request ? "Request" : "Response",
                       phases[static_cast<int>(c.add_phase)],
@@ -1815,7 +1823,8 @@ std::vector<TrailersCase> allTrailersCases() {
         cases.push_back({direction, phase, adder, TrailersStopKind::None, 0});
         for (TrailersStopKind kind :
              {TrailersStopKind::BufferData, TrailersStopKind::ContinueOnData,
-              TrailersStopKind::StopAll, TrailersStopKind::StopTrailers}) {
+              TrailersStopKind::StopAll, TrailersStopKind::StopTrailers,
+              TrailersStopKind::StopAllThenBufferData}) {
           // Codec trailers can be stopped anywhere; added trailers only after the adder.
           for (int stopper = phase == TrailersAddPhase::None ? 0 : adder + 1; stopper < 3;
                stopper++) {
@@ -1896,6 +1905,10 @@ public:
       break;
     case TrailersStopKind::StopTrailers:
       trailers = [] { return FilterTrailersStatus::StopIteration; };
+      break;
+    case TrailersStopKind::StopAllThenBufferData:
+      headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+      data = [](Buffer::Instance&, bool) { return FilterDataStatus::StopIterationAndBuffer; };
       break;
     }
   }
@@ -2112,6 +2125,75 @@ TEST_F(FilterManagerTrailersTest, ResponseTrailersHeldAtStopAllFilterReachItOnce
   filters_[1]->encoder_callbacks_->continueEncoding();
   EXPECT_EQ((Chunks{{"aaa", false}}), sent_data_);
   EXPECT_EQ(1, records_[1].encoded_trailers);
+  EXPECT_EQ(1, records_[0].encoded_trailers);
+  EXPECT_EQ(1, sent_trailers_);
+
+  filter_manager_->destroyFilters();
+}
+
+// A filter stops all iteration on headers. When it resumes it buffers the replayed body and
+// continues from its trailers callback, which runs inside that resumption. The parameter is
+// filter_manager_forward_data_on_trailers_continue.
+class FilterManagerTrailersContinueTest : public FilterManagerTrailersTest,
+                                          public testing::WithParamInterface<bool> {
+public:
+  void initializeChainWithGuard() {
+    scoped_runtime_.mergeValues(
+        {{"envoy.reloadable_features.filter_manager_forward_data_on_trailers_continue",
+          GetParam() ? "true" : "false"}});
+    initializeChain(true);
+  }
+
+  // Without the guard the body is dropped at the resuming filter.
+  Chunks forwardedBody() const { return GetParam() ? Chunks{{"aaa", false}} : Chunks{}; }
+};
+
+INSTANTIATE_TEST_SUITE_P(Guard, FilterManagerTrailersContinueTest, testing::Bool(),
+                         [](const testing::TestParamInfo<bool>& info) {
+                           return info.param ? "On" : "Off";
+                         });
+
+TEST_P(FilterManagerTrailersContinueTest, RequestBodyBufferedAfterStopAllIsForwarded) {
+  initializeChainWithGuard();
+  records_[0].decode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", false);
+  decodeTrailers();
+  EXPECT_EQ(0, records_[0].decoded_trailers);
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", false}}), records_[0].decoded_data);
+  EXPECT_EQ(1, records_[0].decoded_trailers);
+  EXPECT_EQ(forwardedBody(), records_[1].decoded_data);
+  EXPECT_EQ(forwardedBody(), records_[2].decoded_data);
+  EXPECT_EQ(1, records_[1].decoded_trailers);
+  EXPECT_EQ(1, records_[2].decoded_trailers);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_P(FilterManagerTrailersContinueTest, ResponseBodyBufferedAfterStopAllIsForwarded) {
+  initializeChainWithGuard();
+  filter_manager_->decodeHeaders(*request_headers_, true);
+  records_[1].encode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+  records_[1].encode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+
+  encodeHeaders(false);
+  encodeData("aaa", false);
+  encodeTrailers();
+  EXPECT_EQ(0, records_[1].encoded_trailers);
+
+  filters_[1]->encoder_callbacks_->continueEncoding();
+  EXPECT_EQ((Chunks{{"aaa", false}}), records_[1].encoded_data);
+  EXPECT_EQ(1, records_[1].encoded_trailers);
+  EXPECT_EQ(forwardedBody(), records_[0].encoded_data);
+  EXPECT_EQ(forwardedBody(), sent_data_);
   EXPECT_EQ(1, records_[0].encoded_trailers);
   EXPECT_EQ(1, sent_trailers_);
 

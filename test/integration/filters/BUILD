@@ -855,6 +855,23 @@ envoy_cc_test_library(
 )
 
 envoy_cc_test_library(
+    name = "stop_all_then_buffer_filter_lib",
+    srcs = [
+        "stop_all_then_buffer_filter.cc",
+    ],
+    deps = [
+        ":common_lib",
+        ":test_filters_proto_cc_proto",
+        "//envoy/event:timer_interface",
+        "//envoy/http:filter_interface",
+        "//envoy/registry",
+        "//envoy/server:filter_config_interface",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "//test/extensions/filters/http/common:empty_http_filter_config_lib",
+    ],
+)
+
+envoy_cc_test_library(
     name = "encode_headers_return_stop_iteration_filter_config_lib",
     srcs = [
         "encode_headers_return_stop_iteration_filter.cc",

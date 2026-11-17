@@ -269,6 +269,12 @@ bool ActiveStreamFilterBase::commonHandleAfterTrailersCallback(FilterTrailersSta
 
   if (status == FilterTrailersStatus::Continue) {
     if (iteration_state_ == IterationState::StopSingleIteration) {
+      // A filter resuming from StopAllIteration still has iterate_from_current_filter_ set here.
+      // It has seen the end of the stream, so data it buffered must continue from the next filter.
+      if (Runtime::runtimeFeatureEnabled(
+              "envoy.reloadable_features.filter_manager_forward_data_on_trailers_continue")) {
+        iterate_from_current_filter_ = false;
+      }
       commonContinue();
       return false;
     } else {

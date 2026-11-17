@@ -52,6 +52,8 @@ message DecodeHeadersReturnStopAllFilterConfig {
 }
 message EncodeHeadersReturnStopAllFilterConfig {
 }
+message StopAllThenBufferFilterConfig {
+}
 message LocalReplyWithMetadataFilterConfig {
 }
 message ResetStreamFilterConfig {

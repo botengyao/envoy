@@ -875,6 +875,37 @@ typed_config:
   verifyUpStreamRequestAfterStopAllFilter();
 }
 
+// Tests a filter that returns StopAllIterationAndBuffer for headers, buffers the replayed body when
+// it resumes, and continues from decodeTrailers(). The upstream still gets the body.
+TEST_P(FilterIntegrationTest, TestDecodeHeadersReturnsStopAllThenBuffersBody) {
+  // With async host resolution the router stops all iteration too and replays the buffered body
+  // itself when it resumes, which would hide a body that the filter failed to forward.
+  async_lb_ = false;
+  prependFilter(R"EOF(
+name: stop-all-then-buffer-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.StopAllThenBufferFilterConfig
+)EOF");
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, size_, false);
+  Http::TestRequestTrailerMapImpl request_trailers{{"trailer", "trailer"}};
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+  waitForNextUpstreamRequest();
+
+  EXPECT_EQ(size_, upstream_request_->bodyLength());
+  ASSERT_NE(nullptr, upstream_request_->trailers());
+  EXPECT_FALSE(upstream_request_->trailers()->get(Http::LowerCaseString("trailer")).empty());
+
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+}
+
 // Tests encodeHeaders() returns StopAllIterationAndBuffer.
 TEST_P(FilterIntegrationTest, TestEncodeHeadersReturnsStopAll) {
   prependFilter(R"EOF(
