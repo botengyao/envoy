@@ -788,6 +788,23 @@ envoy_cc_test_library(
 )
 
 envoy_cc_test_library(
+    name = "decode_lifecycle_filter_lib",
+    srcs = [
+        "decode_lifecycle_filter.cc",
+    ],
+    deps = [
+        ":common_lib",
+        ":test_filters_proto_cc_proto",
+        "//envoy/http:filter_interface",
+        "//envoy/registry",
+        "//envoy/server:filter_config_interface",
+        "//source/common/common:assert_lib",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "//test/extensions/filters/http/common:empty_http_filter_config_lib",
+    ],
+)
+
+envoy_cc_test_library(
     name = "decode_headers_return_stop_all_filter_config_lib",
     srcs = [
         "decode_headers_return_stop_all_filter.cc",

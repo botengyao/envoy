@@ -50,6 +50,8 @@ message CallDecodedataOnceFilterConfig {
 }
 message DecodeHeadersReturnStopAllFilterConfig {
 }
+message DecodeLifecycleFilterConfig {
+}
 message EncodeHeadersReturnStopAllFilterConfig {
 }
 message LocalReplyWithMetadataFilterConfig {

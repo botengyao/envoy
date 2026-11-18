@@ -38,6 +38,7 @@ public:
   void testNonTerminalEncodingFilterWithCompleteRequest();
   void testNonTerminalEncodingFilterWithIncompleteRequest();
   void testFilterAddsDataAndTrailersToHeaderOnlyRequest();
+  void testDecodeAbortOnEndStream(const std::string& phase, const std::string& action);
 
   const int count_ = 70;
   const int size_ = 1000;
@@ -1757,6 +1758,101 @@ TEST_P(MultiProtocolFilterIntegrationTest, AddedResponseTrailersReachLaterBuffer
   if (downstream_protocol_ != Http::CodecType::HTTP1) {
     EXPECT_EQ("encode", response->trailers()->getGrpcMessageValue());
   }
+}
+
+void FilterIntegrationTest::testDecodeAbortOnEndStream(const std::string& phase,
+                                                       const std::string& action) {
+  if (phase == "trailers") {
+    config_helper_.addConfigModifier(setEnableDownstreamTrailersHttp1());
+  }
+  prependFilter(R"EOF(
+  name: decode-lifecycle-filter
+  typed_config:
+    "@type": type.googleapis.com/test.integration.filters.DecodeLifecycleFilterConfig
+  )EOF");
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  default_request_headers_.addCopy("abort-phase", phase);
+  default_request_headers_.addCopy("abort-action", action);
+  IntegrationStreamDecoderPtr response;
+  if (phase == "headers") {
+    response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  } else {
+    auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+    response = std::move(encoder_decoder.second);
+    codec_client_->sendData(encoder_decoder.first, 16, phase == "data");
+    if (phase == "trailers") {
+      codec_client_->sendTrailers(encoder_decoder.first,
+                                  Http::TestRequestTrailerMapImpl{{"some", "trailer"}});
+    }
+  }
+
+  if (action == "goaway") {
+    ASSERT_TRUE(codec_client_->waitForDisconnect());
+    return;
+  }
+  if (action == "reset") {
+    ASSERT_TRUE(response->waitForReset());
+    EXPECT_FALSE(response->complete());
+    return;
+  }
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  // Upstream HTTP filters do not see local replies.
+  if (testing_downstream_filter_) {
+    const auto result =
+        response->headers().get(Http::LowerCaseString("decode-complete-before-reply"));
+    ASSERT_FALSE(result.empty());
+    EXPECT_EQ("true", result[0]->value().getStringView());
+  }
+}
+
+// A local reply from the callback that ends the request is encoded after that filter's
+// decodeComplete(), and decodeComplete() is not called once the filters are destroyed.
+TEST_P(MultiProtocolFilterIntegrationTest, LocalReplyOnEndStreamInDecodeHeaders) {
+  testDecodeAbortOnEndStream("headers", "local-reply");
+}
+
+// With synchronous host selection an upstream HTTP filter runs inside the router's decodeHeaders().
+TEST_P(MultiProtocolFilterIntegrationTest, LocalReplyOnEndStreamInDecodeHeadersSyncHostSelection) {
+  async_lb_ = false;
+  testDecodeAbortOnEndStream("headers", "local-reply");
+}
+
+TEST_P(MultiProtocolFilterIntegrationTest, LocalReplyOnEndStreamInDecodeData) {
+  testDecodeAbortOnEndStream("data", "local-reply");
+}
+
+TEST_P(MultiProtocolFilterIntegrationTest, LocalReplyOnEndStreamInDecodeTrailers) {
+  testDecodeAbortOnEndStream("trailers", "local-reply");
+}
+
+// A reset destroys the filters inside the decoder callback, so decodeComplete() is skipped.
+TEST_P(FilterIntegrationTest, ResetOnEndStreamInDecodeHeaders) {
+  testDecodeAbortOnEndStream("headers", "reset");
+}
+
+TEST_P(FilterIntegrationTest, ResetOnEndStreamInDecodeHeadersSyncHostSelection) {
+  async_lb_ = false;
+  testDecodeAbortOnEndStream("headers", "reset");
+}
+
+TEST_P(FilterIntegrationTest, ResetOnEndStreamInDecodeData) {
+  testDecodeAbortOnEndStream("data", "reset");
+}
+
+TEST_P(FilterIntegrationTest, ResetOnEndStreamInDecodeTrailers) {
+  testDecodeAbortOnEndStream("trailers", "reset");
+}
+
+TEST_P(FilterIntegrationTest, GoAwayOnEndStreamInDecodeHeaders) {
+  // sendGoAwayAndClose() is a no-op for upstream HTTP filters.
+  if (!testing_downstream_filter_) {
+    return;
+  }
+  testDecodeAbortOnEndStream("headers", "goaway");
 }
 
 } // namespace
