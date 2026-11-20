@@ -1771,7 +1771,7 @@ TEST_F(HttpConnectionManagerImplTest, HitFilterWatermarkLimits) {
   // Change the limit so the buffered data is below the new watermark. The
   // stream should be read-enabled
   EXPECT_CALL(response_encoder_.stream_, readDisable(false));
-  int buffer_len = decoder_filters_[1]->callbacks_->decodingBuffer()->length();
+  int buffer_len = decoder_filters_[0]->callbacks_->decodingBuffer()->length();
   decoder_filters_[0]->callbacks_->setBufferLimit((buffer_len + 1) * 2);
 
   // Start the response

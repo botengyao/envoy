@@ -305,15 +305,22 @@ void ActiveStreamFilterBase::holdSharedBuffer() {
   }
 }
 
+bool ActiveStreamFilterBase::ownBufferInUse() const {
+  return passed_by_data_ || (buffered_data_ != nullptr && buffered_data_->length() > 0);
+}
+
 void ActiveStreamFilterBase::takeSharedBuffer() {
-  // A filter that already holds bytes in its own buffer keeps buffering there.
-  if (!passed_by_data_ && (buffered_data_ == nullptr || buffered_data_->length() == 0)) {
+  if (!ownBufferInUse()) {
     sharedBufferHolder() = this;
   }
 }
 
+Buffer::InstancePtr& ActiveStreamFilterBase::visibleBuffer() {
+  return ownBufferInUse() ? bufferedData() : sharedBuffer();
+}
+
 void ActiveStreamFilterBase::commonHandleBufferData(Buffer::Instance& provided_data,
-                                                    bool hold_shared_buffer) {
+                                                    bool header_pass) {
 
   // The way we do buffering is a little complicated which is why we have this common function
   // which is used for both encoding and decoding. When data first comes into our filter pipeline,
@@ -321,13 +328,17 @@ void ActiveStreamFilterBase::commonHandleBufferData(Buffer::Instance& provided_d
   // continue iteration in the future, we use the buffered data. A future filter can stop and
   // buffer again. In this case, since we are already operating on buffered data, we don't
   // rebuffer, because we assume the filter has modified the buffer as it wishes in place.
-  if (bufferedData().get() != &provided_data) {
-    if (!bufferedData()) {
-      bufferedData() = createBuffer();
+  //
+  // A body added during the header pass goes to the shared buffer without holding it, so that
+  // bodies added by several filters are coalesced there.
+  Buffer::InstancePtr& buffer = header_pass ? sharedBuffer() : bufferedData();
+  if (buffer.get() != &provided_data) {
+    if (!buffer) {
+      buffer = createBuffer();
     }
-    bufferedData()->move(provided_data);
+    buffer->move(provided_data);
   }
-  if (hold_shared_buffer) {
+  if (!header_pass) {
     holdSharedBuffer();
   }
 }
@@ -568,6 +579,10 @@ Buffer::InstancePtr& ActiveStreamDecoderFilter::bufferedData() {
   return usesOwnBuffer() ? buffered_data_ : parent_.buffered_request_data_;
 }
 
+Buffer::InstancePtr& ActiveStreamDecoderFilter::sharedBuffer() {
+  return parent_.buffered_request_data_;
+}
+
 ActiveStreamFilterBase*& ActiveStreamDecoderFilter::sharedBufferHolder() {
   return parent_.state_.request_buffer_holder_;
 }
@@ -667,7 +682,9 @@ OptRef<WebTransportSession> ActiveStreamDecoderFilter::webTransportSession() {
 }
 
 void ActiveStreamDecoderFilter::continueDecoding() { commonContinue(); }
-const Buffer::Instance* ActiveStreamDecoderFilter::decodingBuffer() { return bufferedData().get(); }
+const Buffer::Instance* ActiveStreamDecoderFilter::decodingBuffer() {
+  return visibleBuffer().get();
+}
 
 bool ActiveStreamDecoderFilter::shouldLoadShed() const { return parent_.shouldLoadShed(); }
 
@@ -675,7 +692,7 @@ void ActiveStreamDecoderFilter::modifyDecodingBuffer(
     std::function<void(Buffer::Instance&)> callback) {
   PerFilterBufferTracker::ActiveFilterScope buffer_scope(parent_.request_buffer_tracker_, *this);
   ASSERT(parent_.state_.latest_data_decoding_filter_ == this);
-  callback(*bufferedData());
+  callback(*visibleBuffer());
 }
 
 void ActiveStreamDecoderFilter::sendLocalReply(
@@ -1039,10 +1056,9 @@ void FilterManager::addDecodedData(ActiveStreamDecoderFilter& filter, Buffer::In
       state_.filter_added_data_in_data_callback_ = true;
     }
     // If no call is happening or we are in the decode headers/data callback, buffer the data.
-    // Inline processing happens in the decodeHeaders() callback if necessary. A body added
-    // during the header pass stays shared, so that a later filter adding one appends to it.
-    filter.commonHandleBufferData(data,
-                                  !(state_.filter_call_state_ & FilterCallState::DecodeHeaders));
+    // Inline processing happens in the decodeHeaders() callback if necessary.
+    filter.commonHandleBufferData(
+        data, (state_.filter_call_state_ & FilterCallState::DecodeHeaders) != 0);
   } else if (state_.filter_call_state_ & FilterCallState::DecodeTrailers) {
     // In this case we need to inline dispatch the data to further filters. If those filters
     // choose to buffer/stop iteration that's fine.
@@ -1746,10 +1762,9 @@ void FilterManager::addEncodedData(ActiveStreamEncoderFilter& filter, Buffer::In
       state_.filter_added_data_in_data_callback_ = true;
     }
     // If no call is happening or we are in the decode headers/data callback, buffer the data.
-    // Inline processing happens in the decodeHeaders() callback if necessary. A body added
-    // during the header pass stays shared, so that a later filter adding one appends to it.
-    filter.commonHandleBufferData(data,
-                                  !(state_.filter_call_state_ & FilterCallState::EncodeHeaders));
+    // Inline processing happens in the decodeHeaders() callback if necessary.
+    filter.commonHandleBufferData(
+        data, (state_.filter_call_state_ & FilterCallState::EncodeHeaders) != 0);
   } else if (state_.filter_call_state_ & FilterCallState::EncodeTrailers) {
     // In this case we need to inline dispatch the data to further filters. If those filters
     // choose to buffer/stop iteration that's fine.
@@ -2279,6 +2294,9 @@ Buffer::InstancePtr ActiveStreamEncoderFilter::createBuffer() {
 Buffer::InstancePtr& ActiveStreamEncoderFilter::bufferedData() {
   return usesOwnBuffer() ? buffered_data_ : parent_.buffered_response_data_;
 }
+Buffer::InstancePtr& ActiveStreamEncoderFilter::sharedBuffer() {
+  return parent_.buffered_response_data_;
+}
 ActiveStreamFilterBase*& ActiveStreamEncoderFilter::sharedBufferHolder() {
   return parent_.state_.response_buffer_holder_;
 }
@@ -2394,13 +2412,15 @@ void ActiveStreamEncoderFilter::onEncoderFilterBelowWriteBufferLowWatermark() {
 
 void ActiveStreamEncoderFilter::continueEncoding() { commonContinue(); }
 
-const Buffer::Instance* ActiveStreamEncoderFilter::encodingBuffer() { return bufferedData().get(); }
+const Buffer::Instance* ActiveStreamEncoderFilter::encodingBuffer() {
+  return visibleBuffer().get();
+}
 
 void ActiveStreamEncoderFilter::modifyEncodingBuffer(
     std::function<void(Buffer::Instance&)> callback) {
   PerFilterBufferTracker::ActiveFilterScope buffer_scope(parent_.response_buffer_tracker_, *this);
   ASSERT(parent_.state_.latest_data_encoding_filter_ == this);
-  callback(*bufferedData());
+  callback(*visibleBuffer());
 }
 
 void ActiveStreamEncoderFilter::sendLocalReply(

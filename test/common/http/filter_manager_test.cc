@@ -1661,9 +1661,10 @@ TEST_F(FilterManagerPerFilterBufferTest, StopAllBuffersRequestAtStoppedFilter) {
   decodeData("aaa", false);
   decodeData("bbb", true);
   EXPECT_TRUE(records_[1].decoded_data.empty());
-  // Parked in the shared buffer, which filter 1 holds from then on.
+  // Parked in the shared buffer, as data has not passed filter 0's position yet.
   EXPECT_EQ("aaabbb", filters_[1]->decoder_callbacks_->decodingBuffer()->toString());
-  EXPECT_EQ(nullptr, filters_[0]->decoder_callbacks_->decodingBuffer());
+  EXPECT_EQ(filters_[0]->decoder_callbacks_->decodingBuffer(),
+            filters_[1]->decoder_callbacks_->decodingBuffer());
 
   filters_[1]->decoder_callbacks_->continueDecoding();
   EXPECT_EQ((Chunks{{"aaabbb", true}}), records_[1].decoded_data);
@@ -2281,9 +2282,8 @@ TEST_F(FilterManagerPerFilterBufferTest, StopAllFilterResumingWithNothingParkedR
 
   filter_manager_->decodeHeaders(*request_headers_, false);
   decodeData("aaa", true);
-  // The body is held by filter 0, nothing has reached filter 1.
-  EXPECT_EQ(nullptr, filters_[1]->decoder_callbacks_->decodingBuffer());
 
+  // The body is held by filter 0, nothing has reached filter 1.
   filters_[1]->decoder_callbacks_->continueDecoding();
   EXPECT_EQ(std::vector<bool>{false}, records_[2].decoded_headers);
   EXPECT_TRUE(records_[1].decoded_data.empty());
