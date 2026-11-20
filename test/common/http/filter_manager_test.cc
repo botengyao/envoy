@@ -2223,6 +2223,156 @@ TEST_F(FilterManagerPerFilterBufferTest, StopAllFilterReplayedOwnBufferKeepsItOn
   filter_manager_->destroyFilters();
 }
 
+TEST_F(FilterManagerPerFilterBufferTest, StopAllFilterResumingFirstLeavesLastFrameAtEarlierFilter) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance&, bool end_stream) {
+    return end_stream ? FilterDataStatus::StopIterationAndBuffer : FilterDataStatus::Continue;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", false);
+  decodeData("bbb", true);
+  // "aaa" is parked at filter 1, the final "bbb" is held by filter 0.
+  EXPECT_EQ("bbb", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+  EXPECT_EQ("aaa", filters_[1]->decoder_callbacks_->decodingBuffer()->toString());
+
+  // Filter 1 resumes first: the end of stream is still held by filter 0.
+  filters_[1]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", false}}), records_[2].decoded_data);
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", false}, {"bbb", true}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"aaa", false}, {"bbb", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest,
+       StopAllEncoderFilterResumingFirstLeavesLastFrameAtEarlierFilter) {
+  initializeChain(true);
+  filter_manager_->decodeHeaders(*request_headers_, true);
+  records_[2].encode_data = [](Buffer::Instance&, bool end_stream) {
+    return end_stream ? FilterDataStatus::StopIterationAndBuffer : FilterDataStatus::Continue;
+  };
+  records_[1].encode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+
+  encodeHeaders(false);
+  encodeData("aaa", false);
+  encodeData("bbb", true);
+
+  // Filter 1 resumes first: the end of stream is still held by filter 2.
+  filters_[1]->encoder_callbacks_->continueEncoding();
+  EXPECT_EQ((Chunks{{"aaa", false}}), sent_data_);
+
+  filters_[2]->encoder_callbacks_->continueEncoding();
+  EXPECT_EQ((Chunks{{"aaa", false}, {"bbb", true}}), records_[1].encoded_data);
+  EXPECT_EQ((Chunks{{"aaa", false}, {"bbb", true}}), sent_data_);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, StopAllFilterResumingWithNothingParkedReplaysNothing) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", true);
+  // The body is held by filter 0, nothing has reached filter 1.
+  EXPECT_EQ(nullptr, filters_[1]->decoder_callbacks_->decodingBuffer());
+
+  filters_[1]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ(std::vector<bool>{false}, records_[2].decoded_headers);
+  EXPECT_TRUE(records_[1].decoded_data.empty());
+  EXPECT_TRUE(records_[2].decoded_data.empty());
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", true}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"aaa", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, FilterStoppedOnHeadersResumingFirstReplaysNothing) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", true);
+
+  // Filter 1 continues its headers while the body is still held by filter 0.
+  filters_[1]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ(std::vector<bool>{false}, records_[2].decoded_headers);
+  EXPECT_TRUE(records_[2].decoded_data.empty());
+
+  // The body goes through filter 1 once filter 0 releases it.
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", true}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"aaa", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, EarlierFilterBuffersApartFromDataKeptByLaterFilter) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+  // The last filter keeps what it receives, as the router does for retries.
+  records_[2].decode_data = [this](Buffer::Instance& data, bool) {
+    filters_[2]->decoder_callbacks_->addDecodedData(data, true);
+    return FilterDataStatus::StopIterationNoBuffer;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  // The first data callback of the stream is at filter 2.
+  Buffer::OwnedImpl injected("xxx");
+  filters_[1]->decoder_callbacks_->injectDecodedDataToFilterChain(injected, false);
+  decodeData("aaa", false);
+  EXPECT_EQ("aaa", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+  EXPECT_EQ("xxx", filters_[2]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", false}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"xxx", false}, {"aaa", false}}), records_[2].decoded_data);
+  EXPECT_EQ("xxxaaa", filters_[2]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest,
+       TakeBufferedRequestDataWithSharedBufferHeldByEarlierFilter) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+  records_[2].decode_data = [this](Buffer::Instance& data, bool) {
+    filters_[2]->decoder_callbacks_->addDecodedData(data, true);
+    return FilterDataStatus::StopIterationNoBuffer;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", false);
+  // "xxx" reaches filter 2 while filter 0 still holds "aaa" in the shared buffer.
+  Buffer::OwnedImpl injected("xxx");
+  filters_[1]->decoder_callbacks_->injectDecodedDataToFilterChain(injected, false);
+  EXPECT_EQ("aaa", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+  EXPECT_EQ("xxx", filters_[2]->decoder_callbacks_->decodingBuffer()->toString());
+
+  Buffer::InstancePtr data = filter_manager_->takeBufferedRequestData();
+  ASSERT_NE(nullptr, data);
+  EXPECT_EQ("xxxaaa", data->toString());
+
+  filter_manager_->destroyFilters();
+}
+
 TEST_F(FilterManagerTest, RequestBufferDrainedAfterPayloadTooLargeReleasesNothing) {
   initialize();
   std::shared_ptr<MockStreamDecoderFilter> filter(new NiceMock<MockStreamDecoderFilter>());
