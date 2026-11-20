@@ -189,7 +189,7 @@ struct ActiveStreamFilterBase : public virtual StreamFilterCallbacks,
   bool commonHandleAfterTrailersCallback(FilterTrailersStatus status);
 
   // Buffers provided_data.
-  void commonHandleBufferData(Buffer::Instance& provided_data);
+  void commonHandleBufferData(Buffer::Instance& provided_data, bool hold_shared_buffer = true);
 
   // If iteration has stopped for all frame types, calls this function to buffer the data before
   // the filter processes data. The function also updates streaming state.
@@ -201,10 +201,18 @@ struct ActiveStreamFilterBase : public virtual StreamFilterCallbacks,
   // Buffer that body data stopped at this filter is buffered into, and that
   // decodingBuffer()/encodingBuffer(), addDecodedData()/addEncodedData() and
   // modifyDecodingBuffer()/modifyEncodingBuffer() operate on. This is the stream-level buffer
-  // shared by all filters, owned by the latest filter that data has reached. With per-filter
-  // buffer enabled, a filter that data has already passed (see passed_by_data_) uses its own
-  // buffer instead, so it never sees or changes the bytes held further down the chain.
+  // shared by all filters. With per-filter buffer enabled, a filter that data has already passed
+  // (see passed_by_data_), or that finds the shared buffer held by another filter (see
+  // sharedBufferHolder()), uses its own buffer instead, so it never sees or changes the bytes
+  // held at another chain position.
   virtual Buffer::InstancePtr& bufferedData() PURE;
+  // The filter holding the shared buffer of this direction with per-filter buffer enabled, if
+  // any: the first filter that buffers body data there outside the header pass, then each filter
+  // the buffer is replayed to.
+  virtual ActiveStreamFilterBase*& sharedBufferHolder() PURE;
+  bool usesOwnBuffer();
+  void holdSharedBuffer();
+  void takeSharedBuffer();
   // Whether the end of the stream has been observed, used for the end_stream flag when resuming
   // iteration. With per-filter observed end stream enabled, this is whether the end-of-stream
   // marker has reached this filter's position: an end-stream-carrying frame was either delivered
@@ -351,6 +359,7 @@ struct ActiveStreamDecoderFilter : public ActiveStreamFilterBase,
   bool canContinue() override;
   Buffer::InstancePtr createBuffer() override;
   Buffer::InstancePtr& bufferedData() override;
+  ActiveStreamFilterBase*& sharedBufferHolder() override;
   bool streamObservedEndStream() const override;
   bool has1xxHeaders() override { return false; }
   void do1xxHeaders() override { IS_ENVOY_BUG("unexpected 1xx headers"); }
@@ -443,6 +452,7 @@ struct ActiveStreamEncoderFilter : public ActiveStreamFilterBase,
   bool canContinue() override;
   Buffer::InstancePtr createBuffer() override;
   Buffer::InstancePtr& bufferedData() override;
+  ActiveStreamFilterBase*& sharedBufferHolder() override;
   bool streamObservedEndStream() const override;
   bool has1xxHeaders() override;
   void do1xxHeaders() override;
@@ -1133,6 +1143,10 @@ protected:
     // Used to track which filter is the latest filter that has received data.
     ActiveStreamEncoderFilter* latest_data_encoding_filter_{};
     ActiveStreamDecoderFilter* latest_data_decoding_filter_{};
+
+    // See ActiveStreamFilterBase::sharedBufferHolder().
+    ActiveStreamFilterBase* request_buffer_holder_{};
+    ActiveStreamFilterBase* response_buffer_holder_{};
   };
 
   State& state() { return state_; }
