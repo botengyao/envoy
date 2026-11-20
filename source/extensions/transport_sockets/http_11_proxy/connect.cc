@@ -1,8 +1,10 @@
 #include "source/extensions/transport_sockets/http_11_proxy/connect.h"
 
-#include <sstream>
+#include <string>
+#include <utility>
 
 #include "envoy/network/transport_socket.h"
+#include "envoy/upstream/host_description.h"
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/scalar_to_byte_vector.h"
@@ -16,6 +18,26 @@ namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
 namespace Http11Connect {
+namespace {
+
+// Resolves the HTTP CONNECT target for an upstream host. Prefers "<hostname>:<port>" for RFC 9110
+// authority-form compliance when the host has both a non-empty hostname and an IP address, and
+// falls back to the address string when the hostname is empty or the address is non-IP (such as a
+// pipe or Envoy internal address, where ip() returns nullptr and no port can be derived).
+std::string formatHostConnectTarget(const Upstream::HostDescription& host) {
+  const Network::Address::InstanceConstSharedPtr address = host.address();
+  if (address == nullptr) {
+    return host.hostname();
+  }
+  if (!host.hostname().empty()) {
+    if (const Network::Address::Ip* ip = address->ip(); ip != nullptr) {
+      return absl::StrCat(host.hostname(), ":", ip->port());
+    }
+  }
+  return std::string(address->asStringView());
+}
+
+} // namespace
 
 bool UpstreamHttp11ConnectSocket::isValidConnectResponse(absl::string_view response_payload,
                                                          bool& headers_complete,
@@ -32,38 +54,41 @@ bool UpstreamHttp11ConnectSocket::isValidConnectResponse(absl::string_view respo
 UpstreamHttp11ConnectSocket::UpstreamHttp11ConnectSocket(
     Network::TransportSocketPtr&& transport_socket,
     Network::TransportSocketOptionsConstSharedPtr options,
-    std::shared_ptr<const Upstream::HostDescription> host,
+    Upstream::HostDescriptionConstSharedPtr host,
     std::optional<Network::TransportSocketOptions::Http11ProxyInfo> proxy_info)
-    : PassthroughSocket(std::move(transport_socket)), options_(options) {
+    : PassthroughSocket(std::move(transport_socket)), options_(std::move(options)) {
   // If the filter state metadata has populated the relevant entries in the transport socket
   // options, we want to maintain the original behavior of this transport socket.
   if (options_ && options_->http11ProxyInfo()) {
-    handleProxyInfoConnect(options_->http11ProxyInfo().value());
+    handleProxyInfoConnect(*options_->http11ProxyInfo());
     return;
   }
 
   if (proxy_info.has_value()) {
-    Network::TransportSocketOptions::Http11ProxyInfo actual_info = proxy_info.value();
-    if (actual_info.hostname.empty() && host) {
-      actual_info.hostname = host->hostname().empty() ? host->address()->asStringView()
-                                                      : absl::StrCat(host->hostname(), ":",
-                                                                     host->address()->ip()->port());
+    Network::TransportSocketOptions::Http11ProxyInfo actual_info = std::move(*proxy_info);
+    if (actual_info.hostname.empty() && host != nullptr) {
+      actual_info.hostname = formatHostConnectTarget(*host);
     }
-    handleProxyInfoConnect(actual_info);
+    if (!actual_info.hostname.empty()) {
+      handleProxyInfoConnect(actual_info);
+    }
+    return;
+  }
+
+  if (host == nullptr) {
     return;
   }
 
   // The absence of proxy info from the transport socket options means that we should use the host
   // address of the provided HostDescription if it has the appropriate metadata set.
-  for (auto& metadata : {host->metadata(), host->localityMetadata()}) {
+  for (const auto& metadata : {host->metadata(), host->localityMetadata()}) {
     if (metadata == nullptr) {
       continue;
     }
 
-    const bool has_proxy_addr = metadata->typed_filter_metadata().contains(
-        Config::MetadataFilters::get().ENVOY_HTTP11_PROXY_TRANSPORT_SOCKET_ADDR);
-    if (has_proxy_addr) {
-      handleHostMetadataConnect(host);
+    if (metadata->typed_filter_metadata().contains(
+            Config::MetadataFilters::get().ENVOY_HTTP11_PROXY_TRANSPORT_SOCKET_ADDR)) {
+      handleHostMetadataConnect(*host);
       break;
     }
   }
@@ -74,7 +99,7 @@ std::string UpstreamHttp11ConnectSocket::formatConnectRequest(absl::string_view 
   return absl::StrCat("CONNECT ", target, " HTTP/1.1\r\n", "Host: ", target, "\r\n\r\n");
 }
 
-inline void UpstreamHttp11ConnectSocket::handleProxyInfoConnect(
+void UpstreamHttp11ConnectSocket::handleProxyInfoConnect(
     const Network::TransportSocketOptions::Http11ProxyInfo& proxy_info) {
   if (transport_socket_->ssl()) {
     std::string target = absl::StrCat(
@@ -92,23 +117,21 @@ inline void UpstreamHttp11ConnectSocket::handleProxyInfoConnect(
   }
 }
 
-inline void UpstreamHttp11ConnectSocket::handleHostMetadataConnect(
-    std::shared_ptr<const Upstream::HostDescription> host) {
+void UpstreamHttp11ConnectSocket::handleHostMetadataConnect(const Upstream::HostDescription& host) {
   if (!Runtime::runtimeFeatureEnabled(
           "envoy.reloadable_features.http_11_proxy_connect_legacy_format")) {
-    // Prefer <host-name>:<port> for RFC 9110 compliance, unless URI is <host-ip>:<port>.
-    std::string target;
-    if (!host->hostname().empty()) {
-      const uint32_t port = host->address()->ip()->port();
-      target = absl::StrCat(host->hostname(), ":", port);
-    } else {
-      target = host->address()->asStringView();
+    const std::string target = formatHostConnectTarget(host);
+    if (target.empty()) {
+      return;
     }
     header_buffer_.add(formatConnectRequest(target));
   } else {
+    const Network::Address::InstanceConstSharedPtr address = host.address();
+    if (address == nullptr) {
+      return;
+    }
     // Legacy behavior: <host-ip>:<port> format, no Host header for backward compatibility.
-    header_buffer_.add(
-        absl::StrCat("CONNECT ", host->address()->asStringView(), " HTTP/1.1\r\n\r\n"));
+    header_buffer_.add(absl::StrCat("CONNECT ", address->asStringView(), " HTTP/1.1\r\n\r\n"));
   }
   need_to_strip_connect_response_ = true;
 }
@@ -207,17 +230,17 @@ Network::IoResult UpstreamHttp11ConnectSocket::writeHeader() {
 UpstreamHttp11ConnectSocketFactory::UpstreamHttp11ConnectSocketFactory(
     Network::UpstreamTransportSocketFactoryPtr transport_socket_factory,
     std::optional<Network::TransportSocketOptions::Http11ProxyInfo> proxy_info)
-    : PassthroughFactory(std::move(transport_socket_factory)), proxy_info_(proxy_info) {}
+    : PassthroughFactory(std::move(transport_socket_factory)), proxy_info_(std::move(proxy_info)) {}
 
 Network::TransportSocketPtr UpstreamHttp11ConnectSocketFactory::createTransportSocket(
     Network::TransportSocketOptionsConstSharedPtr options,
-    std::shared_ptr<const Upstream::HostDescription> host) const {
+    Upstream::HostDescriptionConstSharedPtr host) const {
   auto inner_socket = transport_socket_factory_->createTransportSocket(options, host);
   if (inner_socket == nullptr) {
     return nullptr;
   }
-  return std::make_unique<UpstreamHttp11ConnectSocket>(std::move(inner_socket), options, host,
-                                                       proxy_info_);
+  return std::make_unique<UpstreamHttp11ConnectSocket>(std::move(inner_socket), std::move(options),
+                                                       std::move(host), proxy_info_);
 }
 
 void UpstreamHttp11ConnectSocketFactory::hashKey(

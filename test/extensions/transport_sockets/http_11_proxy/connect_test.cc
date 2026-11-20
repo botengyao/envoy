@@ -95,6 +95,66 @@ public:
     connect_socket_->onConnected();
   }
 
+  void expectPassthroughNoOp() {
+    EXPECT_CALL(io_handle_, write(_)).Times(0);
+    Buffer::OwnedImpl msg("initial data");
+    EXPECT_CALL(*inner_socket_, doWrite(BufferEqual(&msg), false))
+        .WillOnce(Return(Network::IoResult{Network::PostIoAction::KeepOpen, msg.length(), false}));
+    Network::IoResult rc = connect_socket_->doWrite(msg, false);
+    EXPECT_EQ(msg.length(), rc.bytes_processed_);
+
+    EXPECT_CALL(io_handle_, recv(_, _, _)).Times(0);
+    EXPECT_CALL(io_handle_, read(_, _)).Times(0);
+    EXPECT_CALL(*inner_socket_, doRead(_))
+        .WillOnce(Return(Network::IoResult{Network::PostIoAction::KeepOpen, 0, false}));
+    Buffer::OwnedImpl read_buffer;
+    connect_socket_->doRead(read_buffer);
+  }
+
+  void initializeSocketWithHost(Upstream::HostDescriptionConstSharedPtr host,
+                                std::optional<Network::TransportSocketOptions::Http11ProxyInfo>
+                                    default_proxy_info = std::nullopt) {
+    options_ = std::make_shared<const Network::TransportSocketOptionsImpl>();
+    auto inner_socket = std::make_unique<NiceMock<Network::MockTransportSocket>>();
+    inner_socket_ = inner_socket.get();
+    EXPECT_CALL(*inner_socket_, ssl()).Times(AnyNumber()).WillRepeatedly(Return(ssl_));
+    EXPECT_CALL(Const(*inner_socket_), ssl()).Times(AnyNumber()).WillRepeatedly(Return(ssl_));
+    ON_CALL(transport_callbacks_, ioHandle()).WillByDefault(ReturnRef(io_handle_));
+
+    connect_socket_ = std::make_unique<UpstreamHttp11ConnectSocket>(
+        std::move(inner_socket), options_, std::move(host), std::move(default_proxy_info));
+    connect_socket_->setTransportSocketCallbacks(transport_callbacks_);
+  }
+
+  std::shared_ptr<NiceMock<Upstream::MockHostDescription>>
+  makeHost(absl::string_view hostname, Network::Address::InstanceConstSharedPtr address,
+           Upstream::MetadataConstSharedPtr metadata = nullptr) {
+    host_hostname_ = std::string(hostname);
+    auto host = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
+    EXPECT_CALL(*host, hostname()).Times(AnyNumber()).WillRepeatedly(ReturnRef(host_hostname_));
+    EXPECT_CALL(*host, address()).Times(AnyNumber()).WillRepeatedly(Return(std::move(address)));
+    EXPECT_CALL(*host, metadata()).Times(AnyNumber()).WillRepeatedly(Return(std::move(metadata)));
+    return host;
+  }
+
+  static Upstream::MetadataConstSharedPtr makeProxyMetadata() {
+    auto metadata = std::make_shared<envoy::config::core::v3::Metadata>();
+    envoy::config::core::v3::Address addr_proto;
+    addr_proto.mutable_socket_address()->set_address("127.0.0.1");
+    addr_proto.mutable_socket_address()->set_port_value(1234);
+    Protobuf::Any anypb;
+    std::ignore = anypb.PackFrom(addr_proto);
+    metadata->mutable_typed_filter_metadata()->emplace(
+        Config::MetadataFilters::get().ENVOY_HTTP11_PROXY_TRANSPORT_SOCKET_ADDR, std::move(anypb));
+    return metadata;
+  }
+
+  Network::TransportSocketOptions::Http11ProxyInfo makeEmptyHostnameDefaultProxyInfo() const {
+    return {"", Network::Utility::parseInternetAddressAndPortNoThrow(
+                    absl::StrCat(Network::Test::getLoopbackAddressUrlString(GetParam()), ":1234"))};
+  }
+
+  std::string host_hostname_;
   Network::TransportSocketOptionsConstSharedPtr options_;
   NiceMock<Network::MockTransportSocket>* inner_socket_;
   NiceMock<Network::MockIoHandle> io_handle_;
@@ -210,6 +270,85 @@ TEST_P(Http11ConnectTest, InjectsHeaderWithHostnameFromMetadata) {
 TEST_P(Http11ConnectTest, InjectsHeaderWithDefaultProxyAddr) {
   initializeWithDefaultProxy();
   injectHeaderOnceTest();
+}
+
+// Test default_proxy_address derives "<hostname>:<port>" when the host has an IP address.
+TEST_P(Http11ConnectTest, DefaultProxyAddrResolvesHostHostnameAndPort) {
+  auto address = std::make_shared<Network::Address::Ipv4Instance>("192.168.1.1", 8443);
+  initializeSocketWithHost(makeHost(TestHostname, address), makeEmptyHostnameDefaultProxyInfo());
+  connect_data_ = Buffer::OwnedImpl(absl::StrCat(
+      "CONNECT ", TestHostname, ":8443 HTTP/1.1\r\nHost: ", TestHostname, ":8443\r\n\r\n"));
+  injectHeaderOnceTest();
+}
+
+// Regression test: a host with a non-IP (pipe or Envoy internal) address and a non-empty hostname
+// must not dereference a null ip() pointer on the default_proxy_address path, falling back to the
+// address string just like the empty-hostname case.
+TEST_P(Http11ConnectTest, DefaultProxyAddrWithNonIpHostAddress) {
+  auto pipe_or_error = Network::Address::PipeInstance::create("/foo/http_11_proxy_test.sock");
+  ASSERT_OK(pipe_or_error);
+  Network::Address::InstanceConstSharedPtr pipe_address = std::move(*pipe_or_error);
+  ASSERT_EQ(nullptr, pipe_address->ip());
+
+  initializeSocketWithHost(makeHost(TestHostname, pipe_address),
+                           makeEmptyHostnameDefaultProxyInfo());
+  connect_data_ = Buffer::OwnedImpl(
+      absl::StrCat("CONNECT ", pipe_address->asStringView(),
+                   ":443 HTTP/1.1\r\nHost: ", pipe_address->asStringView(), ":443\r\n\r\n"));
+  injectHeaderOnceTest();
+
+  auto internal_address =
+      std::make_shared<Network::Address::EnvoyInternalInstance>("internal_listener");
+  ASSERT_EQ(nullptr, internal_address->ip());
+
+  initializeSocketWithHost(makeHost(TestHostname, internal_address),
+                           makeEmptyHostnameDefaultProxyInfo());
+  connect_data_ = Buffer::OwnedImpl(
+      absl::StrCat("CONNECT ", internal_address->asStringView(),
+                   ":443 HTTP/1.1\r\nHost: ", internal_address->asStringView(), ":443\r\n\r\n"));
+  injectHeaderOnceTest();
+}
+
+// Regression test: a host with a non-IP (pipe) address and a non-empty hostname must not
+// dereference a null ip() pointer on the endpoint-metadata path.
+TEST_P(Http11ConnectTest, EndpointMetadataWithNonIpHostAddress) {
+  auto pipe_or_error = Network::Address::PipeInstance::create("/foo/http_11_proxy_test.sock");
+  ASSERT_OK(pipe_or_error);
+  Network::Address::InstanceConstSharedPtr pipe_address = std::move(*pipe_or_error);
+  ASSERT_EQ(nullptr, pipe_address->ip());
+
+  initializeSocketWithHost(makeHost(TestHostname, pipe_address, makeProxyMetadata()));
+  connect_data_ = Buffer::OwnedImpl(
+      absl::StrCat("CONNECT ", pipe_address->asStringView(),
+                   " HTTP/1.1\r\nHost: ", pipe_address->asStringView(), "\r\n\r\n"));
+  injectHeaderOnceTest();
+}
+
+// Test graceful handling when host or host->address() is nullptr.
+TEST_P(Http11ConnectTest, HandlesNullHostAndNullHostAddressGracefully) {
+  // Null host without default_proxy_address or options is a passthrough no-op.
+  initializeSocketWithHost(nullptr);
+  expectPassthroughNoOp();
+
+  // Null host with empty-hostname default_proxy_address has no target and is a passthrough no-op.
+  initializeSocketWithHost(nullptr, makeEmptyHostnameDefaultProxyInfo());
+  expectPassthroughNoOp();
+
+  // Host with non-empty hostname and null address uses the hostname on default_proxy_address.
+  initializeSocketWithHost(makeHost(TestHostname, nullptr), makeEmptyHostnameDefaultProxyInfo());
+  connect_data_ = Buffer::OwnedImpl(ConnectRequestWithHostname);
+  injectHeaderOnceTest();
+
+  // Host with empty hostname and null address has no target on metadata RFC 9110 path.
+  initializeSocketWithHost(makeHost("", nullptr, makeProxyMetadata()));
+  expectPassthroughNoOp();
+
+  // Host with null address has no address target on metadata legacy format path.
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.http_11_proxy_connect_legacy_format", "true"}});
+  initializeSocketWithHost(makeHost(TestHostname, nullptr, makeProxyMetadata()));
+  expectPassthroughNoOp();
 }
 
 // Test the socket is a no-op if there's no header proto.

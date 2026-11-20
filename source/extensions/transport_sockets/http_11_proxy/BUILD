@@ -34,6 +34,7 @@ envoy_cc_library(
     deps = [
         "//envoy/network:connection_interface",
         "//envoy/network:transport_socket_interface",
+        "//envoy/upstream:host_description_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:scalar_to_byte_vector_lib",
         "//source/common/common:utility_lib",

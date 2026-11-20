@@ -2,6 +2,7 @@
 
 #include "envoy/network/connection.h"
 #include "envoy/network/transport_socket.h"
+#include "envoy/upstream/host_description.h"
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
@@ -35,7 +36,7 @@ public:
   UpstreamHttp11ConnectSocket(
       Network::TransportSocketPtr&& transport_socket,
       Network::TransportSocketOptionsConstSharedPtr options,
-      std::shared_ptr<const Upstream::HostDescription> host,
+      Upstream::HostDescriptionConstSharedPtr host,
       std::optional<Network::TransportSocketOptions::Http11ProxyInfo> proxy_info = std::nullopt);
 
   void setTransportSocketCallbacks(Network::TransportSocketCallbacks& callbacks) override;
@@ -43,12 +44,10 @@ public:
   Network::IoResult doRead(Buffer::Instance& buffer) override;
 
 private:
-  void generateHeader();
   Network::IoResult writeHeader();
 
-  inline void
-  handleProxyInfoConnect(const Network::TransportSocketOptions::Http11ProxyInfo& proxy_info);
-  inline void handleHostMetadataConnect(std::shared_ptr<const Upstream::HostDescription> host);
+  void handleProxyInfoConnect(const Network::TransportSocketOptions::Http11ProxyInfo& proxy_info);
+  void handleHostMetadataConnect(const Upstream::HostDescription& host);
 
   Network::TransportSocketOptionsConstSharedPtr options_;
   Network::TransportSocketCallbacks* callbacks_{};
@@ -65,7 +64,7 @@ public:
   // Network::TransportSocketFactory
   Network::TransportSocketPtr
   createTransportSocket(Network::TransportSocketOptionsConstSharedPtr options,
-                        std::shared_ptr<const Upstream::HostDescription> host) const override;
+                        Upstream::HostDescriptionConstSharedPtr host) const override;
   void hashKey(std::vector<uint8_t>& key,
                Network::TransportSocketOptionsConstSharedPtr options) const override;
 

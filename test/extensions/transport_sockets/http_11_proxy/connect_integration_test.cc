@@ -613,5 +613,47 @@ TEST_P(Http11ConnectHttpIntegrationTest, ConfiguredProxy) {
   ASSERT_FALSE(response->headers().get(Http::LowerCaseString("foo")).empty());
 }
 
+// Regression test: an upstream endpoint with a non-empty hostname and a non-IP (pipe) address
+// proxied via default_proxy_address must not crash the worker thread when constructing the CONNECT
+// request.
+TEST_P(Http11ConnectHttpIntegrationTest, ConfiguredProxyWithNonIpEndpointAndHostname) {
+  pre_create_upstreams_ = true;
+  const std::string pipe_path = TestEnvironment::unixDomainSocketPath("unused_pipe.sock");
+  config_helper_.addConfigModifier(
+      [&pipe_path](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+        auto* endpoint = bootstrap.mutable_static_resources()
+                             ->mutable_clusters(0)
+                             ->mutable_load_assignment()
+                             ->mutable_endpoints(0)
+                             ->mutable_lb_endpoints(0)
+                             ->mutable_endpoint();
+        endpoint->set_hostname("sni.lyft.com");
+        endpoint->mutable_address()->mutable_pipe()->set_path(pipe_path);
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+
+  ASSERT_TRUE(fake_upstreams_[1]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+
+  std::string prefix_data;
+  ASSERT_TRUE(fake_upstream_connection_->waitForInexactRawData("\r\n\r\n", prefix_data));
+  const std::string expected_target = absl::StrCat(pipe_path, ":443");
+  const std::string expected_connect = absl::StrCat("CONNECT ", expected_target, " HTTP/1.1\r\n",
+                                                    "Host: ", expected_target, "\r\n\r\n");
+  EXPECT_EQ(expected_connect, prefix_data);
+
+  fake_upstream_connection_->writeRawData("HTTP/1.1 200 OK\r\n\r\n");
+
+  ASSERT_TRUE(fake_upstream_connection_->readDisable(false));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
 } // namespace
 } // namespace Envoy
