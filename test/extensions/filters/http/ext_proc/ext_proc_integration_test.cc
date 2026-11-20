@@ -1899,6 +1899,49 @@ public:
 
     verifyDownstreamResponse(*response, 200);
   }
+
+  // The codec filter stops all iteration until the upstream connection is ready and then resumes
+  // on its own, while ext_proc still holds the buffered request body.
+  void testBufferedRequestBodyHeldAcrossCodecFilterResume(bool replace_body) {
+    proto_config_.mutable_processing_mode()->set_request_header_mode(ProcessingMode::SKIP);
+    proto_config_.mutable_processing_mode()->set_request_body_mode(ProcessingMode::BUFFERED);
+    proto_config_.mutable_processing_mode()->set_response_header_mode(ProcessingMode::SKIP);
+    initializeConfig();
+    HttpIntegrationTest::initialize();
+
+    codec_client_ = makeHttpConnection(lookupPort("http"));
+    Http::TestRequestHeaderMapImpl headers;
+    HttpTestUtility::addDefaultHeaders(headers);
+    headers.setMethod("POST");
+    auto encoder_decoder = codec_client_->startRequest(headers);
+    IntegrationStreamDecoderPtr response = std::move(encoder_decoder.second);
+    codec_client_->sendData(encoder_decoder.first, "aaa", false);
+    codec_client_->sendData(encoder_decoder.first, "bbb", true);
+
+    ProcessingRequest request;
+    ASSERT_TRUE(grpc_upstreams_[0]->waitForHttpConnection(*dispatcher_, processor_connection_));
+    ASSERT_TRUE(processor_connection_->waitForNewStream(*dispatcher_, processor_stream_));
+    ASSERT_TRUE(processor_stream_->waitForGrpcMessage(*dispatcher_, request));
+    ASSERT_TRUE(request.has_request_body());
+    EXPECT_EQ("aaabbb", request.request_body().body());
+
+    // The codec filter has resumed and sent the headers before the processor answers.
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+    ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+
+    processor_stream_->startGrpcStream();
+    ProcessingResponse body_response;
+    auto* response_body = body_response.mutable_request_body();
+    if (replace_body) {
+      response_body->mutable_response()->mutable_body_mutation()->set_body("replaced");
+    }
+    processor_stream_->sendGrpcMessage(body_response);
+
+    ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
+    EXPECT_EQ(replace_body ? "replaced" : "aaabbb", upstream_request_->body().toString());
+    upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+    verifyDownstreamResponse(*response, 200);
+  }
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersionsClientTypeDeferredProcessing, ExtProcIntegrationTestUpstream,
@@ -1953,6 +1996,14 @@ TEST_P(ExtProcIntegrationTestUpstream, RouterRetrySendBody) {
 
 TEST_P(ExtProcIntegrationTestUpstream, RouterRetrySendTrailers) {
   testRouterRetryWithExtProcUpstream(/*send_body*/ false);
+}
+
+TEST_P(ExtProcIntegrationTestUpstream, BufferedRequestBodyHeldAcrossCodecFilterResume) {
+  testBufferedRequestBodyHeldAcrossCodecFilterResume(/*replace_body*/ false);
+}
+
+TEST_P(ExtProcIntegrationTestUpstream, BufferedRequestBodyReplacedAfterCodecFilterResume) {
+  testBufferedRequestBodyHeldAcrossCodecFilterResume(/*replace_body*/ true);
 }
 
 TEST_P(ExtProcIntegrationTest, GetAndRespondImmediatelyGracefulClose) {

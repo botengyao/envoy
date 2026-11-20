@@ -2373,6 +2373,226 @@ TEST_F(FilterManagerPerFilterBufferTest,
   filter_manager_->destroyFilters();
 }
 
+TEST_F(FilterManagerPerFilterBufferTest, StopAllFilterResumingFirstLeavesAddedBodyAtEarlierFilter) {
+  initializeChain(true);
+  // Filter 0 keeps the body with addDecodedData(), as ext_proc does in BUFFERED mode.
+  records_[0].decode_data = [this](Buffer::Instance& data, bool) {
+    filters_[0]->decoder_callbacks_->addDecodedData(data, false);
+    return FilterDataStatus::StopIterationNoBuffer;
+  };
+  records_[1].decode_headers = [](bool) {
+    return FilterHeadersStatus::StopAllIterationAndWatermark;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", true);
+
+  filters_[1]->decoder_callbacks_->continueDecoding();
+  EXPECT_TRUE(records_[2].decoded_data.empty());
+  ASSERT_NE(nullptr, filters_[0]->decoder_callbacks_->decodingBuffer());
+  EXPECT_EQ("aaa", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"aaa", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest,
+       StopAllFilterResumingFirstLeavesEndStreamFrameAtEarlierFilter) {
+  initializeChain(true);
+  records_[0].decode_data = [](Buffer::Instance& data, bool) {
+    data.drain(data.length());
+    return FilterDataStatus::StopIterationNoBuffer;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopAllIterationAndBuffer; };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", true);
+
+  filters_[1]->decoder_callbacks_->continueDecoding();
+  EXPECT_TRUE(records_[2].decoded_data.empty());
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  EXPECT_EQ((Chunks{{"", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, RequestBodyHeldWhileInjectingIsReplayed) {
+  initializeChain(true);
+  int calls = 0;
+  records_[0].decode_data = [&calls](Buffer::Instance&, bool) {
+    return calls++ == 0 ? FilterDataStatus::StopIterationAndBuffer : FilterDataStatus::Continue;
+  };
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", false);
+
+  Buffer::OwnedImpl injected("x");
+  filters_[0]->decoder_callbacks_->injectDecodedDataToFilterChain(injected, false);
+  EXPECT_EQ("aaa", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  decodeData("bbb", true);
+  EXPECT_EQ((Chunks{{"x", false}, {"aaa", false}, {"bbb", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, ResponseBodyHeldWhileInjectingIsReplayed) {
+  initializeChain(true);
+  filter_manager_->decodeHeaders(*request_headers_, true);
+  int calls = 0;
+  records_[2].encode_data = [&calls](Buffer::Instance&, bool) {
+    return calls++ == 0 ? FilterDataStatus::StopIterationAndBuffer : FilterDataStatus::Continue;
+  };
+  encodeHeaders(false);
+  encodeData("aaa", false);
+
+  Buffer::OwnedImpl injected("x");
+  filters_[2]->encoder_callbacks_->injectEncodedDataToFilterChain(injected, false);
+  EXPECT_EQ("aaa", filters_[2]->encoder_callbacks_->encodingBuffer()->toString());
+
+  filters_[2]->encoder_callbacks_->continueEncoding();
+  encodeData("bbb", true);
+  EXPECT_EQ((Chunks{{"x", false}, {"aaa", false}, {"bbb", true}}), sent_data_);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, BodyAddedInHeaderPassJoinsBodyHeldByEarlierFilter) {
+  initializeChain(true);
+  records_[0].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+  records_[1].decode_headers = [this](bool) {
+    Buffer::OwnedImpl data("bb");
+    filters_[1]->decoder_callbacks_->addDecodedData(data, false);
+    return FilterHeadersStatus::Continue;
+  };
+  filter_manager_->decodeHeaders(*request_headers_, true);
+
+  Buffer::OwnedImpl body("aa");
+  filters_[0]->decoder_callbacks_->addDecodedData(body, false);
+  filters_[0]->decoder_callbacks_->continueDecoding();
+
+  EXPECT_EQ((Chunks{{"aabb", true}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"aabb", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, BodyAddedInHeaderPassAfterMetadataEndsStream) {
+  initializeChain(true);
+  records_[0].decode_headers = [this](bool) {
+    filters_[0]->decoder_callbacks_->addDecodedMetadata().push_back(
+        std::make_unique<MetadataMap>(MetadataMap{{"k", "v"}}));
+    return FilterHeadersStatus::Continue;
+  };
+  records_[1].decode_headers = [this](bool) {
+    Buffer::OwnedImpl data("bb");
+    filters_[1]->decoder_callbacks_->addDecodedData(data, false);
+    return FilterHeadersStatus::Continue;
+  };
+  filter_manager_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_EQ((Chunks{{"bb", true}}), records_[1].decoded_data);
+  EXPECT_EQ((Chunks{{"bb", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, FilterSeesBodyItAddedInHeaderPassAfterHandover) {
+  initializeChain(true);
+  records_[0].decode_headers = [this](bool) {
+    Buffer::OwnedImpl body("hello");
+    filters_[0]->decoder_callbacks_->addDecodedData(body, true);
+    return FilterHeadersStatus::Continue;
+  };
+  records_[1].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+  records_[1].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_EQ((Chunks{{"hello", true}}), records_[1].decoded_data);
+  ASSERT_NE(nullptr, filters_[0]->decoder_callbacks_->decodingBuffer());
+  EXPECT_EQ("hello", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, LaterFilterSeesHeldBodyFromHeadersCallback) {
+  initializeChain(true);
+  records_[0].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+  records_[0].decode_data = [](Buffer::Instance&, bool end_stream) {
+    return end_stream ? FilterDataStatus::Continue : FilterDataStatus::StopIterationAndBuffer;
+  };
+  std::string seen;
+  records_[1].decode_headers = [this, &seen](bool) {
+    const Buffer::Instance* buffer = filters_[1]->decoder_callbacks_->decodingBuffer();
+    seen = buffer != nullptr ? buffer->toString() : "";
+    return FilterHeadersStatus::Continue;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  decodeData("aaa", false);
+  decodeData("bbb", true);
+
+  EXPECT_EQ("aaabbb", seen);
+  EXPECT_EQ((Chunks{{"aaabbb", true}}), records_[2].decoded_data);
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, EarlierFilterBuffersApartWhenBodyEntersMidChain) {
+  initializeChain(true);
+  records_[2].decode_data = [this](Buffer::Instance& data, bool) {
+    filters_[2]->decoder_callbacks_->addDecodedData(data, true);
+    return FilterDataStatus::StopIterationNoBuffer;
+  };
+  filter_manager_->decodeHeaders(*request_headers_, false);
+
+  Buffer::OwnedImpl injected("x");
+  filters_[0]->decoder_callbacks_->injectDecodedDataToFilterChain(injected, false);
+  records_[0].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+  decodeData("aaa", false);
+
+  EXPECT_EQ("aaa", filters_[0]->decoder_callbacks_->decodingBuffer()->toString());
+  EXPECT_EQ("x", filters_[2]->decoder_callbacks_->decodingBuffer()->toString());
+
+  filter_manager_->destroyFilters();
+}
+
+TEST_F(FilterManagerPerFilterBufferTest, TakeBufferedRequestDataWhenBodyEntersMidChain) {
+  initializeChain(true);
+  records_[0].decode_headers = [](bool) { return FilterHeadersStatus::StopIteration; };
+  records_[0].decode_data = [](Buffer::Instance&, bool end_stream) {
+    return end_stream ? FilterDataStatus::StopIterationAndBuffer : FilterDataStatus::Continue;
+  };
+  int calls = 0;
+  records_[1].decode_data = [&calls](Buffer::Instance&, bool) {
+    return calls++ == 0 ? FilterDataStatus::Continue : FilterDataStatus::StopIterationAndBuffer;
+  };
+  records_[2].decode_data = [](Buffer::Instance&, bool) {
+    return FilterDataStatus::StopIterationAndBuffer;
+  };
+
+  filter_manager_->decodeHeaders(*request_headers_, false);
+  Buffer::OwnedImpl added("x");
+  filters_[0]->decoder_callbacks_->addDecodedData(added, true);
+  filters_[0]->decoder_callbacks_->continueDecoding();
+  decodeData("aaa", false);
+  decodeData("bbb", true);
+
+  Buffer::InstancePtr data = filter_manager_->takeBufferedRequestData();
+  ASSERT_NE(nullptr, data);
+  EXPECT_EQ("xaaabbb", data->toString());
+
+  filter_manager_->destroyFilters();
+}
+
 TEST_F(FilterManagerTest, RequestBufferDrainedAfterPayloadTooLargeReleasesNothing) {
   initialize();
   std::shared_ptr<MockStreamDecoderFilter> filter(new NiceMock<MockStreamDecoderFilter>());
