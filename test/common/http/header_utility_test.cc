@@ -15,6 +15,7 @@
 #include "test/test_common/utility.h"
 
 #include "gtest/gtest.h"
+#include "quiche/http2/adapter/header_validator.h"
 
 using testing::ElementsAre;
 
@@ -1306,6 +1307,22 @@ TEST(HeaderIsValidTest, InvalidHeaderValuesAreRejected) {
 TEST(HeaderIsValidTest, ValidHeaderValuesAreAccepted) {
   EXPECT_TRUE(HeaderUtility::headerValueIsValid("some-value"));
   EXPECT_TRUE(HeaderUtility::headerValueIsValid("Some Other Value"));
+}
+
+TEST(HeaderIsValidTest, HeaderValueMatchesQuicheValidator) {
+  for (int c = 0; c < 256; ++c) {
+    // Positions in the vector part of the loop and in its scalar remainder, for several sizes.
+    for (const size_t size : {1, 5, 12, 40, 67}) {
+      for (const size_t position : {size_t{0}, size / 2, size - 1}) {
+        std::string value(size, 'v');
+        value[position] = static_cast<char>(c);
+        EXPECT_EQ(HeaderUtility::headerValueIsValid(value),
+                  http2::adapter::HeaderValidator::IsValidHeaderValue(
+                      value, http2::adapter::ObsTextOption::kAllow))
+            << c << " at " << position << " of " << size;
+      }
+    }
+  }
 }
 
 TEST(HeaderIsValidTest, AuthorityIsValid) {

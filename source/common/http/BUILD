@@ -631,7 +631,6 @@ envoy_cc_library(
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/route/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/v3:pkg_cc_proto",
-        "@quiche//:http2_adapter",
     ] + envoy_select_enable_http_datagrams([
         "@quiche//:quiche_common_structured_headers_lib",
     ]) + envoy_select_nghttp2([envoy_external_dep_path("nghttp2")]),

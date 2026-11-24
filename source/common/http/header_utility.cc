@@ -19,7 +19,6 @@
 #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
 #include "quiche/common/structured_headers.h"
 #endif
-#include "quiche/http2/adapter/header_validator.h"
 
 namespace Envoy {
 namespace Http {
@@ -139,8 +138,13 @@ HeaderUtility::createHeaderData(const envoy::config::route::v3::HeaderMatcher& c
 }
 
 bool HeaderUtility::headerValueIsValid(const absl::string_view header_value) {
-  return http2::adapter::HeaderValidator::IsValidHeaderValue(header_value,
-                                                             http2::adapter::ObsTextOption::kAllow);
+  // Allows HTAB, space to '~', and bytes from 0x80. c ^ 0x16 maps HTAB to 0x1f and every other
+  // control character below it; bitwise operators and no early exit let compilers vectorize this.
+  bool valid = true;
+  for (const unsigned char c : header_value) {
+    valid &= ((c ^ 0x16) >= 0x1f) & (c != 0x7f);
+  }
+  return valid;
 }
 
 bool HeaderUtility::headerNameIsValid(absl::string_view header_key) {

@@ -87,6 +87,15 @@ BENCHMARK(bmHeaderExactControl)
     ->ArgsProduct({{0, 1, 4}, {16, 4096}, {0, 1}})
     ->ArgNames({"values", "bytes", "matching_value"});
 
+// The HTTP/1 codec checks every header value it receives.
+static void bmHeaderValueIsValid(benchmark::State& state) {
+  const std::string value(state.range(0), 'v');
+  for (auto _ : state) { // NOLINT
+    benchmark::DoNotOptimize(HeaderUtility::headerValueIsValid(value));
+  }
+}
+BENCHMARK(bmHeaderValueIsValid)->ArgName("bytes")->Arg(4)->Arg(16)->Arg(64)->Arg(256)->Arg(4096);
+
 } // namespace
 } // namespace Http
 } // namespace Envoy
